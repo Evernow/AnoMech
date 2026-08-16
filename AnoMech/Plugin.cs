@@ -9,6 +9,7 @@ using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Map;
 using AnoMech.Core.Native;
+using AnoMech.Multiplayer;
 using AnoMech.Windows;
 using AnoMech.Pointers;
 using CSFramework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
@@ -44,6 +45,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public readonly WindowSystem WindowSystem = new("AnoMech");
     public Game Game { get; }
+    public MultiplayerManager Multiplayer { get; } = new();
     // SimObjects reach engine singletons through these statics (mirrors the
     // Plugin.* PluginService pattern).
     internal static Game GameInstance { get; private set; } = null!;
@@ -54,6 +56,7 @@ public sealed class Plugin : IDalamudPlugin
     internal static LogManager LogManager { get; private set; } = null!;
     private ConfigWindow ConfigWindow { get; init; }
     private MainWindow MainWindow { get; init; }
+    internal MultiplayerWindow MultiplayerWindow { get; init; }
 #if DEBUG
     private DamageDebugWindow DamageDebugWindow { get; init; }
 #endif
@@ -71,9 +74,11 @@ public sealed class Plugin : IDalamudPlugin
         GameInstance = Game;
         ConfigWindow = new ConfigWindow(this);
         MainWindow = new MainWindow(this);
+        MultiplayerWindow = new MultiplayerWindow(this);
 
         WindowSystem.AddWindow(ConfigWindow);
         WindowSystem.AddWindow(MainWindow);
+        WindowSystem.AddWindow(MultiplayerWindow);
 #if DEBUG
         DamageDebugWindow = new DamageDebugWindow(this);
         WindowSystem.AddWindow(DamageDebugWindow);
@@ -84,7 +89,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open AnoMech. Subcommands: config, start, reset, leave"
+            HelpMessage = "Open AnoMech. Subcommands: config, mp, start, reset, leave"
         });
         CommandManager.AddHandler(CommandAlias, new CommandInfo(OnCommand)
         {
@@ -131,6 +136,7 @@ public sealed class Plugin : IDalamudPlugin
 
         WindowSystem.RemoveAllWindows();
 
+        Multiplayer.Dispose();
         Game.Dispose();
         // After Game.Dispose so World.Dispose → SimPlayer.Despawn can still clear
         // the lock flags through the hooks before they're torn down.
@@ -138,6 +144,7 @@ public sealed class Plugin : IDalamudPlugin
         LogManager.Dispose();
         ConfigWindow.Dispose();
         MainWindow.Dispose();
+        MultiplayerWindow.Dispose();
 #if DEBUG
         DamageDebugWindow.Dispose();
 #endif
@@ -154,6 +161,7 @@ public sealed class Plugin : IDalamudPlugin
         var fw = CSFramework.Instance();
         if (fw == null) return;
         Game.Tick(fw->FrameDeltaTime);
+        Multiplayer.Tick(fw->FrameDeltaTime);
     }
 
     private void OnTerritoryChanged(uint territory)
@@ -190,6 +198,10 @@ public sealed class Plugin : IDalamudPlugin
         {
             case "config":
                 ConfigWindow.Toggle();
+                break;
+            case "mp":
+            case "multiplayer":
+                MultiplayerWindow.Toggle();
                 break;
             case "start":
                 StartSelectedScenario(solo: false);

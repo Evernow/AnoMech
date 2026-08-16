@@ -6,6 +6,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 
 namespace AnoMech.Core.Game.Party;
@@ -41,7 +42,12 @@ internal static unsafe class PartyCreator
 
     private static readonly Random Rng = new();
 
-    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, PartyRole? roleOverride = null, bool solo = false)
+    // networkRoles: slots claimed by other real multiplayer participants (never
+    // includes the local player's own role). Spawned as SimNetworkPuppet instead
+    // of an AI-driven SimPartyNpc — same visuals, but position comes from the
+    // network (see SimNetworkPuppet) rather than AiManager. Takes priority over
+    // `solo` so a solo-selected AI strat still shows other real participants.
+    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null)
     {
         var presets = roleOverride is { } skip
             ? PartyPresets.ForRole(skip)
@@ -51,15 +57,25 @@ internal static unsafe class PartyCreator
         for (int i = 0; i < presets.Count; i++)
         {
             var preset = presets[i];
+            var role = (PartyRole)i;
             if (preset == null)
             {
                 // Player's own job slot — wire the SimPlayer in directly so
                 // Party.Get(role) returns a uniform SimCharacter.
-                party.SetSlot((PartyRole)i, player);
+                party.SetSlot(role, player);
                 continue;
             }
 
-            // Solo mode: only the player's own slot is filled — skip every doppel.
+            if (networkRoles != null && networkRoles.Contains(role))
+            {
+                var angle0 = (i / (float)presets.Count) * MathF.Tau;
+                var localPos0 = new Vector3(MathF.Sin(angle0) * RingRadius, 0f, MathF.Cos(angle0) * RingRadius);
+                var puppet = SpawnPuppet(preset, world, role, new Placement(localPos0, MathF.Atan2(-localPos0.X, -localPos0.Z)), itemSheet);
+                if (puppet != null) party.SetSlot(role, puppet);
+                continue;
+            }
+
+            // Solo mode: only the player's own slot (and any network puppets) is filled.
             if (solo) continue;
 
             var angle = (i / (float)presets.Count) * MathF.Tau
@@ -70,14 +86,46 @@ internal static unsafe class PartyCreator
             var localPos = new Vector3(MathF.Sin(angle) * distance, 0f, MathF.Cos(angle) * distance);
             var facingPlayer = MathF.Atan2(-localPos.X, -localPos.Z);
 
-            var member = Spawn(preset, world, (PartyRole)i, new Placement(localPos, facingPlayer), itemSheet);
-            if (member != null) party.SetSlot((PartyRole)i, member);
+            var member = Spawn(preset, world, role, new Placement(localPos, facingPlayer), itemSheet);
+            if (member != null) party.SetSlot(role, member);
         }
     }
 
     private static SimPartyNpc? Spawn(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet)
     {
-        if (!CharacterManagerHelper.CreateCharacter(out var idx, out var obj)) return null;
+        if (!SpawnNative(preset, world, placement, itemSheet, out var idx)) return null;
+
+        Plugin.Log.Info($"PartyCreator: spawned {preset.Name} ({role}, job {preset.ClassJob}) at index {idx}");
+        var member = new SimPartyNpc(idx, world.Coordinates, role, preset.ClassJob, preset.Name);
+        // Bots steer around the scenario's geometry; only doppels get the live
+        // field (bosses/player/puppets keep ObstacleField.Empty and move in straight lines).
+        member.Obstacles = world.Obstacles;
+        // Seed the stored Position/Rotation to match the spawn placement so
+        // anything reading SimCharacter.Position before the first Tick sees
+        // the correct value (the Tick re-sync only kicks in next frame).
+        member.SetPosition(placement);
+        return member;
+    }
+
+    // A puppet needs the same doppel visuals as a bot (Spawn) but never moves on
+    // its own — its Movement is a no-op (SimNetworkPuppet), so it's excluded from
+    // the Obstacles field that only steering doppels need.
+    private static SimNetworkPuppet? SpawnPuppet(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet)
+    {
+        if (!SpawnNative(preset, world, placement, itemSheet, out var idx)) return null;
+
+        Plugin.Log.Info($"PartyCreator: spawned network puppet {preset.Name} ({role}, job {preset.ClassJob}) at index {idx}");
+        var puppet = new SimNetworkPuppet(idx, world.Coordinates, role, preset.ClassJob, preset.Name);
+        puppet.SetPosition(placement);
+        return puppet;
+    }
+
+    // Shared native BattleChara setup for both a bot doppel and a network puppet
+    // — identical visuals, only the wrapper type and movement behaviour differ.
+    private static bool SpawnNative(PartyMemberPreset preset, SimWorld world, Placement placement, ExcelSheet<Item> itemSheet, out int idx)
+    {
+        idx = -1;
+        if (!CharacterManagerHelper.CreateCharacter(out idx, out var obj)) return false;
 
         var gameObj = (GameObject*)obj;
         var chara = (BattleChara*)obj;
@@ -123,16 +171,7 @@ internal static unsafe class PartyCreator
             chara->CurrentWorld = localChara->CurrentWorld;
         }
 
-        Plugin.Log.Info($"PartyCreator: spawned {preset.Name} ({role}, job {preset.ClassJob}) at index {idx}");
-        var member = new SimPartyNpc(idx, world.Coordinates, role, preset.ClassJob, preset.Name);
-        // Bots steer around the scenario's geometry; only doppels get the live
-        // field (bosses/player keep ObstacleField.Empty and move in straight lines).
-        member.Obstacles = world.Obstacles;
-        // Seed the stored Position/Rotation to match the spawn placement so
-        // anything reading SimCharacter.Position before the first Tick sees
-        // the correct value (the Tick re-sync only kicks in next frame).
-        member.SetPosition(placement);
-        return member;
+        return true;
     }
 
     private static void WriteCustomize(BattleChara* chara)

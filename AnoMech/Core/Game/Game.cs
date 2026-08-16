@@ -36,6 +36,9 @@ public sealed class Game : IDisposable
     public EventScheduler Events { get; } = new();
     public SimWorld World { get; }
     public SimPlayer? Player => World.Party.Player;
+    // Null once Reset/Leave clears it -- MultiplayerManager's host-side tick reads
+    // this to stop broadcasting once the multiplayer run has ended locally.
+    public IScenario? ActiveScenario => activeScenario;
     // Flat registry; the zone -> phase -> scenario tree is derived from it in
     // first-appearance order.
     public IReadOnlyList<IScenario> Scenarios { get; }
@@ -117,8 +120,32 @@ public sealed class Game : IDisposable
     // selectedWaymark: index into the scenario's WaymarkPresets; ignored when it has none.
     public void RunScenario(IScenario scenario, PartyRole? roleOverride = null, int? selectedAi = 0, int selectedWaymark = 0)
     {
-        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark));
+        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, null, isPeer: false));
     }
+
+    // Multiplayer host: same as RunScenario but `networkRoles` (claimed by joined
+    // peers) get a SimNetworkPuppet instead of an AI bot. The host still runs the
+    // full scenario/AI/DamageSolver simulation unmodified — see MultiplayerManager.
+    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles)
+    {
+        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, isPeer: false));
+    }
+
+    // Multiplayer peer: loads the same cosmetic zone/party/waymarks as the host but
+    // never calls zone.Run/phase.Run/scenario.Run — no local RNG, AI, or DamageSolver.
+    // Every slot other than the peer's own is a SimNetworkPuppet driven entirely by
+    // WorldSnapshot messages from the host (see MultiplayerManager).
+    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles)
+    {
+        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, isPeer: true));
+    }
+
+    // Fired whenever Kill actually takes a party slot down (gameplay side effects ran,
+    // i.e. the same condition that makes Kill return true) — host-side hook for
+    // MultiplayerManager to broadcast RoleKilled to peers. Not raised by a peer's own
+    // reactive Kill calls (peers only ever call Kill in response to a received
+    // RoleKilled, so re-broadcasting it would just echo the message back).
+    public event Action<PartyRole, string>? PartyMemberKilled;
 
     // The selected preset, or [0] as the default.
     private static IReadOnlyList<Waymark> ResolveWaymarks(IZone zone, int selectedWaymark)
@@ -129,7 +156,7 @@ public sealed class Game : IDisposable
         return presets[0].Markers;
     }
 
-    private void RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark)
+    private void RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark, IReadOnlySet<PartyRole>? networkRoles, bool isPeer)
     {
         var solo = selectedAi is null;
         var phase = scenario.Phase;
@@ -163,11 +190,18 @@ public sealed class Game : IDisposable
         World.ScenarioOrigin = zone.Origin;
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
         World.PlaceWaymarks(ResolveWaymarks(zone, selectedWaymark));
-        World.CreateParty(player.ClassJob.RowId, roleOverride, solo);
-        // zone.Run creates the SimArenaBoundary the out-of-arena check below reads.
-        zone.Run(World);
-        phase.Run(World);
-        scenario.Run(World, selectedAi);
+        World.CreateParty(player.ClassJob.RowId, roleOverride, solo, networkRoles);
+        // A peer runs no scenario logic at all (no RNG, AI, or DamageSolver) — its
+        // arena boundary, boss timeline, and mechanic resolution all come from the
+        // host via WorldSnapshot/RoleKilled instead. zone.Run creates the
+        // SimArenaBoundary the out-of-arena check below reads, so peers skip that
+        // check too (TeleportPlayerToSpawnIfOutsideArena no-ops with no boundary).
+        if (!isPeer)
+        {
+            zone.Run(World);
+            phase.Run(World);
+            scenario.Run(World, selectedAi);
+        }
         // Entering the zone always starts at spawn; a restart only recenters the player
         // if they're standing outside the arena ring (otherwise they keep their position).
         if (freshLoad)
@@ -175,8 +209,11 @@ public sealed class Game : IDisposable
         else
             TeleportPlayerToSpawnIfOutsideArena();
         ResetSprintCooldown();
-        activeScenario = scenario;
-        scenarioElapsed = 0f;
+        if (!isPeer)
+        {
+            activeScenario = scenario;
+            scenarioElapsed = 0f;
+        }
 
         // Reconcile BGM to the new scenario. Bgm.Play is idempotent, so switching
         // between same-track scenarios (e.g. the P5 phases) keeps playing without
@@ -265,6 +302,7 @@ public sealed class Game : IDisposable
             return false;
         }
         target.OnKilled();
+        PartyMemberKilled?.Invoke(target.Role, cause);
         if (!firstFreezeScheduled)
         {
             firstFreezeScheduled = true;
@@ -289,6 +327,7 @@ public sealed class Game : IDisposable
     {
         SimPlayer => "You",
         SimPartyNpc pm => pm.DisplayName,
+        SimNetworkPuppet pm => pm.DisplayName,
         _ => "Character",
     };
 

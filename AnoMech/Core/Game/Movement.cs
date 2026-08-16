@@ -264,3 +264,18 @@ internal sealed class PlayerMovement(SimCharacter parent) : Movement(parent)
         // NO-OP - player cannot be moved like this
     }
 }
+
+// A network puppet's position is set directly from received poses
+// (SimNetworkPuppet.ApplyNetworkPose -> SimCharacter.SetPosition), not by local
+// pathing. AI/scenario code addresses party slots uniformly regardless of what
+// occupies them (see AiManager.Move calling .MoveTo on every slot including the
+// real player's), so this no-ops the same calls PlayerMovement already no-ops --
+// otherwise a scheduled bot MoveTo would fight the network-driven position every
+// frame via Movement.Tick's own SetPosition calls.
+internal sealed class NetworkPuppetMovement(SimCharacter parent) : Movement(parent)
+{
+    public override void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)
+    {
+        // NO-OP - position comes from the network, not local pathing
+    }
+}

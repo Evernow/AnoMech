@@ -11,6 +11,7 @@ using AnoMech.Core;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
 using AnoMech.Scenarios;
+using AnoMech.Scenarios.Umad.P3BlackHole;
 using static AnoMech.Core.Game.Game;
 
 namespace AnoMech.Windows;
@@ -220,6 +221,11 @@ public unsafe class MainWindow : Window, IDisposable
         var game = plugin.Game;
 
         ImGui.TextUnformatted(FullName(_selectedScenario));
+        if (_selectedScenario is UmadP3BlackHoleScenario)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Multiplayer...")) plugin.MultiplayerWindow.Toggle();
+        }
         ImGui.Separator();
         DrawLocationHint();
 

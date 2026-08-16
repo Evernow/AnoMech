@@ -62,6 +62,11 @@ public sealed unsafe class SimEnemy : SimNpc
 
     public uint BNpcBaseId { get; }
 
+    // The config this enemy was spawned with. Read by MultiplayerManager's host-side
+    // sampler so a peer can reconstruct the same doppel locally via world.SpawnEnemy —
+    // avoids inventing a parallel spawn-description format for network replication.
+    public EnemySpawnConfig SpawnConfig { get; internal set; }
+
 
     // Live-read via GameObject::GetName() (vfunc 6, resolves NameId -> BNpcName) —
     // same path the target bar uses, so engine-driven renames mid-fight propagate
@@ -96,6 +101,10 @@ public sealed unsafe class SimEnemy : SimNpc
     public bool IsCasting => cast.IsCasting;
     public uint CastActionId => cast.ActionId;
     public float CastProgress => cast.Progress;
+
+    // The last value passed to SetVisible -- read by MultiplayerManager's host-side
+    // sampler. Not the same as IsEngineVisible (that lags behind async model load).
+    public bool Visible => desiredVisible;
 
     internal SimEnemy(int index, uint bNpcBaseId, string displayName, EnemyListMode enemyListMode, Coordinates coordinates) : base(index, coordinates)
     {
@@ -197,7 +206,10 @@ public sealed unsafe class SimEnemy : SimNpc
         if (config.Level != 0) chara->Level = config.Level;
 
         Plugin.Log.Info($"SimEnemy: spawned BNpcBase {config.BNpcBaseId} (ModelChara {bnpc.ModelChara.RowId}, scale {bnpc.Scale}) at index {idx}");
-        var enemy = new SimEnemy(idx, config.BNpcBaseId, displayName, config.EnemyList, world.Coordinates);
+        var enemy = new SimEnemy(idx, config.BNpcBaseId, displayName, config.EnemyList, world.Coordinates)
+        {
+            SpawnConfig = config,
+        };
         // Mirror the native position/rotation writes above into the C#-side fields.
         enemy.SetPosition(config.Placement);
         enemy.SetTargetable(config.Targetable);

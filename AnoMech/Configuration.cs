@@ -13,6 +13,10 @@ public class Configuration : IPluginConfiguration
     public bool EnableEventLogging { get; set; } = false;
     public bool SuppressBgm { get; set; } = true;
 
+    // Multiplayer relay address (see Relay/README.md) -- remembered across
+    // sessions so the user only has to type it once.
+    public string RelayServerUrl { get; set; } = "";
+
     // Firewall opcode config — updated automatically by OpcodeUpdater on game version change.
     public uint[] ZoneDownOpcodes { get; set; } = [];
     public string ZoneFirewallGameVersion { get; set; } = "";
