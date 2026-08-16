@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
 using AnoMech.Multiplayer;
@@ -52,7 +54,11 @@ public class MultiplayerWindow : Window, IDisposable
             "simulation; up to 7 others join and take over bot slots.");
         ImGui.Separator();
 
-        if (!mp.IsConnected)
+        // Gated on SessionCode (cleared only by LeaveSession), not IsConnected --
+        // a brief relay drop mid-session must keep showing the roster (with a
+        // Reconnecting indicator) rather than yanking the user back to the
+        // connect form, which would look like they'd been kicked out entirely.
+        if (mp.SessionCode == null)
             DrawConnectPanel();
         else
             DrawConnectedPanel();
@@ -91,6 +97,12 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.SetNextItemWidth(200);
         ImGui.InputText("Display name", ref displayName, 64);
 
+        if (mp.ConnectionError is { } err)
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"Connection failed: {err}");
+        }
+
         ImGui.Spacing();
         ImGui.BeginDisabled(!validUrl);
         if (ImGui.Button("Host new session"))
@@ -115,6 +127,20 @@ public class MultiplayerWindow : Window, IDisposable
 
     private void DrawConnectedPanel()
     {
+        // IsConnected here is a live socket-state check (RelayClient.IsConnected),
+        // re-read every frame -- if the relay drops between opening this window
+        // and clicking Start, this goes red before the host can start a run
+        // peers can't actually receive.
+        var stable = mp.IsConnected;
+        if (stable)
+            ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.4f, 1f), "● Connected to relay");
+        else if (mp.IsReconnecting)
+            ImGui.TextColored(new Vector4(1f, 0.8f, 0.3f, 1f), $"● Reconnecting to relay... (attempt {mp.ReconnectAttempt})");
+        else
+            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "● Not connected to relay");
+        if (!stable && mp.ConnectionError is { } connErr)
+            ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), $"Last error: {connErr}");
+
         if (mp.IsHost && mp.SessionCode != null)
         {
             ImGui.TextUnformatted("Session code:");
@@ -129,6 +155,16 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.TextUnformatted(mp.Session.Started ? "Running." : "Connected -- waiting for the host to start.");
         }
 
+        // Surfaced directly to whoever needs to act (update their plugin),
+        // rather than leaving it as a silently-rejected Claim click they'd
+        // have to guess the reason for. Host mismatches vs. any claimed peer
+        // are covered per-row below since the host can't be "wrong" relative
+        // to itself.
+        var myMismatchVsHost = !mp.IsHost && mp.IsVersionMismatched(mp.Session.HostId);
+        if (myMismatchVsHost)
+            ImGui.TextColored(new Vector4(1f, 0.55f, 0.15f, 1f),
+                "⚠ You're on a different AnoMech build than the host -- update before claiming a role.");
+
         ImGui.Separator();
         ImGui.TextUnformatted("Roles:");
         for (var i = 0; i < 8; i++)
@@ -136,15 +172,34 @@ public class MultiplayerWindow : Window, IDisposable
             var role = (PartyRole)i;
             var claimed = mp.Session.ClaimedBy.TryGetValue(role, out var peerId);
             var mine = claimed && peerId == mp.MyPeerId;
-            var label = claimed ? mp.Session.NameOf(peerId) : "(open, bot)";
+            var stale = claimed && !mine && mp.IsPeerStale(peerId);
+            var mismatched = claimed && !mine && mp.IsVersionMismatched(peerId);
+            var label = claimed
+                ? mp.Session.NameOf(peerId) + (mine ? " (you)" : "") + (stale ? " (disconnected?)" : "") + (mismatched ? " (version mismatch!)" : "")
+                : "(open, bot)";
 
             ImGui.TextUnformatted(RoleLabels[i]);
             ImGui.SameLine(50);
-            ImGui.TextUnformatted(label);
-            ImGui.SameLine(220);
+            if (claimed && !mine)
+            {
+                DrawStatusDot(mp.GetPeerStatus(peerId), stale);
+                ImGui.SameLine();
+            }
+            if (mismatched)
+                ImGui.TextColored(new Vector4(1f, 0.55f, 0.15f, 1f), label);
+            else if (stale)
+                ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), label);
+            else
+                ImGui.TextUnformatted(label);
+            if (mismatched && ImGui.IsItemHovered())
+            {
+                var theirs = mp.Session.Builds.GetValueOrDefault(peerId);
+                ImGui.SetTooltip($"Different plugin build than yours.\nYours: {PluginBuildInfo.Version} ({PluginBuildInfo.Checksum})\nTheirs: {theirs?.Version ?? "?"} ({theirs?.Checksum ?? "?"})\nUpdate to matching versions before starting.");
+            }
+            ImGui.SameLine(240);
 
             ImGui.PushID(i);
-            ImGui.BeginDisabled(mp.Session.Started || (claimed && !mine));
+            ImGui.BeginDisabled(mp.Session.Started || (claimed && !mine) || (!claimed && myMismatchVsHost));
             if (mine)
             {
                 if (ImGui.SmallButton("Release")) mp.ReleaseRole();
@@ -158,13 +213,28 @@ public class MultiplayerWindow : Window, IDisposable
         }
 
         ImGui.Separator();
-        if (mp.IsHost && !mp.Session.Started)
+        if (!mp.Session.Started)
         {
-            ImGui.BeginDisabled(mp.MyClaimedRole == null);
-            if (ImGui.Button("Start")) mp.StartScenario();
-            ImGui.EndDisabled();
-            if (mp.MyClaimedRole == null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                ImGui.SetTooltip("Claim a role for yourself first.");
+            if (mp.IsHost)
+            {
+                var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
+                var canStart = stable && mp.MyClaimedRole != null && !anyMismatch;
+                ImGui.BeginDisabled(!canStart);
+                if (ImGui.Button("Start")) mp.StartScenario();
+                ImGui.EndDisabled();
+                if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip(!stable
+                        ? "Not connected to the relay."
+                        : anyMismatch
+                            ? "One or more players are on a different plugin build -- everyone needs to match before starting."
+                            : "Claim a role for yourself first.");
+            }
+            else
+            {
+                ImGui.BeginDisabled();
+                ImGui.Button("Start (controlled by host)");
+                ImGui.EndDisabled();
+            }
             ImGui.SameLine();
         }
 
@@ -173,5 +243,50 @@ public class MultiplayerWindow : Window, IDisposable
             mp.LeaveSession();
             plugin.Game.Leave();
         }
+    }
+
+    // Ping color bands per the below thresholds; grey/red cover the two
+    // "no number to show" cases (no Pong yet vs. flagged stale) so the dot
+    // never silently reads as a suspiciously good 0ms.
+    private static void DrawStatusDot(PeerStatusEntry? status, bool stale)
+    {
+        Vector4 color;
+        string tooltip;
+        if (stale)
+        {
+            color = new Vector4(1f, 0.35f, 0.35f, 1f);
+            tooltip = "No message received in a while -- likely disconnected.";
+        }
+        else if (status is not { } s)
+        {
+            color = new Vector4(0.6f, 0.6f, 0.6f, 1f);
+            tooltip = "Connected -- waiting for a status update...";
+        }
+        else if (s.LatencyMs is not { } ms)
+        {
+            color = new Vector4(0.6f, 0.6f, 0.6f, 1f);
+            tooltip = "Connected -- measuring ping...";
+        }
+        else if (ms < 100f)
+        {
+            color = new Vector4(0.4f, 0.9f, 0.4f, 1f);
+            tooltip = $"Ping: {ms:F0}ms (good)";
+        }
+        else if (ms <= 300f)
+        {
+            color = new Vector4(0.95f, 0.85f, 0.3f, 1f);
+            tooltip = $"Ping: {ms:F0}ms (fair)";
+        }
+        else
+        {
+            color = new Vector4(1f, 0.4f, 0.4f, 1f);
+            tooltip = $"Ping: {ms:F0}ms (poor)";
+        }
+        if (status is { } shown)
+            tooltip += $"\nLast message: {shown.SecondsSinceLastSeen:F0}s ago";
+
+        ImGui.TextColored(color, "●");
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(tooltip);
     }
 }

@@ -90,22 +90,41 @@ internal static class Program
 
         Console.WriteLine($"[{sessionCode}] peer joined ({CountPeers(sessionCode)} connected)");
 
-        var buffer = new byte[16 * 1024];
+        // A single logical WebSocket message (e.g. a large WorldSnapshotMessage,
+        // which grows with live enemy/tether count) can arrive split across many
+        // frames -- ReceiveAsync only fills one frame per call and reports
+        // EndOfMessage=false until the last one. Broadcasting after every single
+        // ReceiveAsync (the old behaviour) forwarded each fragment standalone,
+        // silently truncating/corrupting any message bigger than one read: fine
+        // early in a fight when snapshots are small, but as soon as enough adds
+        // are alive to push a snapshot past one frame, every later snapshot
+        // arrived at peers as broken JSON and got dropped. Buffer until
+        // EndOfMessage before forwarding anything.
+        var readBuffer = new byte[16 * 1024];
+        using var messageBuffer = new MemoryStream();
         try
         {
             while (socket.State == WebSocketState.Open)
             {
-                var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
-                if (result.MessageType == WebSocketMessageType.Close)
+                messageBuffer.SetLength(0);
+                WebSocketReceiveResult result;
+                do
                 {
-                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-                    break;
-                }
+                    result = await socket.ReceiveAsync(readBuffer, CancellationToken.None);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+                        goto closed;
+                    }
+                    messageBuffer.Write(readBuffer, 0, result.Count);
+                } while (!result.EndOfMessage);
+
                 if (result.MessageType != WebSocketMessageType.Text) continue;
 
-                var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                var text = Encoding.UTF8.GetString(messageBuffer.GetBuffer(), 0, (int)messageBuffer.Length);
                 await BroadcastAsync(sessionCode, socket, text);
             }
+            closed: ;
         }
         catch (WebSocketException)
         {

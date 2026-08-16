@@ -237,17 +237,28 @@ public unsafe class MainWindow : Window, IDisposable
         var busy = ZoneSession.IsPlayerBusy();
         var envReady = inInn && !busy;
         var hasStrat = HasStartableStrat();
-        var canStart = envReady && hasStrat;
+        // These buttons call game.RunScenario directly -- the plain solo/AI path,
+        // entirely bypassing MultiplayerManager. While connected to a multiplayer
+        // session for this scenario, that path must be blocked: the host clicking
+        // this instead of the Multiplayer window's own Start button would run a
+        // real fight locally without ever sending a StartMessage, leaving every
+        // guest stuck on "waiting for the host to start" forever; a peer clicking
+        // it would start a second, fully independent local simulation instead of
+        // waiting for the host's broadcast.
+        var mpBlocked = _selectedScenario is UmadP3BlackHoleScenario && plugin.Multiplayer.IsConnected;
+        var canStart = envReady && hasStrat && !mpBlocked;
         ImGui.BeginDisabled(!canStart);
         if (ImGui.Button("Start")) game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
         ImGui.EndDisabled();
         if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
-            ImGui.SetTooltip(!inInn
-                ? "Scenarios can only be started from an inn."
-                : busy
-                    ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
-                    : "No strat available for this region yet.");
+            ImGui.SetTooltip(mpBlocked
+                ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
+                : !inInn
+                    ? "Scenarios can only be started from an inn."
+                    : busy
+                        ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
+                        : "No strat available for this region yet.");
         }
         ImGui.SameLine();
         if (ImGui.Button("Reset")) game.Reset();
@@ -259,14 +270,16 @@ public unsafe class MainWindow : Window, IDisposable
 
         if (_selectedScenario.SupportsSolo)
         {
-            ImGui.BeginDisabled(!envReady);
+            ImGui.BeginDisabled(!envReady || mpBlocked);
             if (ImGui.Button("Start Solo")) game.RunScenario(_selectedScenario, _roleOverride, selectedAi: null, _selectedWaymark);
             ImGui.EndDisabled();
-            if (!envReady && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            if ((!envReady || mpBlocked) && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             {
-                ImGui.SetTooltip(!inInn
-                    ? "Scenarios can only be started from an inn."
-                    : "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.).");
+                ImGui.SetTooltip(mpBlocked
+                    ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
+                    : !inInn
+                        ? "Scenarios can only be started from an inn."
+                        : "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.).");
             }
         }
 

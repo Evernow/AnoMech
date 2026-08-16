@@ -30,7 +30,22 @@ public sealed class RelayClient : IDisposable
     public async Task ConnectAsync(string baseUrl, string sessionCode)
     {
         var uri = new Uri($"{baseUrl.TrimEnd('/')}/session/{Uri.EscapeDataString(sessionCode)}");
-        await socket.ConnectAsync(uri, cts.Token).ConfigureAwait(false);
+        try
+        {
+            await socket.ConnectAsync(uri, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            // Callers (MultiplayerManager.HostSession/JoinSession) fire this
+            // fire-and-forget -- without catching here, a failed handshake
+            // (wrong ws/wss scheme, relay down, TLS misconfig) surfaced only as
+            // an "Unobserved exception in Task" on the finalizer thread, with
+            // no in-game feedback at all. Route it through Disconnected instead
+            // so MultiplayerManager/UI can show it like any other drop.
+            Plugin.Log.Warning($"[RelayClient] Connect to {uri} failed: {e.Message}");
+            Disconnected?.Invoke(e);
+            return;
+        }
         _ = Task.Run(ReceiveLoopAsync);
     }
 
@@ -75,7 +90,12 @@ public sealed class RelayClient : IDisposable
                 {
                     message = JsonSerializer.Deserialize<MpMessage>(ms.ToArray(), JsonOptions);
                 }
-                catch (JsonException e)
+                // Broader than just JsonException: a relay-side bug, a mid-stream
+                // protocol version mismatch, or plain bit-rot on a bad connection
+                // can all surface as other exception types out of the polymorphic
+                // deserializer. One bad message should never take the whole
+                // connection down -- log and keep reading.
+                catch (Exception e) when (e is not OperationCanceledException)
                 {
                     Plugin.Log.Warning($"[RelayClient] Malformed message dropped: {e.Message}");
                     continue;

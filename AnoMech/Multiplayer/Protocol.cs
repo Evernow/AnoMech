@@ -21,11 +21,22 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(SelfPoseMessage), "pose")]
 [JsonDerivedType(typeof(WorldSnapshotMessage), "snapshot")]
 [JsonDerivedType(typeof(RoleKilledMessage), "killed")]
+[JsonDerivedType(typeof(EndMessage), "end")]
+[JsonDerivedType(typeof(PingMessage), "ping")]
+[JsonDerivedType(typeof(PongMessage), "pong")]
+[JsonDerivedType(typeof(PeerStatusMessage), "status")]
 public abstract record MpMessage;
 
 // Peer -> host, sent once right after connecting so the host can register a
-// display name for the lobby roster before any role is claimed.
-public sealed record HelloMessage(Guid PeerId, string DisplayName) : MpMessage;
+// display name for the lobby roster before any role is claimed. Version/
+// Checksum identify the sender's exact plugin build (see PluginBuildInfo) so
+// the host can catch a mismatch before it turns into a silent desync.
+public sealed record HelloMessage(Guid PeerId, string DisplayName, string Version, string Checksum) : MpMessage;
+
+// One peer's plugin build as declared in their Hello. Checksum is what
+// actually gets compared (see MultiplayerManager.IsVersionMismatched);
+// Version is only for the human-readable message.
+public sealed record PeerBuildInfo(string Version, string Checksum);
 
 // Host -> everyone, full-state (not delta) so a client that missed an update
 // self-heals on the next broadcast instead of drifting from a merge bug.
@@ -33,6 +44,7 @@ public sealed record LobbyStateMessage(
     Guid HostId,
     Dictionary<PartyRole, Guid> ClaimedBy,
     Dictionary<Guid, string> Names,
+    Dictionary<Guid, PeerBuildInfo> Builds,
     bool Started) : MpMessage;
 
 public sealed record ClaimRoleMessage(Guid PeerId, PartyRole Role) : MpMessage;
@@ -77,3 +89,31 @@ public sealed record WorldSnapshotMessage(List<EnemyState> Enemies, List<TetherS
 // Game.Kill on whatever currently occupies that role locally -- their own real
 // SimPlayer if it's their claimed role, otherwise that role's local puppet.
 public sealed record RoleKilledMessage(PartyRole Role, string Cause) : MpMessage;
+
+// Host -> everyone, sent whenever the host's own run ends for any reason
+// (Reset, Leave, or the scenario finishing) -- ResetInternal clears
+// ActiveScenario the same way regardless of which button triggered it, so
+// MultiplayerManager.Tick detects all of them from that one place. Without
+// this, a peer whose host left had no way to find out and just kept running
+// their local copy of the zone forever.
+public sealed record EndMessage : MpMessage;
+
+// Host -> everyone, every PingIntervalSeconds -- decoupled from Started so
+// connection-quality info is already live in the lobby before anyone clicks
+// Start. SentAtMs is the host's own Environment.TickCount64; only the host
+// ever compares it against a later reading of that same clock (on the
+// matching Pong), so there's no cross-machine clock sync to worry about.
+public sealed record PingMessage(long SentAtMs) : MpMessage;
+
+// Peer -> host, sent immediately on receiving a PingMessage, echoing SentAtMs
+// back unchanged so the host can compute round-trip time on its own clock.
+public sealed record PongMessage(Guid PeerId, long SentAtMs) : MpMessage;
+
+// One peer's connection quality as last measured by the host. LatencyMs is
+// null until that peer's first Pong comes back.
+public sealed record PeerStatusEntry(float? LatencyMs, float SecondsSinceLastSeen);
+
+// Host -> everyone, alongside each PingMessage. Full-state (every claimed
+// peer, not just whoever changed) so a peer's roster UI matches the host's
+// without peers needing their own liveness bookkeeping.
+public sealed record PeerStatusMessage(Dictionary<Guid, PeerStatusEntry> Statuses) : MpMessage;

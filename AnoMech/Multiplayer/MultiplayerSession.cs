@@ -14,6 +14,7 @@ public sealed class MultiplayerSession
     public Guid HostId { get; set; }
     public Dictionary<PartyRole, Guid> ClaimedBy { get; private set; } = new();
     public Dictionary<Guid, string> Names { get; private set; } = new();
+    public Dictionary<Guid, PeerBuildInfo> Builds { get; private set; } = new();
     public bool Started { get; set; }
 
     public void ApplyLobbyState(LobbyStateMessage msg)
@@ -21,10 +22,13 @@ public sealed class MultiplayerSession
         HostId = msg.HostId;
         ClaimedBy = new Dictionary<PartyRole, Guid>(msg.ClaimedBy);
         Names = new Dictionary<Guid, string>(msg.Names);
+        Builds = new Dictionary<Guid, PeerBuildInfo>(msg.Builds);
         Started = msg.Started;
     }
 
-    public LobbyStateMessage ToMessage() => new(HostId, new Dictionary<PartyRole, Guid>(ClaimedBy), new Dictionary<Guid, string>(Names), Started);
+    public LobbyStateMessage ToMessage() => new(
+        HostId, new Dictionary<PartyRole, Guid>(ClaimedBy), new Dictionary<Guid, string>(Names),
+        new Dictionary<Guid, PeerBuildInfo>(Builds), Started);
 
     public PartyRole? RoleOf(Guid peerId) =>
         ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => (PartyRole?)kv.Key).FirstOrDefault();

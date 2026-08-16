@@ -45,7 +45,7 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
         var native = BattleCharaPtr;
         if (native != null)
         {
-            Position = Coordinates.ToLocal(native->Position);
+            position = Coordinates.ToLocal(native->Position);
             Rotation = native->Rotation;
         }
         statusList.Update(deltaSeconds);
@@ -63,18 +63,22 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     // Location Subsystem
     // -------------------------
     
-    // Character position in local coordinates. Updated every frame to be always in sync with game
-    public Vector3 Position { get; private set; }
+    // Character position in local coordinates. Updated every frame to be always in sync with game.
+    // Virtual so SimNetworkPuppet can report the peer's true latest reported position here (for
+    // mechanic resolution: AoeQuery, distance checks, gaze facing, ...) even while the rendered
+    // model is still smoothly catching up to it -- see SimNetworkPuppet.Position.
+    private Vector3 position;
+    public virtual Vector3 Position => position;
     public float Rotation { get; private set; }
-    
-    public void SetPosition(Vector3 position)
+
+    public void SetPosition(Vector3 newPosition)
     {
         var obj = BattleCharaPtr;
         if (obj == null) return;
-        var w = Coordinates.ToGlobal(position);
+        var w = Coordinates.ToGlobal(newPosition);
         obj->SetPosition(w.X, w.Y, w.Z);
         if (obj->DrawObject != null) obj->DrawObject->Object.Position = w;
-        Position = position; // early update, will be updated on next tick anyway
+        position = newPosition; // early update, will be updated on next tick anyway
     }
     
     public void SetRotation(float rotation)

@@ -17,6 +17,12 @@ public class Configuration : IPluginConfiguration
     // sessions so the user only has to type it once.
     public string RelayServerUrl { get; set; } = "";
 
+    // Stable per-install multiplayer identity. Reused across Host/Join calls
+    // (instead of a fresh Guid each time) so that if a peer's connection drops
+    // and they rejoin the same session, the host's still-held role claim for
+    // their old identity matches their new connection instead of orphaning it.
+    public Guid LocalPeerId { get; set; } = Guid.NewGuid();
+
     // Firewall opcode config — updated automatically by OpcodeUpdater on game version change.
     public uint[] ZoneDownOpcodes { get; set; } = [];
     public string ZoneFirewallGameVersion { get; set; } = "";
