@@ -81,6 +81,14 @@ public sealed class MultiplayerManager : IDisposable
     // received here. This is why MultiplayerWindow's status lookup doesn't
     // need to branch on IsHost at all.
     private readonly Dictionary<Guid, PeerStatusEntry> peerStatuses = new();
+    // Peer-only: the host is deliberately excluded from peerStatuses above (it
+    // never pings itself, so there's no latency number to report) -- without
+    // this, a peer's own view of the host's row would be permanently stuck on
+    // "waiting for a status update" since it would never receive an entry for
+    // the host's own PeerId. Tracked separately from peerLastSeenMs (which is
+    // host-only ground truth about *its* peers) by watching every host-
+    // originated broadcast a peer receives -- see DispatchCore.
+    private long lastHostMessageMs;
 
     // ---- Reconnection --------------------------------------------------------
     // The relay has no session persistence beyond "sockets currently in the
@@ -112,6 +120,13 @@ public sealed class MultiplayerManager : IDisposable
     // "Unobserved exception in Task" in the raw Dalamud log. Cleared whenever
     // a fresh Host/Join attempt starts.
     public string? ConnectionError { get; private set; }
+    // Set when a session ends out from under a peer -- the host explicitly
+    // left, or we lost contact with them -- rather than via our own "Leave
+    // session" click, so the connect screen can say why instead of the roster
+    // just silently vanishing. LeaveSession clears it like ConnectionError;
+    // the two code paths that actually need it to survive into the connect
+    // screen set it right after their own LeaveSession call returns.
+    public string? SessionEndReason { get; private set; }
 
     public PartyRole? MyClaimedRole => Session.RoleOf(MyPeerId);
 
@@ -120,6 +135,11 @@ public sealed class MultiplayerManager : IDisposable
     // Connection-quality snapshot for a claimed peer, as last measured/relayed
     // by the host. Same accessor for host and peer callers -- see peerStatuses.
     public PeerStatusEntry? GetPeerStatus(Guid peerId) => peerStatuses.GetValueOrDefault(peerId);
+
+    // Peer-only equivalents of IsPeerStale/GetPeerStatus for the host's own
+    // roster row -- see lastHostMessageMs.
+    public float SecondsSinceHostMessage => (Environment.TickCount64 - lastHostMessageMs) / 1000f;
+    public bool IsHostStale => !IsHost && SecondsSinceHostMessage * 1000f > PeerStaleTimeoutMs;
 
     // ---- Session lifecycle ----------------------------------------------
 
@@ -150,6 +170,10 @@ public sealed class MultiplayerManager : IDisposable
         RelayUrl = relayUrl;
         SessionCode = code.Trim().ToUpperInvariant();
         Session = new MultiplayerSession();
+        // Seed to "now" rather than the long default (0) -- otherwise the host's
+        // row would read as having gone silent for decades until the very first
+        // host broadcast arrives.
+        lastHostMessageMs = Environment.TickCount64;
 
         relay = new RelayClient();
         WireRelay(relay);
@@ -173,7 +197,13 @@ public sealed class MultiplayerManager : IDisposable
         client.Disconnected += failure => OnDisconnectedOffThread(client, failure);
     }
 
-    public void LeaveSession()
+    // Public entry point for a user-initiated leave (button click) -- notifies
+    // everyone else, who then tear down via LeaveSessionInternal(false) from
+    // Dispatch's SessionEndedMessage case (see there for why anyone leaving
+    // ends it for the whole group, not just themselves).
+    public void LeaveSession() => LeaveSessionInternal(notifyOthers: true);
+
+    private void LeaveSessionInternal(bool notifyOthers)
     {
         reconnectCts?.Cancel();
         reconnectCts?.Dispose();
@@ -181,12 +211,27 @@ public sealed class MultiplayerManager : IDisposable
         reconnecting = false;
         ReconnectAttempt = 0;
         if (IsHost) Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
-        relay?.Dispose();
+
+        // Peers need to find out someone left -- otherwise they're stuck
+        // sitting in a lobby (or a stale zone, if mid-fight) waiting on a
+        // session that's already over (see SessionEndedMessage). Dispose() is
+        // synchronous and would otherwise usually abort the send before it
+        // reaches the wire, so defer disposal until the send actually
+        // completes instead of doing it inline below. notifyOthers is false
+        // when we're already reacting to someone *else's* SessionEndedMessage
+        // -- otherwise every recipient would re-broadcast its own, cascading
+        // once per remaining peer for no reason (everyone's leaving anyway).
+        if (notifyOthers && relay is { IsConnected: true } activeRelay)
+            _ = activeRelay.SendAsync(new SessionEndedMessage(MyPeerId)).ContinueWith(_ => activeRelay.Dispose());
+        else
+            relay?.Dispose();
         relay = null;
+
         running = false;
         SessionCode = null;
         RelayUrl = null;
         ConnectionError = null;
+        SessionEndReason = null;
         Session = new MultiplayerSession();
         hostEnemyNetIds.Clear();
         hostTetherNetIds.Clear();
@@ -251,6 +296,7 @@ public sealed class MultiplayerManager : IDisposable
         relay = client;
         reconnecting = false;
         ReconnectAttempt = 0;
+        lastHostMessageMs = Environment.TickCount64; // same "don't read as decades-stale" reasoning as JoinSession
         ConnectionError = null;
         // Re-registers us with the host (refreshes Names, triggers a
         // BroadcastLobbyState) -- our role claim itself is untouched since the
@@ -281,6 +327,18 @@ public sealed class MultiplayerManager : IDisposable
         if (relay == null) return;
         if (IsHost) ApplyRelease(MyPeerId);
         else _ = relay.SendAsync(new ReleaseRoleMessage(MyPeerId));
+    }
+
+    // Peer-only: MainWindow's plain Reset button routes here instead of
+    // calling Game.Reset() directly while connected as a peer, so a reset
+    // reaches the whole group (see ResetRequestMessage) instead of only
+    // clearing the requester's own local view. The host's own Reset click
+    // needs no equivalent -- it's already authoritative and already
+    // propagates via the existing Tick()/EndMessage path.
+    public void RequestReset()
+    {
+        if (IsHost || relay is not { IsConnected: true }) return;
+        _ = relay.SendAsync(new ResetRequestMessage(MyPeerId));
     }
 
     private void ApplyClaim(Guid peerId, PartyRole role)
@@ -418,6 +476,21 @@ public sealed class MultiplayerManager : IDisposable
                 SendPingAndRefreshStatuses();
             }
         }
+        else if (IsHostStale)
+        {
+            // A clean "Leave session" click reaches peers via SessionEndedMessage
+            // well within PeerStaleTimeoutMs, so this only fires for a host that
+            // vanished without warning -- a crash, alt-F4, or hard network drop,
+            // where no goodbye message was ever possible. Same end state either
+            // way: nobody's left to resume the fight with, so leave the zone (if
+            // mid-fight) and the session both, rather than sitting on a frozen
+            // roster or a stale zone forever.
+            if (running) Plugin.GameInstance.Leave();
+            LeaveSession();
+            SessionEndReason = "Lost contact with the host.";
+            LobbyChanged?.Invoke();
+            return;
+        }
 
         if (!running) return;
 
@@ -436,7 +509,10 @@ public sealed class MultiplayerManager : IDisposable
                 // retry short of leaving and re-hosting a brand new session/code.
                 Session.Started = false;
                 _ = relay?.SendAsync(Session.ToMessage());
-                _ = relay?.SendAsync(new EndMessage());
+                // Reset() leaves World.Map.IsInInstance true (deliberately stays
+                // in-zone); only Leave()/a natural finish clears it. Read here,
+                // now, before anything else can change it.
+                _ = relay?.SendAsync(new EndMessage(ReturnedToInn: !Plugin.GameInstance.World.Map.IsInInstance));
                 LobbyChanged?.Invoke();
                 return;
             }
@@ -672,11 +748,17 @@ public sealed class MultiplayerManager : IDisposable
             Plugin.GameInstance.Kill(member, msg.Cause);
     }
 
-    private void OnEndReceived()
+    private void OnEndReceived(EndMessage msg)
     {
         if (IsHost || !running) return;
         running = false;
-        Plugin.GameInstance.Leave();
+        // Mirror whichever the host actually did -- Leave() if they left the
+        // zone entirely, or Reset() to match them staying in-zone (ready for a
+        // quick re-Start) instead of always hard-kicking to the inn.
+        if (msg.ReturnedToInn)
+            Plugin.GameInstance.Leave();
+        else
+            Plugin.GameInstance.Reset();
     }
 
     // ---- Message pump -------------------------------------------------------
@@ -727,6 +809,20 @@ public sealed class MultiplayerManager : IDisposable
 
     private void DispatchCore(MpMessage message)
     {
+        // Every message type the host actually broadcasts to everyone (as
+        // opposed to a fellow peer's request that the relay's dumb fan-out
+        // happens to deliver to us too, e.g. another peer's ClaimRoleMessage --
+        // this switch just never matches those on a non-host client). Used to
+        // drive the host's own roster-row liveness (see lastHostMessageMs);
+        // must be kept in sync with the `when !IsHost` cases below.
+        // SessionEndedMessage deliberately excluded -- unlike everything else
+        // here it isn't guaranteed to have come from the host (any peer can
+        // send it now), and it's moot anyway since receiving it tears the
+        // whole session down a few lines later regardless.
+        if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage
+            or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage)
+            lastHostMessageMs = Environment.TickCount64;
+
         switch (message)
         {
             // Host-authoritative: only the host acts on requests other clients send.
@@ -777,8 +873,8 @@ public sealed class MultiplayerManager : IDisposable
             case RoleKilledMessage killed when !IsHost:
                 OnRoleKilledReceived(killed);
                 break;
-            case EndMessage when !IsHost:
-                OnEndReceived();
+            case EndMessage end when !IsHost:
+                OnEndReceived(end);
                 break;
             case PingMessage ping when !IsHost:
                 _ = relay?.SendAsync(new PongMessage(MyPeerId, ping.SentAtMs));
@@ -787,6 +883,23 @@ public sealed class MultiplayerManager : IDisposable
                 peerStatuses.Clear();
                 foreach (var (id, entry) in status.Statuses)
                     peerStatuses[id] = entry;
+                break;
+            // No `when !IsHost` guard -- anyone leaving ends the session for
+            // the whole group, including the host, so this has to run
+            // regardless of role. Read the sender's name before
+            // LeaveSessionInternal wipes Session out from under it.
+            case SessionEndedMessage ended:
+            {
+                var who = Session.NameOf(ended.PeerId);
+                if (running) Plugin.GameInstance.Leave();
+                LeaveSessionInternal(notifyOthers: false);
+                SessionEndReason = $"{who} left -- session ended.";
+                LobbyChanged?.Invoke();
+                break;
+            }
+            case ResetRequestMessage req when IsHost:
+                Plugin.Log.Information($"[Multiplayer] {Session.NameOf(req.PeerId)} requested a reset.");
+                Plugin.GameInstance.Reset();
                 break;
         }
     }

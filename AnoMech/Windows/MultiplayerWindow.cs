@@ -102,6 +102,11 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"Connection failed: {err}");
         }
+        else if (mp.SessionEndReason is { } endReason)
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), endReason);
+        }
 
         ImGui.Spacing();
         ImGui.BeginDisabled(!validUrl);
@@ -155,15 +160,22 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.TextUnformatted(mp.Session.Started ? "Running." : "Connected -- waiting for the host to start.");
         }
 
-        // Surfaced directly to whoever needs to act (update their plugin),
-        // rather than leaving it as a silently-rejected Claim click they'd
+        // Surfaced directly to whoever needs to act (update their plugin) --
+        // both checksums right here, not just a generic "different build"
+        // that would leave them guessing without hovering the host's row.
+        // Rather than leaving it as a silently-rejected Claim click they'd
         // have to guess the reason for. Host mismatches vs. any claimed peer
         // are covered per-row below since the host can't be "wrong" relative
         // to itself.
         var myMismatchVsHost = !mp.IsHost && mp.IsVersionMismatched(mp.Session.HostId);
         if (myMismatchVsHost)
+        {
+            var hostBuild = mp.Session.Builds.GetValueOrDefault(mp.Session.HostId);
             ImGui.TextColored(new Vector4(1f, 0.55f, 0.15f, 1f),
-                "⚠ You're on a different AnoMech build than the host -- update before claiming a role.");
+                "⚠ Different AnoMech build than the host -- update before claiming a role.");
+            ImGui.TextColored(new Vector4(1f, 0.55f, 0.15f, 1f),
+                $"Yours: {PluginBuildInfo.Version} ({PluginBuildInfo.ShortChecksum})   Host: {hostBuild?.Version ?? "?"} ({hostBuild?.ShortChecksum ?? "?"})");
+        }
 
         ImGui.Separator();
         ImGui.TextUnformatted("Roles:");
@@ -172,7 +184,11 @@ public class MultiplayerWindow : Window, IDisposable
             var role = (PartyRole)i;
             var claimed = mp.Session.ClaimedBy.TryGetValue(role, out var peerId);
             var mine = claimed && peerId == mp.MyPeerId;
-            var stale = claimed && !mine && mp.IsPeerStale(peerId);
+            // The host never appears in the ping-based peerStatuses broadcast
+            // (it doesn't ping itself), so its row is tracked separately --
+            // via time-since-last-broadcast rather than a fabricated 0ms ping.
+            var isHostRow = claimed && !mine && peerId == mp.Session.HostId;
+            var stale = claimed && !mine && (isHostRow ? mp.IsHostStale : mp.IsPeerStale(peerId));
             var mismatched = claimed && !mine && mp.IsVersionMismatched(peerId);
             var label = claimed
                 ? mp.Session.NameOf(peerId) + (mine ? " (you)" : "") + (stale ? " (disconnected?)" : "") + (mismatched ? " (version mismatch!)" : "")
@@ -182,7 +198,10 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.SameLine(50);
             if (claimed && !mine)
             {
-                DrawStatusDot(mp.GetPeerStatus(peerId), stale);
+                if (isHostRow)
+                    DrawHostStatusDot(mp.IsHostStale, mp.SecondsSinceHostMessage);
+                else
+                    DrawStatusDot(mp.GetPeerStatus(peerId), stale);
                 ImGui.SameLine();
             }
             if (mismatched)
@@ -194,7 +213,7 @@ public class MultiplayerWindow : Window, IDisposable
             if (mismatched && ImGui.IsItemHovered())
             {
                 var theirs = mp.Session.Builds.GetValueOrDefault(peerId);
-                ImGui.SetTooltip($"Different plugin build than yours.\nYours: {PluginBuildInfo.Version} ({PluginBuildInfo.Checksum})\nTheirs: {theirs?.Version ?? "?"} ({theirs?.Checksum ?? "?"})\nUpdate to matching versions before starting.");
+                ImGui.SetTooltip($"Different plugin build than yours.\nYours: {PluginBuildInfo.Version} ({PluginBuildInfo.ShortChecksum})\nTheirs: {theirs?.Version ?? "?"} ({theirs?.ShortChecksum ?? "?"})\nUpdate to matching versions before starting.");
             }
             ImGui.SameLine(240);
 
@@ -211,6 +230,17 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.EndDisabled();
             ImGui.PopID();
         }
+
+        // Session.Names gets an entry the moment someone's Hello lands, well
+        // before they've claimed a role -- without this, a connected friend
+        // who hasn't picked a slot yet is invisible anywhere in this window,
+        // leaving "did the invite even work?" with no positive answer.
+        var unclaimed = mp.Session.Names.Keys
+            .Where(id => id != mp.MyPeerId && !mp.Session.ClaimedBy.ContainsValue(id))
+            .Select(id => mp.Session.NameOf(id) + (mp.IsVersionMismatched(id) ? " (version mismatch)" : ""))
+            .ToList();
+        if (unclaimed.Count > 0)
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), $"Connected, no role yet: {string.Join(", ", unclaimed)}");
 
         ImGui.Separator();
         if (!mp.Session.Started)
@@ -243,6 +273,21 @@ public class MultiplayerWindow : Window, IDisposable
             mp.LeaveSession();
             plugin.Game.Leave();
         }
+    }
+
+    // The host doesn't ping itself, so there's no round-trip number to show
+    // for its row -- just whether we've heard from it recently. Green/red
+    // only (no yellow "fair" band): unlike a peer's ping, this is time-since-
+    // last-broadcast, not a latency measurement, so a three-way split would
+    // imply precision that isn't there.
+    private static void DrawHostStatusDot(bool stale, float secondsSince)
+    {
+        var color = stale ? new Vector4(1f, 0.35f, 0.35f, 1f) : new Vector4(0.4f, 0.9f, 0.4f, 1f);
+        ImGui.TextColored(color, "●");
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(stale
+                ? $"No message from the host in {secondsSince:F0}s -- likely disconnected."
+                : $"Host -- last message {secondsSince:F0}s ago.");
     }
 
     // Ping color bands per the below thresholds; grey/red cover the two

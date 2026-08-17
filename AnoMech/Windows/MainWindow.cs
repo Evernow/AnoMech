@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using System.Reflection;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Components;
@@ -10,6 +9,7 @@ using AnoMech.Core.Map;
 using AnoMech.Core;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
+using AnoMech.Multiplayer;
 using AnoMech.Scenarios;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 using static AnoMech.Core.Game.Game;
@@ -58,14 +58,13 @@ public unsafe class MainWindow : Window, IDisposable
     private readonly DebugMenu debugMenu;
 #endif
 
-    // <Version> from AnoMech.csproj flows into the assembly version; surface it in the
-    // title bar. Use a ### id so the window identity stays "MainWindow" across versions.
+    // <Version> from AnoMech.csproj flows into the assembly version; surface it,
+    // plus the plugin build checksum (PluginBuildInfo -- the same value the
+    // multiplayer handshake compares to catch a host/peer on different
+    // builds), in the title bar. Use a ### id so the window identity stays
+    // "MainWindow" across versions.
     private static string TitleWithVersion()
-    {
-        var v = Assembly.GetExecutingAssembly().GetName().Version;
-        var version = v is null ? "" : $" v{v.Major}.{v.Minor}.{v.Build}.{v.Revision}";
-        return $"AnoMech{version}###MainWindow";
-    }
+        => $"AnoMech v{PluginBuildInfo.Version} ({PluginBuildInfo.ShortChecksum})###MainWindow";
 
     public MainWindow(Plugin plugin)
         : base(TitleWithVersion())
@@ -261,7 +260,17 @@ public unsafe class MainWindow : Window, IDisposable
                         : "No strat available for this region yet.");
         }
         ImGui.SameLine();
-        if (ImGui.Button("Reset")) game.Reset();
+        // A peer's own Game.Reset() would only clear their own local view --
+        // route through the host instead so a reset reaches the whole group.
+        // The host's own click needs no such redirect: it's already
+        // authoritative and already propagates via Tick()/EndMessage.
+        if (ImGui.Button("Reset"))
+        {
+            if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
+                plugin.Multiplayer.RequestReset();
+            else
+                game.Reset();
+        }
         if (game.World.Map.IsInInstance)
         {
             ImGui.SameLine();

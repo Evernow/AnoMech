@@ -25,6 +25,8 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(PingMessage), "ping")]
 [JsonDerivedType(typeof(PongMessage), "pong")]
 [JsonDerivedType(typeof(PeerStatusMessage), "status")]
+[JsonDerivedType(typeof(SessionEndedMessage), "sessionEnded")]
+[JsonDerivedType(typeof(ResetRequestMessage), "resetRequest")]
 public abstract record MpMessage;
 
 // Peer -> host, sent once right after connecting so the host can register a
@@ -36,7 +38,12 @@ public sealed record HelloMessage(Guid PeerId, string DisplayName, string Versio
 // One peer's plugin build as declared in their Hello. Checksum is what
 // actually gets compared (see MultiplayerManager.IsVersionMismatched);
 // Version is only for the human-readable message.
-public sealed record PeerBuildInfo(string Version, string Checksum);
+public sealed record PeerBuildInfo(string Version, string Checksum)
+{
+    // Enough to eyeball-compare between two players without wrapping; the
+    // full Checksum is still what mismatch detection actually compares.
+    public string ShortChecksum => Checksum.Length >= 6 ? Checksum[..6] : Checksum;
+}
 
 // Host -> everyone, full-state (not delta) so a client that missed an update
 // self-heals on the next broadcast instead of drifting from a merge bug.
@@ -96,7 +103,14 @@ public sealed record RoleKilledMessage(PartyRole Role, string Cause) : MpMessage
 // MultiplayerManager.Tick detects all of them from that one place. Without
 // this, a peer whose host left had no way to find out and just kept running
 // their local copy of the zone forever.
-public sealed record EndMessage : MpMessage;
+//
+// ReturnedToInn distinguishes Game.Reset() (despawns but deliberately stays
+// in-zone, ready for a quick re-Start) from Game.Leave()/a natural finish
+// (unloads back to the inn) -- both clear ActiveScenario identically, so the
+// host reads World.Map.IsInInstance at broadcast time to tell them apart.
+// Without this a peer always got hard-kicked to the inn even when the host
+// only meant to reset in place.
+public sealed record EndMessage(bool ReturnedToInn) : MpMessage;
 
 // Host -> everyone, every PingIntervalSeconds -- decoupled from Started so
 // connection-quality info is already live in the lobby before anyone clicks
@@ -117,3 +131,19 @@ public sealed record PeerStatusEntry(float? LatencyMs, float SecondsSinceLastSee
 // peer, not just whoever changed) so a peer's roster UI matches the host's
 // without peers needing their own liveness bookkeeping.
 public sealed record PeerStatusMessage(Dictionary<Guid, PeerStatusEntry> Statuses) : MpMessage;
+
+// Sent by whoever clicks "Leave session" -- host or peer alike -- to every
+// other client (as opposed to Reset or a natural scenario end, see
+// EndMessage, which keep the session alive for a re-Start). Anyone leaving
+// ends the session for the whole group: every recipient reverts to the inn
+// if mid-fight and fully disconnects too, rather than the group splintering
+// into "some people still in, some out." PeerId is who left, purely for the
+// goodbye message the rest of the group sees.
+public sealed record SessionEndedMessage(Guid PeerId) : MpMessage;
+
+// Peer -> host: "please reset the encounter for the group." The peer doesn't
+// reset itself directly -- the host resets its own authoritative run instead,
+// which naturally reaches everyone (including the requester) via the
+// existing EndMessage broadcast, so there's one single code path for "the
+// run reset" regardless of who asked for it.
+public sealed record ResetRequestMessage(Guid PeerId) : MpMessage;

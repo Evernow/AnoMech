@@ -16,6 +16,9 @@ internal static class PluginBuildInfo
 {
     public static string Version { get; } = ComputeVersion();
     public static string Checksum { get; } = ComputeChecksum();
+    // Enough to eyeball-compare between two players' title bars without
+    // wrapping; the full Checksum is still what mismatch detection compares.
+    public static string ShortChecksum { get; } = Checksum.Length >= 6 ? Checksum[..6] : Checksum;
 
     private static string ComputeVersion()
     {
