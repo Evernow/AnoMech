@@ -69,6 +69,17 @@ public sealed class Game : IDisposable
     private bool firstFreezeScheduled;
     private readonly OpcodeUpdater opcodeUpdater;
 
+#if DEBUG
+    // Keeps AnoMech-DamageDebug.txt reflecting near-live state through Tick, not
+    // just the one auto-freeze on first death -- a run where nobody dies but
+    // something still visibly went wrong needs the same trace available. Tracked
+    // independently of activeScenario since peers never get one (see isPeer guard
+    // in RunScenarioInternal) but still need their own local dump kept fresh.
+    private const float PeriodicDumpInterval = 3f;
+    private float periodicDumpTimer;
+    private bool peerScenarioRunning;
+#endif
+
     public Game()
     {
         World = new SimWorld(Events);
@@ -191,6 +202,11 @@ public sealed class Game : IDisposable
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
         World.PlaceWaymarks(ResolveWaymarks(zone, selectedWaymark));
         World.CreateParty(player.ClassJob.RowId, roleOverride, solo, networkRoles);
+#if DEBUG
+        // Cleared here (not just inside scenario.Run, which peers skip below) so a
+        // peer's own diagnostic dump starts fresh per run too, same as the host's.
+        AnoMech.Core.DiagnosticLog.Clear();
+#endif
         // A peer runs no scenario logic at all (no RNG, AI, or DamageSolver) — its
         // arena boundary, boss timeline, and mechanic resolution all come from the
         // host via WorldSnapshot/RoleKilled instead. zone.Run creates the
@@ -202,6 +218,10 @@ public sealed class Game : IDisposable
             phase.Run(World);
             scenario.Run(World, selectedAi);
         }
+        // Outside the isPeer guard above: RunInstanceEvents carries no RNG/AI/
+        // DamageSolver dependency, so both host and peer schedule it locally
+        // (host doesn't get it a second time -- Run doesn't call it itself).
+        scenario.RunInstanceEvents(World);
         // Entering the zone always starts at spawn; a restart only recenters the player
         // if they're standing outside the arena ring (otherwise they keep their position).
         if (freshLoad)
@@ -214,6 +234,15 @@ public sealed class Game : IDisposable
             activeScenario = scenario;
             scenarioElapsed = 0f;
         }
+#if DEBUG
+        else
+        {
+            // Peers never get activeScenario (Tick must not call scenario.Tick locally
+            // for them -- see the isPeer guard above), but the periodic dump still
+            // needs to know a run is in progress; this tracks that independently.
+            peerScenarioRunning = true;
+        }
+#endif
 
         // Reconcile BGM to the new scenario. Bgm.Play is idempotent, so switching
         // between same-track scenarios (e.g. the P5 phases) keeps playing without
@@ -256,6 +285,20 @@ public sealed class Game : IDisposable
             scenarioElapsed += deltaSeconds;
             activeScenario.Tick(deltaSeconds, scenarioElapsed);
         }
+#if DEBUG
+        // Runs for host (activeScenario) and peer (peerScenarioRunning) alike, so
+        // both sides of a multiplayer test keep their own local dump file fresh --
+        // see RunScenarioInternal for why peers never get an activeScenario.
+        if (activeScenario != null || peerScenarioRunning)
+        {
+            periodicDumpTimer += deltaSeconds;
+            if (periodicDumpTimer >= PeriodicDumpInterval)
+            {
+                periodicDumpTimer = 0f;
+                AnoMech.Windows.DamageDebugWindow.Instance?.DumpToFile();
+            }
+        }
+#endif
     }
 
     // Godmode preview: how long a swallowed-death HP-bar drop stays down before healing back.
@@ -279,9 +322,12 @@ public sealed class Game : IDisposable
         if (target is SimCharacter sc && sc.HasStatus(SimParty.InvulnStatusId))
         {
             Plugin.Log.Info($"[Invuln] {DescribeName(target)} survived: {cause}");
+            AnoMech.Core.DiagnosticLog.Info($"[Game] Kill: {target.Role} survived via Invuln -- {cause}");
             return false;
         }
 
+        AnoMech.Core.DiagnosticLog.Warn(
+            $"[Game] Kill: {target.Role} died at ({(target as IPositioned)?.Position.X:F1},{(target as IPositioned)?.Position.Z:F1}) -- {cause}");
         PrintDeath(target, cause);
         if (!firstDeathScheduled)
         {
@@ -399,6 +445,8 @@ public sealed class Game : IDisposable
         firstDeathScheduled = false;
         firstFreezeScheduled = false;
 #if DEBUG
+        periodicDumpTimer = 0f;
+        peerScenarioRunning = false;
         AnoMech.Windows.DamageDebugWindow.Instance?.ResetFreeze();
 #endif
         // Input-lock flags are owned by SimPlayer (reconciled each tick, cleared on

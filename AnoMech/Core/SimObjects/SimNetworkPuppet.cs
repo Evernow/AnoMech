@@ -1,3 +1,4 @@
+using System;
 using System.Numerics;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Party;
@@ -20,15 +21,19 @@ namespace AnoMech.Core.SimObjects;
 // simpler than lifting the seal on tested engine code for one extra caller.
 public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
 {
-    // Sanity cap on how fast we step toward a newly received pose. Comfortably
-    // above sprint (~9y/s): fast enough that the puppet keeps pace with real
-    // movement between ~12-15Hz network updates without ever looking like it's
-    // crawling behind, but still smooths out per-packet jitter instead of
-    // snapping. Distances beyond SnapThreshold (spawn placement, a lag spike,
-    // a genuine teleport) skip interpolation entirely rather than visibly
-    // gliding across the arena.
-    private const float CatchUpSpeed = 12f;
+    // Sanity cap on how fast we step toward a newly received pose. Distances beyond
+    // SnapThreshold (spawn placement, a lag spike, a genuine teleport) skip
+    // interpolation entirely rather than visibly gliding across the arena.
+    // See SimEnemy.NetworkCatchUpSpeed's doc comment for why this was raised from
+    // 12f -- same reasoning: it's meant to be a jitter filter over
+    // MultiplayerManager's snapshot interval, not a second lag source stacked on
+    // top of it.
+    private const float CatchUpSpeed = 20f;
     private const float SnapThreshold = 15f;
+    // Angular counterpart to CatchUpSpeed -- see SimEnemy.NetworkAngularCatchUpSpeed's
+    // doc comment (same reasoning, same value) for why rotation needs stepping too,
+    // and why this was raised from a half-turn-in-1/8s.
+    private const float AngularCatchUpSpeed = MathF.PI * 20f;
     // Mirrors Game.Movement.RunTimelineId -- can't reference it by type name here
     // since the Movement property below shadows the Movement type in this scope.
     private const ushort RunTimelineId = 22;
@@ -36,6 +41,13 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
     private Vector3? targetPosition;
     private float targetRotation;
     private bool interpAnimActive;
+    private bool poseMoving;
+
+    // Tolerance below which two consecutive poses read as "the same spot" rather
+    // than motion -- filters quantization/floating-point noise between updates
+    // that are otherwise identical. See SimEnemy.NetworkMovementEpsilon (same
+    // reasoning, same value).
+    private const float PoseMovementEpsilon = 0.01f;
 
     // Mechanic resolution (AoeQuery, stack/distance checks, gaze facing, ...) must
     // see where the peer's real character actually is right now, not wherever the
@@ -63,9 +75,17 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
     // Records the latest pose reported by the owning peer's real client. The
     // actual position write happens in Tick (see below) so the model steps
     // toward it smoothly with the run animation playing, instead of teleporting
-    // once per network update.
+    // once per network update. poseMoving is read off whether the reported
+    // position is actually advancing between updates, not off local
+    // interpolation state -- see SimEnemy.TickNetworkPosition's doc comment for
+    // why that's the more robust signal (this class doesn't hit the specific
+    // AnimationLock desync that motivated it there -- AnimationLock is always
+    // false for a puppet -- but the same "gap between targets can shrink to
+    // nothing once updates arrive fast enough" risk applies here too).
     public void ApplyNetworkPose(Vector3 position, float rotation)
     {
+        if (targetPosition is { } previous)
+            poseMoving = Vector3.DistanceSquared(previous, position) > PoseMovementEpsilon * PoseMovementEpsilon;
         targetPosition = position;
         targetRotation = rotation;
     }
@@ -81,27 +101,22 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
         var basePos = base.Position;
         var delta = target - basePos;
         var dist = delta.Length();
-        if (dist > SnapThreshold)
-        {
-            SetPosition(new Placement(target, targetRotation));
-            if (interpAnimActive) { ResetActionTimeline(); interpAnimActive = false; }
-            return;
-        }
-
         var step = CatchUpSpeed * deltaSeconds;
-        if (dist <= step)
-        {
-            SetPosition(new Placement(target, targetRotation));
-            if (interpAnimActive) { ResetActionTimeline(); interpAnimActive = false; }
-            return;
-        }
+        var nextRotation = MathUtil.StepRotation(Rotation, targetRotation, AngularCatchUpSpeed * deltaSeconds);
+        if (dist > SnapThreshold || dist <= step)
+            SetPosition(new Placement(target, nextRotation));
+        else
+            SetPosition(new Placement(basePos + delta / dist * step, nextRotation));
 
-        var next = basePos + delta / dist * step;
-        SetPosition(new Placement(next, targetRotation));
-        if (!interpAnimActive)
+        if (poseMoving && !interpAnimActive)
         {
             PlayActionTimeline(RunTimelineId, baseOverride: RunTimelineId);
             interpAnimActive = true;
+        }
+        else if (!poseMoving && interpAnimActive)
+        {
+            ResetActionTimeline();
+            interpAnimActive = false;
         }
     }
 

@@ -36,7 +36,21 @@ public sealed class UmadP3BlackHoleScenario : IScenario
     private SimParty party = null!;
     private DamageSolver damage = null!;
     private List<Vector3>[] BlackHolePositions = null!;
-    private const float BlackHoleAvoidRadius = 1.5f; // damage radius is 1.25; small clearance
+    // damage radius is 1.25; small clearance. internal: also read by
+    // MultiplayerManager to rebuild a peer's own obstacle avoidance (see
+    // OnWorldSnapshotReceived) from the already-synced black hole enemies,
+    // since a peer never runs Run_BlackHoleObstacles itself.
+    internal const float BlackHoleAvoidRadius = 1.5f;
+    // Diagnostic-only: how close counts as "worth logging" in Tick's DamageDown
+    // check below, well wider than the actual 1.25y hit radius so a dump catches
+    // the approach (and near misses that never actually triggered DamageDown),
+    // not just the single moment of impact. internal: also read by
+    // MultiplayerManager to log a peer's own local view of the same near-miss,
+    // for comparison against what the host believed (see OnWorldSnapshotReceived).
+    internal const float NearBlackHoleLogRadius = 3f;
+    // Applied by the queued Primordial Crust cleanse below (Tick) -- shared so the
+    // cleanse's own recast cooldown can be kept safely longer than it, see Tick.
+    private const float EarthResistanceDownDuration = 1.960f;
     private int PrimodialCrustsToResolve;
     private float CleanseCooldown;
     SimEnemy? CleanseHelper;
@@ -51,6 +65,9 @@ public sealed class UmadP3BlackHoleScenario : IScenario
 
     public void Run(SimWorld worldParam, int? selectedAi)
     {
+        // Fresh per run so a damage-debug dump (see DamageDebugWindow.DumpToFile)
+        // never mixes tether diagnostic lines in from an earlier attempt.
+        AnoMech.Core.DiagnosticLog.Clear();
         world = worldParam;
         party = worldParam.Party;
         state = new UmadP3BlackHoleState(world, settingsWindow.Overrides);
@@ -84,14 +101,18 @@ public sealed class UmadP3BlackHoleScenario : IScenario
         Run_Exdeath_400040D8_1();
         Run_Kefka_400040D6();
         Run_Chaos_400040E8_6();
-        Run_InstanceEvents();
         Run_OtherDebuffs();
         Run_PlayerLockons();
         // [64.06s] 03|400040E9|Chaos|00|1|0000|00||7691|9020|44|44|0|10000|||100.00|104.00|0.00|0.00|7fb12caee07dda16
         world.Events.Add(0f, () => CleanseHelper = world.SpawnEnemy(new EnemySpawnConfig(BNpcBaseId: BNpcBaseId.KefkaHelper, NameId: BNpcNameId.Chaos, Level: 1, Targetable: false, EnemyList: EnemyListMode.Never, IsVisible: false, Placement: new Placement(new Vector3(0.000f, 0.000f, 4.000f), 0.000f))));
     }
 
-    private void Run_InstanceEvents()
+    // Called for both host and peer (see IScenario.RunInstanceEvents / Game.
+    // RunScenarioInternal) -- these are fixed-time native replays of what the
+    // real duty's InstanceContentDirector sends, with no dependency on this
+    // run's randomized state, so a peer schedules the exact same calls on its
+    // own world.Events instead of only ever seeing them via the host.
+    public void RunInstanceEvents(SimWorld world)
     {
         // [5.88s] 33|800375D2|80000027|1B|02|1BDB|40004141|5fbef31e42584d90
         world.Events.Add(5.88f, () => world.Map.DirectorUpdate(0x80000027U, 0x1BU, 0x2U, 0x1BDBU, 0x40004141U));
@@ -152,10 +173,17 @@ public sealed class UmadP3BlackHoleScenario : IScenario
        if (CleanseCooldown == 0f && PrimodialCrustsToResolve > 0)
        {
            PrimodialCrustsToResolve--;
-           CleanseCooldown = .5f;
+           // Must stay longer than EarthResistanceDownDuration. This cleanse is a
+           // raid-wide r=100 circle (everyone is always in range, see CastType 2's
+           // InsideCircle), and DamageSolver.IsLethal instakills anyone who already
+           // carries the vuln status it applies. A cooldown shorter than that
+           // status's own duration (the old 0.5s vs. a 1.96s status) let a second
+           // queued cleanse fire while the first tick's status was still up on
+           // everyone, wiping the whole party instead of just cleansing them.
+           CleanseCooldown = EarthResistanceDownDuration + 0.1f;
            CleanseHelper?.Cast(ActionId.Earthquake_Cleanse);
-           damage.Resolve(CleanseHelper, ActionId.Earthquake_Cleanse, [DamageType.Earth], [(StatusId.EarthResistanceDownII, 1.960f)]);
-       } 
+           damage.Resolve(CleanseHelper, ActionId.Earthquake_Cleanse, [DamageType.Earth], [(StatusId.EarthResistanceDownII, EarthResistanceDownDuration)]);
+       }
        
        int wave = elapsed switch
        {
@@ -171,9 +199,35 @@ public sealed class UmadP3BlackHoleScenario : IScenario
            {
                foreach(var player in party.ActiveMembers())
                {
-                  if (player.Placement().DistanceSq(bh) < 1.25f * 1.25f)
+                  var distSq = player.Placement().DistanceSq(bh);
+                  // Diagnostic-only trace, wider than the actual 1.25y hit radius: a fresh
+                  // AnoMech-DamageDebug dump previously had nothing to show for a DamageDown
+                  // except the bare AddStatus line -- no position, no which hole, no distance,
+                  // and no trace of a close call that *didn't* trigger one. For a peer this
+                  // matters specifically because the position DamageSolver reads for them
+                  // (SimNetworkPuppet.Position) is whatever their last self-reported pose was,
+                  // not their true live position -- logging it here captures exactly what the
+                  // host believed at the moment that mattered, which a future dump can be
+                  // cross-referenced against the peer's own local trace to tell a genuinely
+                  // stale pose apart from the peer's own pathing actually cutting it close.
+                  // Not edge-triggered (unlike the DamageDown apply below) since a lingering
+                  // approach is short-lived by nature -- a few seconds of a hazard at 9-17y
+                  // out, not a standing condition -- so it won't flood the log.
+                  if (distSq < NearBlackHoleLogRadius * NearBlackHoleLogRadius)
                   {
-                     player.AddStatus(StatusId.DamageDown, 180f); 
+                      var role = (player as ISimPartyMember)?.Role.ToString() ?? "?";
+                      AnoMech.Core.DiagnosticLog.Info(
+                          $"[UmadP3BlackHoleScenario] Near black hole (wave {wave}): {role} at ({player.Position.X:F2},{player.Position.Z:F2}) is {MathF.Sqrt(distSq):F2}y from hole at ({bh.X:F2},{bh.Z:F2}).");
+                  }
+                  // Edge-triggered: 180s already outlasts the fight, so this only ever needs
+                  // to fire once per approach -- re-checking HasStatus first avoids re-adding
+                  // (and re-logging) every single tick for as long as a player lingers in range.
+                  if (!player.HasStatus(StatusId.DamageDown) && distSq < 1.25f * 1.25f)
+                  {
+                     var role = (player as ISimPartyMember)?.Role.ToString() ?? "?";
+                     AnoMech.Core.DiagnosticLog.Info(
+                         $"[UmadP3BlackHoleScenario] DamageDown triggered (wave {wave}): {role} at ({player.Position.X:F2},{player.Position.Z:F2}), {MathF.Sqrt(distSq):F2}y from hole at ({bh.X:F2},{bh.Z:F2}).");
+                     player.AddStatus(StatusId.DamageDown, 180f);
                   }
                }
            }
@@ -427,14 +481,49 @@ public sealed class UmadP3BlackHoleScenario : IScenario
         if (row < targets.List.Length)
         {
             var target = targets.Get(row);
-            var actionId = targets.List.Length == 1 ? ActionId.ShockingImpact : ActionId.ShockwaveCone;
+            var isFullStack = targets.List.Length == 1;
+            var actionId = isFullStack ? ActionId.ShockingImpact : ActionId.ShockwaveCone;
             var size = MathF.PI / 6;      // half cone 30 degrees, estimated based on animation
-            var stackTargets = targets.List.Length == 1 ? 8 : 0;
-            world.Events.Add(time - 0.2f, () => enemy?.Face(target));
-            world.Events.Add(time, () => enemy?.Cast(actionId, targetId: target?.GameObjectId));
-            world.Events.Add(time, () => damage.Resolve(enemy, actionId, [DamageType.Magic], [(StatusId.MagicVulnerabilityUp, 1.96f)], stackMinTargets: stackTargets, size: size));
+            world.Events.Add(time - 0.2f, () => enemy?.Face(LiveConeTarget(target)));
+            world.Events.Add(time, () => enemy?.Cast(actionId, targetId: LiveConeTarget(target)?.GameObjectId));
+            // stackMinTargets is evaluated at resolve time, not capture time: this stack wants
+            // "everyone currently alive", not a fixed 8. With a hardcoded 8, anyone who'd already
+            // died to an earlier, unrelated mechanic this fight permanently dropped the live
+            // headcount below 8, so every later 8-man stack wave would find targets.Count < 8 and
+            // wipe the rest of the party regardless of how well they executed it (confirmed via
+            // AnoMech-DamageDebug dumps: a single earlier Implosion death cascaded into a
+            // "7/8 players in stack" kill of everyone else). The real fight scales a stack's
+            // damage split by who's actually alive to share it, not by a fixed roster size.
+            world.Events.Add(time, () => damage.Resolve(enemy, actionId, [DamageType.Magic], [(StatusId.MagicVulnerabilityUp, 1.96f)], stackMinTargets: isFullStack ? party.ActiveMembers().Count() : 0, size: size));
         }
     }
+
+    // ConeTargets is rolled once at scenario start, long before this wave actually
+    // resolves -- if that specific pick has since died to an unrelated mechanic (most
+    // commonly Implosion's own Shockwave, which lands moments before this wave), their
+    // SimCharacter isn't removed, just frozen at the death spot (see IsAlive()). Facing
+    // a corpse there aims the cone by coincidence, not intent: everyone funnels through
+    // roughly the same Implosion-safe arc right before this wave, so a dead player's
+    // last position can sit angularly close to an entirely different, still-alive role
+    // group and sweep it into a second, overlapping hit -- confirmed via AnoMech-
+    // DamageDebug dumps, where a wave that killed a tank and a healer to Implosion then
+    // killed the entire DPS stack to this cone with the vuln-stack death message, even
+    // though the DPS were never near either dead player's intended target and had
+    // already arrived at their own spot in time. The real fight never has this failure
+    // mode: a boss doesn't re-target a corpse. Retarget within the same role category
+    // (everyone in it already shares this cone's intended landing spot by design, see
+    // DodgeSlap) to whoever's still up; if the whole category is gone there's nothing
+    // left to aim at faithfully, so keep the original target rather than guess.
+    private SimCharacter? LiveConeTarget(SimCharacter? target)
+    {
+        if (target is null || target.IsAlive() || target is not ISimPartyMember deadMember)
+            return target;
+        return party.ActiveMembers()
+                    .FirstOrDefault(m => m is ISimPartyMember alive && SameRoleCategory(alive.Role, deadMember.Role))
+               ?? target;
+    }
+
+    private static bool SameRoleCategory(PartyRole a, PartyRole b) => a.IsTank() == b.IsTank() && a.IsDps() == b.IsDps();
     
     private void Run_Kefka_400040E7_1()
     {
@@ -504,16 +593,18 @@ public sealed class UmadP3BlackHoleScenario : IScenario
             var shotTime = firstShotTime + i * shootCooldown;
             world.Events.Add(shotTime - 0.1f, () => black_Hole_40004166?.Face(tether?.B));
             world.Events.Add(shotTime, () => black_Hole_40004166?.Cast(ActionId.Nothingness));
-            world.Events.Add(shotTime , () => ResolveNothingness(damage.Resolve(black_Hole_40004166, ActionId.Nothingness, [DamageType.Lethal], [], killTargets: false)));
+            world.Events.Add(shotTime , () => ResolveNothingness(damage.Resolve(black_Hole_40004166, ActionId.Nothingness, [DamageType.Lethal], [], killTargets: false), pos));
         }
         world.Events.Add(firstShotTime + shootCooldown * (numberOfShots - 1), () => tether?.Despawn());
         world.Events.Add(firstShotTime + shootCooldown * (numberOfShots - 1) + despawnDelay, () => black_Hole_40004166?.Despawn());
     }
 
-    private void ResolveNothingness(IReadOnlyList<SimCharacter> targets)
+    private void ResolveNothingness(IReadOnlyList<SimCharacter> targets, Vector3 holePos)
     {
         foreach (var simCharacter in targets)
         {
+           var role = (simCharacter as ISimPartyMember)?.Role.ToString() ?? "?";
+           AnoMech.Core.DiagnosticLog.Info($"[UmadP3BlackHoleScenario] ResolveNothingness: {role} hit by hole at ({holePos.X:F1},{holePos.Z:F1}).");
            if (simCharacter.HasStatus(StatusId.MeanestExistence))
            {
                if (simCharacter.HasStatus(StatusId.PrimordialCrust))
@@ -523,9 +614,11 @@ public sealed class UmadP3BlackHoleScenario : IScenario
                    simCharacter.RemoveStatus(StatusId.SecondInLine);
                    simCharacter.RemoveStatus(StatusId.ThirdInLine);
                    PrimodialCrustsToResolve++;
+                   AnoMech.Core.DiagnosticLog.Info($"[UmadP3BlackHoleScenario] ResolveNothingness: {role} hit at MeanestExistence, saved by PrimordialCrust.");
                }
                else
                {
+                   AnoMech.Core.DiagnosticLog.Warn($"[UmadP3BlackHoleScenario] ResolveNothingness: {role} hit at MeanestExistence with no PrimordialCrust -- dying.");
                    simCharacter.Die("Hit by Nothingness while having Meanest Existence debuff");
                }
            }
@@ -533,10 +626,12 @@ public sealed class UmadP3BlackHoleScenario : IScenario
            {
                simCharacter.RemoveStatus(StatusId.Unbecoming);
                simCharacter.AddStatus(StatusId.MeanestExistence);
+               AnoMech.Core.DiagnosticLog.Info($"[UmadP3BlackHoleScenario] ResolveNothingness: {role} hit (2nd) -- Unbecoming -> MeanestExistence.");
            }
            else
            {
                simCharacter.AddStatus(StatusId.Unbecoming);
+               AnoMech.Core.DiagnosticLog.Info($"[UmadP3BlackHoleScenario] ResolveNothingness: {role} hit (1st) -- gained Unbecoming.");
            }
         }
     }

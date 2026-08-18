@@ -14,6 +14,18 @@ namespace AnoMech.Core.Game.Ai;
 public sealed class AiManager
 {
     private const float RunSpeed = 6f;
+    // Real Sprint gives +25% (6 * 1.25 = 7.5y/s), but this mirrors the ~9y/s figure
+    // already used elsewhere in this codebase as the reference sprint speed (see
+    // SimEnemy/SimNetworkPuppet's NetworkCatchUpSpeed doc comments) rather than
+    // introducing a second, inconsistent number.
+    private const float SprintSpeed = 9f;
+    // Mirrors LocalPlayerInputHooks' real-Sprint values so a bot's simulated
+    // sprint status looks identical to a real player pressing the real button --
+    // that class can't be reused directly (it's scoped to hooking the local
+    // player's own keypress, a different concern), so these are duplicated here
+    // deliberately rather than reached into.
+    private const ushort SprintStatusId = 50;
+    private const int SprintStatusParam = 30;
     private const float DefaultJitter = 0.3f;
 
     private readonly SimWorld world;
@@ -27,9 +39,16 @@ public sealed class AiManager
     // Schedule a slot-move at `time`. `positions` is evaluated at fire-time;
     // null entries in the returned AiMove are skipped (no movement that slot).
     // When `arrivalTime` > 0, each member's MoveTo is deferred so they arrive at
-    // the destination at scenario-time `arrivalTime` (running at RunSpeed). If a
-    // member is too far to make it in time, it falls back to leaving immediately
-    // and arriving late.
+    // the destination at scenario-time `arrivalTime` (running at RunSpeed) --
+    // unless a plain walk can't close the gap in time but sprinting could, in
+    // which case they pop Sprint (status, for the party-list icon, replicated to
+    // every host/peer the same way any other AddStatus call already is) and
+    // leave immediately at SprintSpeed instead of waiting to see if they're late.
+    // Confirmed via AnoMech-DamageDebug dumps: UMAD P3's wave-2 DodgeSlap can
+    // require ~9y/s to make a role's target in the ~2s window after DodgeImplosion
+    // -- comfortably above RunSpeed, comfortably within reach of a sprint. If even
+    // sprinting isn't enough, sprinting wouldn't help and just adds visual noise,
+    // so that case still falls through to the plain "leave now, arrive late" path.
     public void Move(float time, Func<IAiMove> positions, float jitter = DefaultJitter, float arrivalTime = 0f)
     {
         world.Events.Add(time, () =>
@@ -41,18 +60,33 @@ public sealed class AiManager
                 var member = world.Party.Get(i);
                 if (member == null || !member.IsAlive()) continue;
                 var target = Jitter(new Vector3(local.X, 0f, local.Y), jitter);
+                var role = (member as ISimPartyMember)?.Role.ToString() ?? $"slot{i}";
 
                 if (arrivalTime > 0f)
                 {
                     var dx = target.X - member.Position.X;
                     var dz = target.Z - member.Position.Z;
-                    var delay = arrivalTime - time - MathF.Sqrt(dx * dx + dz * dz) / RunSpeed;
+                    var dist = MathF.Sqrt(dx * dx + dz * dz);
+                    var available = arrivalTime - time;
+                    var neededSpeed = available > 0f ? dist / available : float.PositiveInfinity;
+
+                    if (neededSpeed > RunSpeed && neededSpeed <= SprintSpeed)
+                    {
+                        member.AddStatus(SprintStatusId, available, SprintStatusParam);
+                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) sprinting -- {dist:F1}y in {available:F2}s needs {neededSpeed:F2}y/s.");
+                        member.MoveTo(target, speed: SprintSpeed);
+                        continue;
+                    }
+
+                    var delay = available - dist / RunSpeed;
                     if (delay > 0f)
                     {
+                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) deferred {delay:F2}s (arrive {arrivalTime:F1}).");
                         world.Events.Add(delay, () => member.MoveTo(target));
                         continue;
                     }
                 }
+                AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}).");
                 member.MoveTo(target);
             }
         });

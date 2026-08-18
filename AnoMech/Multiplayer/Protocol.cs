@@ -125,13 +125,54 @@ public sealed record EnemyStatusState(ushort StatusId, ushort Stacks);
 // side like ModelState, once per actual value change.
 // LastLockonVfxId mirrors SimCharacter.AttachLockonVfx (stack-target markers,
 // mystery-magic cones, etc.) -- see SimCharacter.LastLockonVfxId's own doc comment.
+// CastTargetX/Y/Z mirrors SimCast's scenario-local targetLocation for a
+// ground-targeted cast (e.g. UMAD P3's BlizzardIII spread markers, cast by an
+// invisible off-arena helper at each player's position). Without it a peer's
+// replayed Cast(actionId) omits targetLocation, and NativeCast's own
+// `position ?? parent.Position` fallback anchors the AOE telegraph at that
+// invisible helper's spawn point instead of the intended ground spot -- the
+// omen would render nowhere near where it actually needs dodging.
+// CastSeconds mirrors SimCast.Total -- the actual cast duration this cast
+// resolved to, whether that's the scenario's explicit override or a Lumina
+// sheet lookup. Same category of bug as CastTargetX/Y/Z: without it, a peer's
+// replayed Cast(actionId) omits castSeconds and re-derives its own duration
+// from the sheet, which for a scenario's synthetic helper-enemy action IDs
+// either doesn't match what the host actually scripted (telegraph runs the
+// wrong length, usually shorter, out of sync with when the host's damage
+// really resolves) or isn't in the sheet at all (the peer's cast silently
+// fails to start, so the animation never plays at all).
+// CastOmenDelay mirrors SimCast.OmenDelay -- without it a peer always replays
+// with the default 0f, so a cast scripted with a real delay (e.g. UMAD P3's
+// Damning Edict at 4.1f, meant to keep its telegraph hidden for most of a 5s
+// cast) shows its ground AOE for the entire cast instead of just the tail end.
+// LastInstantCastSeq/ActionId/TargetX/Y/Z mirror SimCast's same-named fields --
+// see SimCast.LastInstantCastSeq's own doc comment for why instant casts (e.g.
+// UMAD P3's Nothingness) need this separate, edge-triggered signal instead of
+// the IsCasting/CastActionId pair above: those never observe an instant cast
+// at all, since CastInfo.IsCasting never goes true for one and ActionId is
+// cleared again within the same tick it ran in. LastInstantCastSeq starts at 0
+// and only increments, so a peer skips replaying it until it's actually fired
+// at least once (avoiding a spurious replay of the zero-value default on
+// first connect).
+// CastTargetEnemyNetId/CastTargetRole and their LastInstantCast* siblings mirror
+// SimCast.TargetId -- see its doc comment for why an entity target can't just be
+// forwarded as a raw GameObjectId (host and peer each spawn their own local party
+// doppels, so the same role's ID differs between them). Resolved the same way
+// TetherState's A/B ends already are: to an enemy NetId when the target is an
+// enemy, a PartyRole when it's a party member, both null when it's neither
+// (a ground-targeted cast, or a target that's since despawned).
 public sealed record EnemyState(
     int NetId, uint BNpcBaseId, uint NameId, byte Level, bool Targetable,
     EnemyListMode EnemyList, uint ModelCharaId, float Scale, float HitboxRadius,
     byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
     IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, uint? LastLockonVfxId,
     float X, float Y, float Z, float Rotation,
-    bool IsCasting, uint CastActionId);
+    bool IsCasting, uint CastActionId, float CastSeconds, float CastOmenDelay,
+    float? CastTargetX, float? CastTargetY, float? CastTargetZ,
+    int? CastTargetEnemyNetId, PartyRole? CastTargetRole,
+    int LastInstantCastSeq, uint LastInstantCastActionId,
+    float? LastInstantCastTargetX, float? LastInstantCastTargetY, float? LastInstantCastTargetZ,
+    int? LastInstantCastTargetEnemyNetId, PartyRole? LastInstantCastTargetRole);
 
 // A GrabbyTether-style link. Each end resolves to either a live enemy (by
 // NetId) or a party role; a peer reconstructs it locally via world.Tether so

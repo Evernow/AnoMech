@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using AnoMech.Core;
 
 namespace AnoMech.Multiplayer;
 
@@ -33,7 +34,7 @@ public sealed class RelayClient : IDisposable
         try
         {
             await socket.ConnectAsync(uri, cts.Token).ConfigureAwait(false);
-            Plugin.Log.Information($"[RelayClient] Connected to {uri}.");
+            DiagnosticLog.Info($"[RelayClient] Connected to {uri}.");
         }
         catch (Exception e)
         {
@@ -43,7 +44,7 @@ public sealed class RelayClient : IDisposable
             // an "Unobserved exception in Task" on the finalizer thread, with
             // no in-game feedback at all. Route it through Disconnected instead
             // so MultiplayerManager/UI can show it like any other drop.
-            Plugin.Log.Warning($"[RelayClient] Connect to {uri} failed: {e.Message}");
+            DiagnosticLog.Warn($"[RelayClient] Connect to {uri} failed: {e.Message}");
             Disconnected?.Invoke(e);
             return;
         }
@@ -61,7 +62,7 @@ public sealed class RelayClient : IDisposable
         }
         catch (Exception e)
         {
-            Plugin.Log.Warning($"[RelayClient] Send failed: {e.Message}");
+            DiagnosticLog.Warn($"[RelayClient] Send failed: {e.Message}");
         }
         finally
         {
@@ -84,7 +85,7 @@ public sealed class RelayClient : IDisposable
                     result = await socket.ReceiveAsync(buffer, cts.Token).ConfigureAwait(false);
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        Plugin.Log.Information($"[RelayClient] Received close frame: status={result.CloseStatus}, description=\"{result.CloseStatusDescription}\".");
+                        DiagnosticLog.Info($"[RelayClient] Received close frame: status={result.CloseStatus}, description=\"{result.CloseStatusDescription}\".");
                         return;
                     }
                     ms.Write(buffer, 0, result.Count);
@@ -102,7 +103,7 @@ public sealed class RelayClient : IDisposable
                 // connection down -- log and keep reading.
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
-                    Plugin.Log.Warning($"[RelayClient] Malformed message dropped: {e.Message}");
+                    DiagnosticLog.Warn($"[RelayClient] Malformed message dropped: {e.Message}");
                     continue;
                 }
                 if (message != null) MessageReceived?.Invoke(message);
@@ -116,11 +117,11 @@ public sealed class RelayClient : IDisposable
         {
             failure = e;
             var code = e is WebSocketException wse ? $" (WebSocketErrorCode={wse.WebSocketErrorCode})" : "";
-            Plugin.Log.Warning($"[RelayClient] Receive loop faulted: {e}{code}");
+            DiagnosticLog.Warn($"[RelayClient] Receive loop faulted: {e}{code}");
         }
         finally
         {
-            Plugin.Log.Debug($"[RelayClient] Receive loop exiting -- final socket state {socket.State}.");
+            DiagnosticLog.Debug($"[RelayClient] Receive loop exiting -- final socket state {socket.State}.");
             Disconnected?.Invoke(failure);
         }
     }
@@ -129,7 +130,7 @@ public sealed class RelayClient : IDisposable
     {
         if (disposed) return;
         disposed = true;
-        Plugin.Log.Debug($"[RelayClient] Dispose() -- socket state was {socket.State}.");
+        DiagnosticLog.Debug($"[RelayClient] Dispose() -- socket state was {socket.State}.");
         cts.Cancel();
         try { socket.Abort(); } catch { /* best-effort teardown */ }
         socket.Dispose();

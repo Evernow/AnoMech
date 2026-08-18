@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
+using AnoMech.Core;
 
 namespace AnoMech.Multiplayer;
 
@@ -46,7 +47,7 @@ internal static class PluginBuildInfo
         }
         catch (Exception e)
         {
-            Plugin.Log.Warning($"[Multiplayer] Failed to checksum plugin DLL: {e.Message}");
+            DiagnosticLog.Warn($"[Multiplayer] Failed to checksum plugin DLL: {e.Message}");
             return "unknown";
         }
     }

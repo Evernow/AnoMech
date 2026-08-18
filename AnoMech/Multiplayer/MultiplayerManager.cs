@@ -4,11 +4,14 @@ using System.Linq;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
+using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
+using AnoMech.Core.Game.Geometry;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
+using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
 using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
@@ -24,15 +27,17 @@ namespace AnoMech.Multiplayer;
 // peers' claimed roles spawned as SimNetworkPuppet instead of AI bots
 // (PartyCreator). Peers run zero scenario logic themselves -- they load the
 // same cosmetic zone/party, then just apply whatever the host broadcasts:
-//   - WorldSnapshot (~12Hz): enemy/tether/role poses and casts, replayed
+//   - WorldSnapshot (every host Tick, so tied to the host's own FPS): enemy/
+//     tether/role poses and casts, replayed
 //     through the same public SimWorld/SimEnemy APIs scenarios use, so a
 //     peer's local doppels get the real cast-bar/omen/tether VFX pipeline
 //     rather than a hand-rolled visual.
 //   - RoleKilled: routed through the same Game.Kill every death already
 //     funnels through, targeting whatever locally occupies that role (the
 //     peer's own real SimPlayer, or that role's local puppet).
-// Peers report their own real position back at ~15Hz (SelfPose) so the host's
-// puppet for that peer stays where DamageSolver's spatial queries expect it.
+// Peers report their own real position back every frame (SelfPose) so the
+// host's puppet for that peer stays where DamageSolver's spatial queries
+// expect it.
 //
 // All engine calls in this class assume the framework thread (Game.Tick,
 // World.SpawnEnemy, SetPosition, etc. are not thread-safe) -- Tick() runs
@@ -41,8 +46,28 @@ namespace AnoMech.Multiplayer;
 // marshalled onto it via Plugin.Framework.Run before touching any game state.
 public sealed class MultiplayerManager : IDisposable
 {
-    private const float SnapshotIntervalSeconds = 1f / 12f;
-    private const float PoseIntervalSeconds = 1f / 15f;
+    // No throttle here (was a fixed interval, 12Hz then 24Hz): Tick only runs once
+    // per Framework update in the first place, so any interval smaller than the
+    // actual frame time (typically ~4-17ms depending on the host's FPS) can never
+    // fire more than once per frame anyway -- there's no fresher data to send in
+    // between. A timer value only matters once it's *larger* than a frame, at
+    // which point it's a deliberate throttle, not a floor. For a tank reading
+    // boss facing/position in real time, every millisecond of artificial delay
+    // stacks on top of whatever the relay's real transit time already costs, so
+    // just broadcast every Tick and let the host's own frame rate be the ceiling.
+    // Tradeoff is outbound snapshot bandwidth/CPU scaling with the host's FPS
+    // instead of being capped -- fine for a handful of peers.
+    // No throttle here either (was 1/15, 15Hz) -- same reasoning as the enemy
+    // snapshot rate above: a peer's own Tick only runs once per their own frame,
+    // so this can't fire more than once per frame regardless of the timer value,
+    // and every millisecond of added staleness here is the host's belief about
+    // where a real player currently is, which feeds directly into host-side
+    // mechanic checks (e.g. UMAD P3's DamageDown-for-standing-on-a-black-hole
+    // check) as well as what other peers see. SelfPoseMessage is a single small
+    // message (one GUID + 4 floats) rather than a full WorldSnapshotMessage, so
+    // the absolute bandwidth cost per peer is much smaller than the enemy-side
+    // change -- it just scales with the number of connected peers instead of
+    // being capped at a fixed rate.
     private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
     // Mirrors UmadP5ExaflaresScenario.FrameGapCapSeconds -- a peer's P5 debug-bot
     // replay ticks debugShadowStateP5.Timeline off this Tick's own deltaSeconds
@@ -69,8 +94,6 @@ public sealed class MultiplayerManager : IDisposable
 
     private RelayClient? relay;
     private bool running;
-    private float snapshotTimer;
-    private float poseTimer;
 
     private readonly Dictionary<SimEnemy, int> hostEnemyNetIds = new();
     private int nextEnemyNetId;
@@ -110,7 +133,7 @@ public sealed class MultiplayerManager : IDisposable
     // Peer-only: last ModelState actually applied per NetId, so SetModelState
     // is only re-issued on a genuine change -- its native rebuild briefly
     // disables/re-enables drawing (see SimEnemy's EnemyListMode doc), so
-    // calling it every ~83ms snapshot even when unchanged would flicker.
+    // calling it every snapshot even when unchanged would flicker.
     private readonly Dictionary<int, byte> peerEnemyModelState = new();
     // Peer-only: last status set logged per NetId, edge-triggered like
     // peerEnemyModelState above -- statuses are still reconciled against the
@@ -118,10 +141,14 @@ public sealed class MultiplayerManager : IDisposable
     private readonly Dictionary<int, string> peerEnemyLastLoggedStatuses = new();
     // Peer-only: last-applied AnimationTimelineId/LastLockonVfxId per enemy
     // NetId, edge-triggered like peerEnemyModelState -- re-issuing
-    // PlayAnimationTimeline/AttachLockonVfx every ~83ms snapshot even when
+    // PlayAnimationTimeline/AttachLockonVfx every snapshot even when
     // unchanged would restart the same animation/VFX on a loop.
     private readonly Dictionary<int, ushort> peerEnemyAnimationTimeline = new();
     private readonly Dictionary<int, uint> peerEnemyLastLockonVfx = new();
+    // Peer-only: last-seen LastInstantCastSeq per enemy NetId, edge-triggered the
+    // same way -- see EnemyState.LastInstantCastSeq's doc comment for why instant
+    // casts need this separate counter instead of the IsCasting rising edge.
+    private readonly Dictionary<int, int> peerEnemyLastInstantCastSeq = new();
     // Peer-only: last-applied CurrentState per event-object NetId, edge-triggered
     // the same way -- SetState is a plain field write with no native rebuild to
     // worry about, but re-issuing it unconditionally every snapshot is still
@@ -344,7 +371,7 @@ public sealed class MultiplayerManager : IDisposable
         Session.Names[MyPeerId] = DisplayName;
         Session.Builds[MyPeerId] = new PeerBuildInfo(PluginBuildInfo.Version, PluginBuildInfo.Checksum);
 
-        Plugin.Log.Information($"[Multiplayer] Hosting session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
+        DiagnosticLog.Info($"[Multiplayer] Hosting session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
         relay = new RelayClient();
         WireRelay(relay);
         _ = relay.ConnectAsync(relayUrl, SessionCode);
@@ -365,7 +392,7 @@ public sealed class MultiplayerManager : IDisposable
         // host broadcast arrives.
         lastHostMessageMs = Environment.TickCount64;
 
-        Plugin.Log.Information($"[Multiplayer] Joining session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
+        DiagnosticLog.Info($"[Multiplayer] Joining session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
         relay = new RelayClient();
         WireRelay(relay);
         _ = ConnectAndHelloAsync(relayUrl, SessionCode);
@@ -374,7 +401,7 @@ public sealed class MultiplayerManager : IDisposable
     private async Task ConnectAndHelloAsync(string relayUrl, string code)
     {
         await relay!.ConnectAsync(relayUrl, code);
-        Plugin.Log.Information($"[Multiplayer] Connected to relay, socket ready -- sending Hello.");
+        DiagnosticLog.Info($"[Multiplayer] Connected to relay, socket ready -- sending Hello.");
         await relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
     }
 
@@ -398,7 +425,7 @@ public sealed class MultiplayerManager : IDisposable
     private void LeaveSessionInternal(bool notifyOthers)
     {
         if (SessionCode != null)
-            Plugin.Log.Information($"[Multiplayer] Leaving session {SessionCode} (was {(IsHost ? "host" : "peer")}, notifyOthers={notifyOthers}).");
+            DiagnosticLog.Info($"[Multiplayer] Leaving session {SessionCode} (was {(IsHost ? "host" : "peer")}, notifyOthers={notifyOthers}).");
         reconnectCts?.Cancel();
         reconnectCts?.Dispose();
         reconnectCts = null;
@@ -442,6 +469,7 @@ public sealed class MultiplayerManager : IDisposable
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
         peerEnemyLastLockonVfx.Clear();
+        peerEnemyLastInstantCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
         peerRoleLastLockonVfx.Clear();
         peerRoleReconciledStatusIds.Clear();
@@ -475,7 +503,7 @@ public sealed class MultiplayerManager : IDisposable
     private void BeginReconnect()
     {
         if (SessionCode == null || RelayUrl == null || reconnecting) return;
-        Plugin.Log.Information($"[Multiplayer] Connection to {RelayUrl} lost -- beginning reconnect loop for session {SessionCode}.");
+        DiagnosticLog.Info($"[Multiplayer] Connection to {RelayUrl} lost -- beginning reconnect loop for session {SessionCode}.");
         reconnecting = true;
         ReconnectAttempt = 0;
         reconnectCts = new CancellationTokenSource();
@@ -487,7 +515,7 @@ public sealed class MultiplayerManager : IDisposable
         while (!token.IsCancellationRequested)
         {
             var delay = ReconnectBackoff[Math.Min(ReconnectAttempt, ReconnectBackoff.Length - 1)];
-            Plugin.Log.Information($"[Multiplayer] Reconnect attempt {ReconnectAttempt + 1} in {delay.TotalSeconds}s.");
+            DiagnosticLog.Info($"[Multiplayer] Reconnect attempt {ReconnectAttempt + 1} in {delay.TotalSeconds}s.");
             try { await Task.Delay(delay, token).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
             if (token.IsCancellationRequested) return;
@@ -496,7 +524,7 @@ public sealed class MultiplayerManager : IDisposable
             WireRelay(client);
             await client.ConnectAsync(relayUrl, sessionCode).ConfigureAwait(false);
             var connected = client.IsConnected;
-            Plugin.Log.Information($"[Multiplayer] Reconnect attempt {ReconnectAttempt + 1}: {(connected ? "succeeded" : "failed")}.");
+            DiagnosticLog.Info($"[Multiplayer] Reconnect attempt {ReconnectAttempt + 1}: {(connected ? "succeeded" : "failed")}.");
 
             _ = Plugin.Framework.Run(() => FinishReconnectAttempt(client, connected, token));
             if (connected) return;
@@ -518,7 +546,7 @@ public sealed class MultiplayerManager : IDisposable
         reconnecting = false;
         ReconnectAttempt = 0;
         disconnectedSinceMs = null;
-        Plugin.Log.Information($"[Multiplayer] Reconnected to session {SessionCode}.");
+        DiagnosticLog.Info($"[Multiplayer] Reconnected to session {SessionCode}.");
         lastHostMessageMs = Environment.TickCount64; // same "don't read as decades-stale" reasoning as JoinSession
         ConnectionError = null;
         // Re-registers us with the host (refreshes Names, triggers a
@@ -586,7 +614,7 @@ public sealed class MultiplayerManager : IDisposable
     {
         if (Session.ClaimedBy.TryGetValue(role, out var holder) && holder != peerId)
         {
-            Plugin.Log.Information($"[Multiplayer] Rejected role claim: {Session.NameOf(peerId)} wanted {role}, already held by {Session.NameOf(holder)}.");
+            DiagnosticLog.Info($"[Multiplayer] Rejected role claim: {Session.NameOf(peerId)} wanted {role}, already held by {Session.NameOf(holder)}.");
             return;
         }
         // A build mismatch means differing scenario/protocol logic between host
@@ -597,13 +625,13 @@ public sealed class MultiplayerManager : IDisposable
         // UI so it isn't a mystery why nothing happened.
         if (IsVersionMismatched(peerId))
         {
-            Plugin.Log.Warning($"[Multiplayer] Rejected role claim from {Session.NameOf(peerId)} -- plugin build mismatch.");
+            DiagnosticLog.Warn($"[Multiplayer] Rejected role claim from {Session.NameOf(peerId)} -- plugin build mismatch.");
             return;
         }
         foreach (var r in Session.ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => kv.Key).ToList())
             Session.ClaimedBy.Remove(r);
         Session.ClaimedBy[role] = peerId;
-        Plugin.Log.Information($"[Multiplayer] {Session.NameOf(peerId)} claimed {role}.");
+        DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(peerId)} claimed {role}.");
         BroadcastLobbyState();
     }
 
@@ -622,7 +650,7 @@ public sealed class MultiplayerManager : IDisposable
     {
         foreach (var r in Session.ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => kv.Key).ToList())
             Session.ClaimedBy.Remove(r);
-        Plugin.Log.Information($"[Multiplayer] {Session.NameOf(peerId)} released their role.");
+        DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(peerId)} released their role.");
         BroadcastLobbyState();
     }
 
@@ -634,7 +662,7 @@ public sealed class MultiplayerManager : IDisposable
     private void RemovePeer(Guid peerId)
     {
         var who = Session.NameOf(peerId);
-        Plugin.Log.Information($"[Multiplayer] Removing {who} ({peerId}) from the session (running={running}).");
+        DiagnosticLog.Info($"[Multiplayer] Removing {who} ({peerId}) from the session (running={running}).");
         foreach (var r in Session.ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => kv.Key).ToList())
             Session.ClaimedBy.Remove(r);
         Session.Names.Remove(peerId);
@@ -658,7 +686,7 @@ public sealed class MultiplayerManager : IDisposable
         // Leave() -> Unload() assumes a zone was actually entered.
         if (running && Plugin.GameInstance.World.Map.IsInInstance)
         {
-            Plugin.Log.Information($"[Multiplayer] Ending the run because {who} left mid-fight.");
+            DiagnosticLog.Info($"[Multiplayer] Ending the run because {who} left mid-fight.");
             Plugin.GameInstance.Leave();
         }
         BroadcastLobbyState();
@@ -698,12 +726,12 @@ public sealed class MultiplayerManager : IDisposable
         if (!IsHost || relay == null) return;
         if (!IsConnected)
         {
-            Plugin.Log.Warning("[Multiplayer] Cannot start: not connected to the relay.");
+            DiagnosticLog.Warn("[Multiplayer] Cannot start: not connected to the relay.");
             return;
         }
         if (MyClaimedRole == null)
         {
-            Plugin.Log.Warning("[Multiplayer] Cannot start: host has not claimed a role.");
+            DiagnosticLog.Warn("[Multiplayer] Cannot start: host has not claimed a role.");
             return;
         }
         // Captures whatever's currently selected in the main window -- same
@@ -714,7 +742,7 @@ public sealed class MultiplayerManager : IDisposable
         if (Plugin.MainWindow.SelectedScenario is not { } selectedScenario
             || !SupportedScenarios.Contains(selectedScenario.GetType()))
         {
-            Plugin.Log.Warning("[Multiplayer] Cannot start: no multiplayer-supported scenario is selected in the main window.");
+            DiagnosticLog.Warn("[Multiplayer] Cannot start: no multiplayer-supported scenario is selected in the main window.");
             return;
         }
         // Reuses MainWindow's own solo-Start gate: a grouped scenario (e.g. P2
@@ -724,7 +752,7 @@ public sealed class MultiplayerManager : IDisposable
         // AiStrats[SelectedAi] in TryStartDebugBotReplay.
         if (!Plugin.MainWindow.HasStartableStrat())
         {
-            Plugin.Log.Warning("[Multiplayer] Cannot start: no strat available for the selected scenario/region.");
+            DiagnosticLog.Warn("[Multiplayer] Cannot start: no strat available for the selected scenario/region.");
             return;
         }
         var scenarioIndex = Plugin.GameInstance.Scenarios.ToList().IndexOf(selectedScenario);
@@ -736,7 +764,7 @@ public sealed class MultiplayerManager : IDisposable
         // race ahead of their Hello (see IsVersionMismatched).
         if (Session.ClaimedBy.Values.Any(IsVersionMismatched))
         {
-            Plugin.Log.Warning("[Multiplayer] Cannot start: one or more claimed players are on a different plugin build.");
+            DiagnosticLog.Warn("[Multiplayer] Cannot start: one or more claimed players are on a different plugin build.");
             return;
         }
         if (IsStartCheckPending) return; // already mid-check from a previous click
@@ -744,7 +772,7 @@ public sealed class MultiplayerManager : IDisposable
         if (CheckOwnStartReadiness() is { } ownReason)
         {
             StartCheckFailureReason = $"You cannot start: {ownReason}.";
-            Plugin.Log.Information($"[Multiplayer] Cannot start: {ownReason}.");
+            DiagnosticLog.Info($"[Multiplayer] Cannot start: {ownReason}.");
             LobbyChanged?.Invoke();
             return;
         }
@@ -760,7 +788,7 @@ public sealed class MultiplayerManager : IDisposable
             startCheckFailures[peerId] = "disconnected";
             pendingStartResponses.Remove(peerId);
         }
-        Plugin.Log.Information($"[Multiplayer] Start requested -- waiting on readiness from: {string.Join(", ", pendingStartResponses.Select(Session.NameOf))}.");
+        DiagnosticLog.Info($"[Multiplayer] Start requested -- waiting on readiness from: {string.Join(", ", pendingStartResponses.Select(Session.NameOf))}.");
         _ = relay.SendAsync(new StartCheckMessage());
         LobbyChanged?.Invoke();
 
@@ -777,11 +805,11 @@ public sealed class MultiplayerManager : IDisposable
         {
             var summary = string.Join(", ", startCheckFailures.Select(kv => $"{Session.NameOf(kv.Key)} ({kv.Value})"));
             StartCheckFailureReason = $"{startCheckFailures.Count} player(s) cannot start: {summary}.";
-            Plugin.Log.Information($"[Multiplayer] Start check failed: {StartCheckFailureReason}");
+            DiagnosticLog.Info($"[Multiplayer] Start check failed: {StartCheckFailureReason}");
             LobbyChanged?.Invoke();
             return;
         }
-        Plugin.Log.Information("[Multiplayer] Start check passed -- starting the scenario.");
+        DiagnosticLog.Info("[Multiplayer] Start check passed -- starting the scenario.");
         ActuallyStartScenario();
     }
 
@@ -791,7 +819,7 @@ public sealed class MultiplayerManager : IDisposable
 
         var scenario = Plugin.GameInstance.Scenarios[Session.ScenarioIndex];
         var networkRoles = Session.ClaimedBy.Where(kv => kv.Value != MyPeerId).Select(kv => kv.Key).ToHashSet();
-        Plugin.Log.Information($"[Multiplayer] Host starting '{scenario.Name}' as {myRole}. Network roles: {string.Join(", ", networkRoles.Select(r => $"{r}={Session.NameOf(Session.ClaimedBy[r])}"))}.");
+        DiagnosticLog.Info($"[Multiplayer] Host starting '{scenario.Name}' as {myRole}. Network roles: {string.Join(", ", networkRoles.Select(r => $"{r}={Session.NameOf(Session.ClaimedBy[r])}"))}.");
 
         Session.Started = true;
         _ = relay!.SendAsync(Session.ToMessage());
@@ -831,7 +859,7 @@ public sealed class MultiplayerManager : IDisposable
         // seconds from now at the earliest, not before this line returns.
         if (debugBotControlled)
         {
-            Plugin.Log.Information("[Multiplayer] Host: debug-bot mode active for own character this run.");
+            DiagnosticLog.Info("[Multiplayer] Host: debug-bot mode active for own character this run.");
             DebugBotControl.Enabled = true;
         }
         running = true;
@@ -848,24 +876,25 @@ public sealed class MultiplayerManager : IDisposable
         if (IsHost) return;
         if (running)
         {
-            Plugin.Log.Debug("[Multiplayer] OnStartReceived: already running -- ignoring (idempotency guard).");
+            DiagnosticLog.Debug("[Multiplayer] OnStartReceived: already running -- ignoring (idempotency guard).");
             return;
         }
         if (MyClaimedRole is not { } myRole)
         {
-            Plugin.Log.Warning("[Multiplayer] Host started the scenario, but I never claimed a role -- ignoring.");
+            DiagnosticLog.Warn("[Multiplayer] Host started the scenario, but I never claimed a role -- ignoring.");
             return;
         }
 
         var scenario = Plugin.GameInstance.Scenarios[Session.ScenarioIndex];
         var networkRoles = Enum.GetValues<PartyRole>().Where(r => r != myRole).ToHashSet();
-        Plugin.Log.Information($"[Multiplayer] Peer entering '{scenario.Name}' as {myRole}.");
+        DiagnosticLog.Info($"[Multiplayer] Peer entering '{scenario.Name}' as {myRole}.");
 
         peerEnemies.Clear();
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
         peerEnemyLastLockonVfx.Clear();
+        peerEnemyLastInstantCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
         peerRoleLastLockonVfx.Clear();
         peerRoleReconciledStatusIds.Clear();
@@ -911,7 +940,7 @@ public sealed class MultiplayerManager : IDisposable
         if (IsHost && disconnectedSinceMs is { } since && running && Plugin.GameInstance.World.Map.IsInInstance
             && Environment.TickCount64 - since > PeerStaleTimeoutMs)
         {
-            Plugin.Log.Warning($"[Multiplayer] Disconnected from the relay for over {PeerStaleTimeoutMs / 1000}s while running -- leaving the zone myself (every peer has likely already given up waiting and left on their own).");
+            DiagnosticLog.Warn($"[Multiplayer] Disconnected from the relay for over {PeerStaleTimeoutMs / 1000}s while running -- leaving the zone myself (every peer has likely already given up waiting and left on their own).");
             Plugin.GameInstance.Leave();
             EndHostRunLocally();
             disconnectedSinceMs = null;
@@ -937,7 +966,7 @@ public sealed class MultiplayerManager : IDisposable
                 startCheckTimer += deltaSeconds;
                 if (startCheckTimer >= StartCheckTimeoutSeconds)
                 {
-                    Plugin.Log.Information($"[Multiplayer] StartCheck timed out waiting on: {string.Join(", ", pending.Select(Session.NameOf))}.");
+                    DiagnosticLog.Info($"[Multiplayer] StartCheck timed out waiting on: {string.Join(", ", pending.Select(Session.NameOf))}.");
                     foreach (var peerId in pending)
                         startCheckFailures[peerId] = "no response";
                     FinishStartCheck();
@@ -958,7 +987,7 @@ public sealed class MultiplayerManager : IDisposable
             // running can briefly be true before that deferred entry actually
             // completes, and calling it too early teleports the real character
             // to garbage coordinates instead.
-            Plugin.Log.Warning($"[Multiplayer] Lost contact with the host (no message in {SecondsSinceHostMessage:F1}s, threshold {PeerStaleTimeoutMs / 1000}s) -- leaving.");
+            DiagnosticLog.Warn($"[Multiplayer] Lost contact with the host (no message in {SecondsSinceHostMessage:F1}s, threshold {PeerStaleTimeoutMs / 1000}s) -- leaving.");
             if (running && Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
             LeaveSession();
             SessionEndReason = "Lost contact with the host.";
@@ -993,22 +1022,19 @@ public sealed class MultiplayerManager : IDisposable
                 // in-zone); only Leave()/a natural finish clears it. Read here,
                 // now, before anything else can change it.
                 var returnedToInn = !Plugin.GameInstance.World.Map.IsInInstance;
-                Plugin.Log.Information($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
+                DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
                 _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
                 LobbyChanged?.Invoke();
                 return;
             }
             if (!aiReplayStateSent) TrySendAiReplayState();
-            snapshotTimer += deltaSeconds;
-            if (snapshotTimer < SnapshotIntervalSeconds) return;
-            snapshotTimer = 0f;
             SampleAndBroadcastSnapshot();
         }
         else
         {
             if (Plugin.GameInstance.World.Map.IsInInstance)
             {
-                if (!peerEnteredInstance) Plugin.Log.Information("[Multiplayer] Peer's deferred zone entry completed -- now sending SelfPose.");
+                if (!peerEnteredInstance) DiagnosticLog.Info("[Multiplayer] Peer's deferred zone entry completed -- now sending SelfPose.");
                 peerEnteredInstance = true;
                 // Cheap and idempotent past the first successful call (guarded
                 // internally on debugBotReplayStarted) -- simpler than a second
@@ -1034,7 +1060,7 @@ public sealed class MultiplayerManager : IDisposable
             }
             else if (peerEnteredInstance)
             {
-                Plugin.Log.Information("[Multiplayer] Peer's zone was unloaded out from under the run (IsInInstance went false) -- stopping locally.");
+                DiagnosticLog.Info("[Multiplayer] Peer's zone was unloaded out from under the run (IsInInstance went false) -- stopping locally.");
                 running = false;
                 StopDebugBotReplay();
                 return;
@@ -1045,9 +1071,6 @@ public sealed class MultiplayerManager : IDisposable
                 // rather than tearing down a run that hasn't truly started.
                 return;
             }
-            poseTimer += deltaSeconds;
-            if (poseTimer < PoseIntervalSeconds) return;
-            poseTimer = 0f;
             SendSelfPose();
         }
     }
@@ -1061,7 +1084,7 @@ public sealed class MultiplayerManager : IDisposable
         var liveEnemies = world.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
         foreach (var stale in hostEnemyNetIds.Keys.Where(e => !liveEnemies.Contains(e)).ToList())
         {
-            Plugin.Log.Debug($"[Multiplayer] Host: enemy NetId {hostEnemyNetIds[stale]} ({stale.BNpcBaseId}) no longer active -- dropping from broadcast.");
+            DiagnosticLog.Debug($"[Multiplayer] Host: enemy NetId {hostEnemyNetIds[stale]} ({stale.BNpcBaseId}) no longer active -- dropping from broadcast.");
             hostEnemyNetIds.Remove(stale);
             hostEnemyLastLoggedModelState.Remove(stale);
             hostEnemyLastLoggedStatuses.Remove(stale);
@@ -1076,47 +1099,54 @@ public sealed class MultiplayerManager : IDisposable
             {
                 netId = nextEnemyNetId++;
                 hostEnemyNetIds[enemy] = netId;
-                Plugin.Log.Information($"[Multiplayer] Host: broadcasting new enemy NetId {netId} -- BNpcBase {enemy.BNpcBaseId}, pos {enemy.Position}, visible {enemy.Visible}.");
+                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new enemy NetId {netId} -- BNpcBase {enemy.BNpcBaseId}, pos {enemy.Position}, visible {enemy.Visible}.");
             }
             var cfg = enemy.SpawnConfig;
             var modelState = enemy.ModelState;
             if (!hostEnemyLastLoggedModelState.TryGetValue(enemy, out var lastLogged) || lastLogged != modelState)
             {
                 hostEnemyLastLoggedModelState[enemy] = modelState;
-                Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) ModelState -> 0x{modelState:X2}.");
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) ModelState -> 0x{modelState:X2}.");
             }
             var statusSnapshot = enemy.ActiveStatusSnapshot;
             var statusKey = string.Join(",", statusSnapshot.Select(s => $"{s.StatusId}:{s.Stacks}"));
             if (!hostEnemyLastLoggedStatuses.TryGetValue(enemy, out var lastStatusKey) || lastStatusKey != statusKey)
             {
                 hostEnemyLastLoggedStatuses[enemy] = statusKey;
-                Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) statuses -> [{statusKey}].");
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) statuses -> [{statusKey}].");
             }
             if (enemy.AnimationTimelineId is { } timelineId
                 && (!hostEnemyLastLoggedAnimationTimeline.TryGetValue(enemy, out var lastTimeline) || lastTimeline != timelineId))
             {
                 hostEnemyLastLoggedAnimationTimeline[enemy] = timelineId;
-                Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
             }
             if (enemy.LastLockonVfxId is { } lockonId
                 && (!hostEnemyLastLoggedLockonVfx.TryGetValue(enemy, out var lastLockon) || lastLockon != lockonId))
             {
                 hostEnemyLastLoggedLockonVfx[enemy] = lockonId;
-                Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
             }
+            var (castTargetEnemyNetId, castTargetRole) = ResolveTargetId(world, enemy.CastTargetId);
+            var (instantTargetEnemyNetId, instantTargetRole) = ResolveTargetId(world, enemy.LastInstantCastTargetId);
             enemies.Add(new EnemyState(
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, cfg.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
                 statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList(),
                 enemy.AnimationTimelineId, enemy.LastLockonVfxId,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
-                enemy.IsCasting, enemy.CastActionId));
+                enemy.IsCasting, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
+                enemy.CastTargetLocation?.X, enemy.CastTargetLocation?.Y, enemy.CastTargetLocation?.Z,
+                castTargetEnemyNetId, castTargetRole,
+                enemy.LastInstantCastSeq, enemy.LastInstantCastActionId,
+                enemy.LastInstantCastTargetLocation?.X, enemy.LastInstantCastTargetLocation?.Y, enemy.LastInstantCastTargetLocation?.Z,
+                instantTargetEnemyNetId, instantTargetRole));
         }
 
         var liveTethers = world.Children.OfType<SimTether>().Where(t => t.IsActive).ToList();
         foreach (var stale in hostTetherNetIds.Keys.Where(t => !liveTethers.Contains(t)).ToList())
         {
-            Plugin.Log.Debug($"[Multiplayer] Host: tether NetId {hostTetherNetIds[stale]} no longer active -- dropping from broadcast.");
+            DiagnosticLog.Debug($"[Multiplayer] Host: tether NetId {hostTetherNetIds[stale]} no longer active -- dropping from broadcast.");
             hostTetherNetIds.Remove(stale);
         }
 
@@ -1129,7 +1159,7 @@ public sealed class MultiplayerManager : IDisposable
             {
                 netId = nextTetherNetId++;
                 hostTetherNetIds[tether] = netId;
-                Plugin.Log.Information($"[Multiplayer] Host: broadcasting new tether NetId {netId} (TetherId {tether.TetherId}) -- A={(aEnemy is { } ae ? $"enemy#{ae}" : aRole?.ToString() ?? "null")}, B={(bEnemy is { } be ? $"enemy#{be}" : bRole?.ToString() ?? "null")}.");
+                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new tether NetId {netId} (TetherId {tether.TetherId}) -- A={(aEnemy is { } ae ? $"enemy#{ae}" : aRole?.ToString() ?? "null")}, B={(bEnemy is { } be ? $"enemy#{be}" : bRole?.ToString() ?? "null")}.");
             }
             tethers.Add(new TetherState(netId, tether.TetherId, aEnemy, aRole, bEnemy, bRole));
         }
@@ -1147,13 +1177,13 @@ public sealed class MultiplayerManager : IDisposable
                 if (!hostRoleLastLoggedStatuses.TryGetValue(role, out var lastStatusKey) || lastStatusKey != statusKey)
                 {
                     hostRoleLastLoggedStatuses[role] = statusKey;
-                    Plugin.Log.Information($"[Multiplayer] Host: role {role} statuses -> [{statusKey}].");
+                    DiagnosticLog.Info($"[Multiplayer] Host: role {role} statuses -> [{statusKey}].");
                 }
                 if (member.LastLockonVfxId is { } lockonId
                     && (!hostRoleLastLoggedLockonVfx.TryGetValue(role, out var lastLockon) || lastLockon != lockonId))
                 {
                     hostRoleLastLoggedLockonVfx[role] = lockonId;
-                    Plugin.Log.Information($"[Multiplayer] Host: role {role} LastLockonVfxId -> {lockonId}.");
+                    DiagnosticLog.Info($"[Multiplayer] Host: role {role} LastLockonVfxId -> {lockonId}.");
                 }
                 statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList();
             }
@@ -1170,7 +1200,7 @@ public sealed class MultiplayerManager : IDisposable
         var liveEventObjects = world.Children.OfType<SimEventObject>().Where(o => o.IsActive).ToList();
         foreach (var stale in hostEventObjectNetIds.Keys.Where(o => !liveEventObjects.Contains(o)).ToList())
         {
-            Plugin.Log.Debug($"[Multiplayer] Host: event object NetId {hostEventObjectNetIds[stale]} (EObj 0x{stale.EObjRowId:X}) no longer active -- dropping from broadcast.");
+            DiagnosticLog.Debug($"[Multiplayer] Host: event object NetId {hostEventObjectNetIds[stale]} (EObj 0x{stale.EObjRowId:X}) no longer active -- dropping from broadcast.");
             hostEventObjectNetIds.Remove(stale);
         }
 
@@ -1181,7 +1211,7 @@ public sealed class MultiplayerManager : IDisposable
             {
                 netId = nextEventObjectNetId++;
                 hostEventObjectNetIds[eo] = netId;
-                Plugin.Log.Information($"[Multiplayer] Host: broadcasting new event object NetId {netId} -- EObj 0x{eo.EObjRowId:X}, pos {eo.Position}, state {eo.CurrentState}.");
+                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new event object NetId {netId} -- EObj 0x{eo.EObjRowId:X}, pos {eo.Position}, state {eo.CurrentState}.");
             }
             eventObjects.Add(new EventObjectState(
                 netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
@@ -1197,6 +1227,20 @@ public sealed class MultiplayerManager : IDisposable
         if (c is SimEnemy e) return hostEnemyNetIds.TryGetValue(e, out var id) ? (id, null) : (null, null);
         foreach (var role in Enum.GetValues<PartyRole>())
             if (ReferenceEquals(world.Party.Get(role), c)) return (null, role);
+        return (null, null);
+    }
+
+    // Same job as ResolveEnd, but for a Cast() target: SimCast only ever stores the raw
+    // GameObjectId it was given (see SimCast.TargetId's doc comment for why that number
+    // means nothing to a peer on its own), so this resolves by ID equality against the
+    // host's own local party/enemy set instead of ResolveEnd's reference equality.
+    private (int? enemyNetId, PartyRole? role) ResolveTargetId(SimWorld world, GameObjectId? targetId)
+    {
+        if (targetId is not { } id) return (null, null);
+        foreach (var role in Enum.GetValues<PartyRole>())
+            if (world.Party.Get(role)?.GameObjectId == id) return (null, role);
+        foreach (var (enemy, netId) in hostEnemyNetIds)
+            if (enemy.GameObjectId == id) return (netId, null);
         return (null, null);
     }
 
@@ -1241,7 +1285,7 @@ public sealed class MultiplayerManager : IDisposable
             var stale = IsPeerStale(peerId);
             if (stale && warnedStalePeers.Add(peerId))
             {
-                Plugin.Log.Warning($"[Multiplayer] {Session.NameOf(peerId)} ({role}) hasn't reported in over {PeerStaleTimeoutMs / 1000}s -- likely disconnected.");
+                DiagnosticLog.Warn($"[Multiplayer] {Session.NameOf(peerId)} ({role}) hasn't reported in over {PeerStaleTimeoutMs / 1000}s -- likely disconnected.");
                 // Mid-fight, a silently-vanished party member dooms the run the same
                 // way an explicit "Leave session" click does (see RemovePeer's mid-
                 // fight branch) -- but unlike that click, going stale isn't
@@ -1255,12 +1299,12 @@ public sealed class MultiplayerManager : IDisposable
                 // guard appears in this file.
                 if (running && Plugin.GameInstance.World.Map.IsInInstance)
                 {
-                    Plugin.Log.Information($"[Multiplayer] Ending the run because {Session.NameOf(peerId)} went stale mid-fight.");
+                    DiagnosticLog.Info($"[Multiplayer] Ending the run because {Session.NameOf(peerId)} went stale mid-fight.");
                     Plugin.GameInstance.Leave();
                 }
             }
             else if (!stale && warnedStalePeers.Remove(peerId))
-                Plugin.Log.Information($"[Multiplayer] {Session.NameOf(peerId)} ({role}) is reporting in again.");
+                DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(peerId)} ({role}) is reporting in again.");
         }
     }
 
@@ -1280,13 +1324,13 @@ public sealed class MultiplayerManager : IDisposable
         if (!IsHost) return;
         if (Session.RoleOf(msg.PeerId) is not { } role)
         {
-            Plugin.Log.Debug($"[Multiplayer] SelfPose from {msg.PeerId} but they hold no claimed role -- dropping.");
+            DiagnosticLog.Debug($"[Multiplayer] SelfPose from {msg.PeerId} but they hold no claimed role -- dropping.");
             return;
         }
         if (Plugin.GameInstance.World.Party.Get(role) is SimNetworkPuppet puppet)
             puppet.ApplyNetworkPose(new Vector3(msg.X, msg.Y, msg.Z), msg.Rotation);
         else
-            Plugin.Log.Debug($"[Multiplayer] SelfPose from {Session.NameOf(msg.PeerId)} ({role}) but that slot isn't a SimNetworkPuppet -- dropping.");
+            DiagnosticLog.Debug($"[Multiplayer] SelfPose from {Session.NameOf(msg.PeerId)} ({role}) but that slot isn't a SimNetworkPuppet -- dropping.");
     }
 
     // ---- Peer: applying a world snapshot ------------------------------------
@@ -1306,26 +1350,26 @@ public sealed class MultiplayerManager : IDisposable
                     e.BNpcBaseId, e.NameId, e.Level, e.Targetable, e.EnemyList, e.Visible,
                     new Placement(new Vector3(e.X, e.Y, e.Z), e.Rotation),
                     e.ModelCharaId, e.Scale, e.HitboxRadius, e.InitialModeAttributeFlags);
-                Plugin.Log.Information($"[Multiplayer] Peer: first snapshot of enemy NetId {e.NetId} -- BNpcBase {e.BNpcBaseId}, pos ({e.X:F2},{e.Y:F2},{e.Z:F2}), rot {e.Rotation:F2}, visible {e.Visible} -- spawning local doppel.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of enemy NetId {e.NetId} -- BNpcBase {e.BNpcBaseId}, pos ({e.X:F2},{e.Y:F2},{e.Z:F2}), rot {e.Rotation:F2}, visible {e.Visible} -- spawning local doppel.");
                 enemy = world.SpawnEnemy(config);
                 if (enemy == null)
                 {
-                    Plugin.Log.Warning($"[Multiplayer] Peer: SpawnEnemy returned null for NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) -- skipping this enemy.");
+                    DiagnosticLog.Warn($"[Multiplayer] Peer: SpawnEnemy returned null for NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) -- skipping this enemy.");
                     continue;
                 }
                 peerEnemies[e.NetId] = enemy;
             }
             // Smoothed in Tick rather than teleported here -- see SimEnemy.
             // ApplyNetworkPosition/TickNetworkPosition. A hard SetPosition every
-            // ~83ms (12Hz snapshots) made boss movement visibly stutter for peers;
-            // the first snapshot's "spawn" branch above already places the doppel
+            // snapshot made boss movement visibly stutter for peers; the first
+            // snapshot's "spawn" branch above already places the doppel
             // exactly here via EnemySpawnConfig.Placement, so this call is a no-op
             // distance-wise on that first tick.
             enemy.ApplyNetworkPosition(new Vector3(e.X, e.Y, e.Z), e.Rotation);
             enemy.SetVisible(e.Visible);
             // Re-issued only on an actual change -- SetModelState's native rebuild
-            // briefly disables/re-enables drawing, so calling it every ~83ms
-            // snapshot even when unchanged would flicker the model. A scenario's
+            // briefly disables/re-enables drawing, so calling it every snapshot
+            // even when unchanged would flicker the model. A scenario's
             // mid-fight SetModelState calls (Kefka's grow transformation, Omega-M's
             // phase swaps, etc.) are otherwise a purely local Timeline write the
             // host never has any other reason to tell peers about -- without this a
@@ -1333,7 +1377,7 @@ public sealed class MultiplayerManager : IDisposable
             if (!peerEnemyModelState.TryGetValue(e.NetId, out var lastModelState) || lastModelState != e.ModelState)
             {
                 peerEnemyModelState[e.NetId] = e.ModelState;
-                Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) ModelState -> 0x{e.ModelState:X2}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) ModelState -> 0x{e.ModelState:X2}.");
                 enemy.SetModelState(e.ModelState);
             }
             // Reconciled against the host's set every snapshot -- AddStatus/RemoveStatus
@@ -1358,40 +1402,114 @@ public sealed class MultiplayerManager : IDisposable
             if (!peerEnemyLastLoggedStatuses.TryGetValue(e.NetId, out var lastStatusKey) || lastStatusKey != statusKey)
             {
                 peerEnemyLastLoggedStatuses[e.NetId] = statusKey;
-                Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) statuses -> [{statusKey}].");
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) statuses -> [{statusKey}].");
             }
             // Rising-edge trigger: reuses the real SimCast pipeline (cast bar +
             // omen VFX) rather than faking either, so timing/placement come from
-            // the same code path solo play already exercises.
+            // the same code path solo play already exercises. targetLocation is
+            // threaded through for ground-targeted casts (e.g. BlizzardIII spread
+            // markers) -- omitting it would anchor the telegraph at the caster's
+            // own position instead of the intended ground spot (see NativeCast).
+            // castSeconds is threaded through for the same reason: leaving it null
+            // makes SimCast.Start fall back to a Lumina sheet lookup, which for a
+            // scenario's synthetic helper-enemy action IDs either resolves to a
+            // duration that has nothing to do with what the host scripted (the
+            // telegraph runs too short, out of sync with the host's real damage
+            // timing) or isn't in the sheet at all (Start() logs a warning and the
+            // cast never begins on the peer -- the animation silently never plays).
+            // omenDelay is threaded through too -- left at its 0f default, a cast
+            // like Damning Edict (scripted with omenDelay: 4.1f so its telegraph
+            // only shows for the last ~0.9s of a 5s cast) would instead show that
+            // telegraph for the entire cast on a peer's screen.
+            // targetId is resolved via ResolvePeerEnd (same helper tethers already
+            // use) from the host's role/enemy-NetId translation of its own raw
+            // GameObjectId -- see SimCast.TargetId's doc comment for why the ID
+            // itself can't just cross the network. Omitting it entirely (as the
+            // original TargetLocation-only fix did) left entity-targeted casts like
+            // UMAD P3's Thunder III tankbuster with no target at all on a peer, so
+            // NativeActionEffect's NumTargets went to 0 and the hit-react animation
+            // that's supposed to play on the tank being hit never showed up there.
             if (e.IsCasting && !enemy.IsCasting)
-                enemy.Cast(e.CastActionId);
+            {
+                var targetLocation = e.CastTargetX is { } tx && e.CastTargetY is { } ty && e.CastTargetZ is { } tz
+                    ? new Vector3(tx, ty, tz)
+                    : (Vector3?)null;
+                var targetId = ResolvePeerEnd(world, e.CastTargetEnemyNetId, e.CastTargetRole)?.GameObjectId;
+                enemy.Cast(e.CastActionId, targetLocation: targetLocation, castSeconds: e.CastSeconds, omenDelay: e.CastOmenDelay, targetId: targetId);
+            }
+            // Edge-triggered on a monotonic counter rather than IsCasting's rising
+            // edge -- an instant cast (e.g. Nothingness) never makes IsCasting go
+            // true at all (see SimCast.LastInstantCastSeq's doc comment), so this is
+            // the only signal a peer has that one happened. Guarded on seq > 0 so a
+            // peer that just connected doesn't replay the zero-value default the
+            // instant it sees its first snapshot for this enemy.
+            if (e.LastInstantCastSeq > 0
+                && (!peerEnemyLastInstantCastSeq.TryGetValue(e.NetId, out var lastInstantSeq) || lastInstantSeq != e.LastInstantCastSeq))
+            {
+                peerEnemyLastInstantCastSeq[e.NetId] = e.LastInstantCastSeq;
+                var instantTargetLocation = e.LastInstantCastTargetX is { } itx && e.LastInstantCastTargetY is { } ity && e.LastInstantCastTargetZ is { } itz
+                    ? new Vector3(itx, ity, itz)
+                    : (Vector3?)null;
+                var instantTargetId = ResolvePeerEnd(world, e.LastInstantCastTargetEnemyNetId, e.LastInstantCastTargetRole)?.GameObjectId;
+                enemy.Cast(e.LastInstantCastActionId, targetLocation: instantTargetLocation, castSeconds: 0f, targetId: instantTargetId);
+            }
             // Edge-triggered like ModelState -- PlayAnimationTimeline/AttachLockonVfx
-            // are one-shot cues, so re-issuing them every ~83ms snapshot even when
+            // are one-shot cues, so re-issuing them every snapshot even when
             // unchanged would restart the same animation/VFX on a loop.
             if (e.AnimationTimelineId is { } timelineId
                 && (!peerEnemyAnimationTimeline.TryGetValue(e.NetId, out var lastTimeline) || lastTimeline != timelineId))
             {
                 peerEnemyAnimationTimeline[e.NetId] = timelineId;
-                Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
                 enemy.PlayAnimationTimeline(timelineId);
             }
             if (e.LastLockonVfxId is { } lockonId
                 && (!peerEnemyLastLockonVfx.TryGetValue(e.NetId, out var lastLockon) || lastLockon != lockonId))
             {
                 peerEnemyLastLockonVfx[e.NetId] = lockonId;
-                Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
                 enemy.AttachLockonVfx(lockonId, persistent: false);
             }
         }
         foreach (var staleId in peerEnemies.Keys.Where(id => !seenEnemyIds.Contains(id)).ToList())
         {
-            Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {staleId} no longer in snapshot -- despawning local doppel.");
+            DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {staleId} no longer in snapshot -- despawning local doppel.");
             peerEnemies[staleId].Despawn();
             peerEnemies.Remove(staleId);
             peerEnemyModelState.Remove(staleId);
             peerEnemyLastLoggedStatuses.Remove(staleId);
             peerEnemyAnimationTimeline.Remove(staleId);
             peerEnemyLastLockonVfx.Remove(staleId);
+            peerEnemyLastInstantCastSeq.Remove(staleId);
+        }
+
+        // UMAD P3 only (harmless no-op elsewhere -- no enemy will ever match
+        // BlackHole's BNpcBaseId in another scenario). A peer never runs the
+        // scenario's own Run_BlackHoleObstacles, so without this a debug-bot
+        // peer's own MoveTo pathing has no avoidance data and can cut straight
+        // through a black hole's damage radius mid-transit -- which the host
+        // would then apply DamageDown for, since the peer's own reported
+        // position is self-authoritative. Rebuilt from the already-synced
+        // peerEnemies rather than replaying the scenario's RNG state, so it
+        // can never drift from whatever the host is actually showing.
+        world.Obstacles.Clear();
+        // Diagnostic-only, paired with UmadP3BlackHoleScenario.Tick's own "Near black
+        // hole" log: that one is the host's belief (built off this peer's last
+        // self-reported pose, via SimNetworkPuppet.Position); this is the peer's own,
+        // true local position at the same real moment. If a future DamageDown dump
+        // shows the host's line but not this one at a comparable timestamp, the pose
+        // report was stale when it mattered -- if both show it, the peer's own
+        // pathing genuinely cut it close. localPlayer is null on the host (it drives
+        // its own bots directly, no self-pose loop), so this is peer-only already.
+        var localPlayer = Plugin.GameInstance.World.Party.Player;
+        foreach (var (netId, bh) in peerEnemies.Where(kvp => kvp.Value.BNpcBaseId == BNpcBaseId.BlackHole))
+        {
+            world.Obstacles.Add(new CircleObstacle(new Vector2(bh.Position.X, bh.Position.Z), UmadP3BlackHoleScenario.BlackHoleAvoidRadius));
+            if (localPlayer is null) continue;
+            var distSq = localPlayer.Placement().DistanceSq(bh.Position);
+            if (distSq < UmadP3BlackHoleScenario.NearBlackHoleLogRadius * UmadP3BlackHoleScenario.NearBlackHoleLogRadius)
+                DiagnosticLog.Info(
+                    $"[Multiplayer] Peer: local position ({localPlayer.Position.X:F2},{localPlayer.Position.Z:F2}) is {MathF.Sqrt(distSq):F2}y from black hole NetId {netId} at ({bh.Position.X:F2},{bh.Position.Z:F2}).");
         }
 
         // Debug-bot replay: Chaos/Exdeath might not have been replicated yet
@@ -1423,18 +1541,18 @@ public sealed class MultiplayerManager : IDisposable
             if (peerTethers.TryGetValue(t.NetId, out var existing))
             {
                 if (ReferenceEquals(existing.A, a) && ReferenceEquals(existing.B, b)) continue;
-                Plugin.Log.Information($"[Multiplayer] Peer: tether NetId {t.NetId} endpoint changed -- recreating (A={aDesc}, B={bDesc}).");
+                DiagnosticLog.Info($"[Multiplayer] Peer: tether NetId {t.NetId} endpoint changed -- recreating (A={aDesc}, B={bDesc}).");
                 existing.Despawn();
             }
             else
             {
-                Plugin.Log.Information($"[Multiplayer] Peer: first snapshot of tether NetId {t.NetId} (TetherId {t.TetherId}) -- A={aDesc}, B={bDesc}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of tether NetId {t.NetId} (TetherId {t.TetherId}) -- A={aDesc}, B={bDesc}.");
             }
             peerTethers[t.NetId] = world.Tether(a, b, t.TetherId);
         }
         foreach (var staleId in peerTethers.Keys.Where(id => !seenTetherIds.Contains(id)).ToList())
         {
-            Plugin.Log.Information($"[Multiplayer] Peer: tether NetId {staleId} no longer in snapshot -- despawning.");
+            DiagnosticLog.Info($"[Multiplayer] Peer: tether NetId {staleId} no longer in snapshot -- despawning.");
             peerTethers[staleId].Despawn();
             peerTethers.Remove(staleId);
         }
@@ -1478,13 +1596,13 @@ public sealed class MultiplayerManager : IDisposable
             if (!peerRoleLastLoggedStatuses.TryGetValue(r.Role, out var lastStatusKey) || lastStatusKey != statusKey)
             {
                 peerRoleLastLoggedStatuses[r.Role] = statusKey;
-                Plugin.Log.Information($"[Multiplayer] Peer: role {r.Role} statuses -> [{statusKey}].");
+                DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} statuses -> [{statusKey}].");
             }
             if (r.LastLockonVfxId is { } lockonId
                 && (!peerRoleLastLockonVfx.TryGetValue(r.Role, out var lastLockon) || lastLockon != lockonId))
             {
                 peerRoleLastLockonVfx[r.Role] = lockonId;
-                Plugin.Log.Information($"[Multiplayer] Peer: role {r.Role} LastLockonVfxId -> {lockonId}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} LastLockonVfxId -> {lockonId}.");
                 member.AttachLockonVfx(lockonId, persistent: false);
             }
         }
@@ -1502,29 +1620,29 @@ public sealed class MultiplayerManager : IDisposable
                     TimelineState = o.TimelineState,
                     SpawnVisible = true,
                 };
-                Plugin.Log.Information($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
                 eo = world.SpawnEventObject(config);
                 if (eo == null)
                 {
-                    Plugin.Log.Warning($"[Multiplayer] Peer: SpawnEventObject returned null for NetId {o.NetId} (EObj 0x{o.EObjId:X}) -- skipping.");
+                    DiagnosticLog.Warn($"[Multiplayer] Peer: SpawnEventObject returned null for NetId {o.NetId} (EObj 0x{o.EObjId:X}) -- skipping.");
                     continue;
                 }
                 peerEventObjects[o.NetId] = eo;
             }
             eo.SetPosition(new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation));
             // Edge-triggered like ModelState -- SetState is a plain field write with
-            // no rebuild to worry about, but re-issuing it every ~83ms snapshot even
+            // no rebuild to worry about, but re-issuing it every snapshot even
             // when unchanged is pointless churn.
             if (!peerEventObjectState.TryGetValue(o.NetId, out var lastState) || lastState != o.CurrentState)
             {
                 peerEventObjectState[o.NetId] = o.CurrentState;
-                Plugin.Log.Information($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) CurrentState -> {o.CurrentState}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) CurrentState -> {o.CurrentState}.");
                 eo.SetState(o.CurrentState);
             }
         }
         foreach (var staleId in peerEventObjects.Keys.Where(id => !seenEventObjectIds.Contains(id)).ToList())
         {
-            Plugin.Log.Information($"[Multiplayer] Peer: event object NetId {staleId} no longer in snapshot -- despawning local copy.");
+            DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {staleId} no longer in snapshot -- despawning local copy.");
             peerEventObjects[staleId].Despawn();
             peerEventObjects.Remove(staleId);
             peerEventObjectState.Remove(staleId);
@@ -1541,17 +1659,17 @@ public sealed class MultiplayerManager : IDisposable
     private void OnRoleKilledReceived(RoleKilledMessage msg)
     {
         if (IsHost) return;
-        Plugin.Log.Information($"[Multiplayer] {msg.Role} killed: {msg.Cause}");
+        DiagnosticLog.Info($"[Multiplayer] {msg.Role} killed: {msg.Cause}");
         if (Plugin.GameInstance.World.Party.Get(msg.Role) is ISimPartyMember member)
             Plugin.GameInstance.Kill(member, msg.Cause);
         else
-            Plugin.Log.Debug($"[Multiplayer] RoleKilled for {msg.Role} but that slot isn't an ISimPartyMember locally -- dropping.");
+            DiagnosticLog.Debug($"[Multiplayer] RoleKilled for {msg.Role} but that slot isn't an ISimPartyMember locally -- dropping.");
     }
 
     private void OnEndReceived(EndMessage msg)
     {
         if (IsHost || !running) return;
-        Plugin.Log.Information($"[Multiplayer] Peer received EndMessage (ReturnedToInn={msg.ReturnedToInn}).");
+        DiagnosticLog.Info($"[Multiplayer] Peer received EndMessage (ReturnedToInn={msg.ReturnedToInn}).");
         running = false;
         StopDebugBotReplay();
         // If our own deferred zone entry (RunScenarioAsPeer) hasn't actually
@@ -1565,7 +1683,7 @@ public sealed class MultiplayerManager : IDisposable
         // to reset.
         if (!Plugin.GameInstance.World.Map.IsInInstance)
         {
-            Plugin.Log.Information("[Multiplayer] EndMessage received before our own deferred zone entry completed -- nothing to leave/reset.");
+            DiagnosticLog.Info("[Multiplayer] EndMessage received before our own deferred zone entry completed -- nothing to leave/reset.");
             return;
         }
         // Mirror whichever the host actually did -- Leave() if they left the
@@ -1595,7 +1713,7 @@ public sealed class MultiplayerManager : IDisposable
             case UmadP3BlackHoleScenario p3Scenario:
                 if (p3Scenario.LastState is not { } p3State) return;
                 aiReplayStateSent = true;
-                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                DiagnosticLog.Info("[Multiplayer] Host: broadcasting AiReplayState for this run.");
                 _ = relay!.SendAsync(new AiReplayStateMessage(
                     p3State.Roles.List, p3State.StackTargets.List, p3State.SlapAttacks.ToArray(),
                     p3State.KefkaPosition.Select(d => d.RadiansFromNorth).ToArray(), p3State.ImplosionAttack));
@@ -1603,14 +1721,14 @@ public sealed class MultiplayerManager : IDisposable
             case UmadP2ForsakenScenario p2Scenario:
                 if (p2Scenario.LastState is not { } p2State) return;
                 aiReplayStateSent = true;
-                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                DiagnosticLog.Info("[Multiplayer] Host: broadcasting AiReplayState for this run.");
                 _ = relay!.SendAsync(new P2AiReplayStateMessage(
                     p2State.EndAttacks, p2State.NewNorth.RadiansFromNorth, p2State.Rotation, p2State.Lockons));
                 break;
             case UmadP4KefkaSaysScenario p4Scenario:
                 if (p4Scenario.LastState is not { } p4State) return;
                 aiReplayStateSent = true;
-                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                DiagnosticLog.Info("[Multiplayer] Host: broadcasting AiReplayState for this run.");
                 _ = relay!.SendAsync(new P4AiReplayStateMessage(
                     p4State.Mystery.Select(m => m.BlizzardOffset).ToArray(),
                     p4State.Mystery.Select(m => m.LightningOffset).ToArray(),
@@ -1625,7 +1743,7 @@ public sealed class MultiplayerManager : IDisposable
             case UmadP5ExaflaresScenario p5Scenario:
                 if (p5Scenario.LastState is not { } p5State) return;
                 aiReplayStateSent = true;
-                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                DiagnosticLog.Info("[Multiplayer] Host: broadcasting AiReplayState for this run.");
                 _ = relay!.SendAsync(new P5AiReplayStateMessage(p5State.LeftOrder.ToArray(), p5State.RightOrder.ToArray()));
                 break;
         }
@@ -1658,7 +1776,7 @@ public sealed class MultiplayerManager : IDisposable
             case UmadP3BlackHoleScenario when pendingAiReplayState is { } msg:
             {
                 debugBotReplayStarted = true;
-                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
                 var shadowState = UmadP3BlackHoleState.FromNetworkReplay(
                     world, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack);
                 // Chaos/Exdeath might not have been replicated yet (WorldSnapshot
@@ -1684,10 +1802,10 @@ public sealed class MultiplayerManager : IDisposable
                 debugBotReplayStarted = true;
                 if (!IsValidAiIndex(p2Scenario))
                 {
-                    Plugin.Log.Warning($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p2Scenario.Name} ({p2Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
+                    DiagnosticLog.Warn($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p2Scenario.Name} ({p2Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
                     break;
                 }
-                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
                 var shadowState = UmadP2ForsakenState.FromNetworkReplay(
                     p2Msg.EndAttacks, p2Msg.NewNorthRadians, p2Msg.Rotation, p2Msg.Lockons);
                 debugShadowStateP2 = shadowState;
@@ -1700,10 +1818,10 @@ public sealed class MultiplayerManager : IDisposable
                 debugBotReplayStarted = true;
                 if (!IsValidAiIndex(p4Scenario))
                 {
-                    Plugin.Log.Warning($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p4Scenario.Name} ({p4Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
+                    DiagnosticLog.Warn($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p4Scenario.Name} ({p4Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
                     break;
                 }
-                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
                 var shadowState = UmadP4KefkaSaysState.FromNetworkReplay(
                     world.Party, p4Msg.MysteryBlizzardOffset, p4Msg.MysteryLightningOffset, p4Msg.MysteryLightningOrientation,
                     p4Msg.Wave1First, p4Msg.Wave1, p4Msg.Wave1True, p4Msg.Wave2, p4Msg.Wave2True,
@@ -1719,10 +1837,10 @@ public sealed class MultiplayerManager : IDisposable
                 debugBotReplayStarted = true;
                 if (!IsValidAiIndex(p5Scenario))
                 {
-                    Plugin.Log.Warning($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p5Scenario.Name} ({p5Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
+                    DiagnosticLog.Warn($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p5Scenario.Name} ({p5Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
                     break;
                 }
-                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
                 // A fresh, peer-owned EventScheduler -- NOT the host's -- since
                 // UmadP5ExaflaresAi schedules its dodges directly onto it, and
                 // nothing would ever drive one shared with anything else. See
@@ -1745,7 +1863,7 @@ public sealed class MultiplayerManager : IDisposable
     // bot-driven while standing in an empty arena or back in the inn.
     private void StopDebugBotReplay()
     {
-        if (debugBotReplayStarted) Plugin.Log.Information("[Multiplayer] Peer: stopping debug-bot replay.");
+        if (debugBotReplayStarted) DiagnosticLog.Info("[Multiplayer] Peer: stopping debug-bot replay.");
         DebugBotControl.Enabled = false;
         pendingAiReplayState = null;
         pendingP2AiReplayState = null;
@@ -1782,12 +1900,12 @@ public sealed class MultiplayerManager : IDisposable
             disconnectedSinceMs ??= Environment.TickCount64;
             if (failure != null)
             {
-                Plugin.Log.Warning($"[Multiplayer] Disconnected: {failure.Message}");
+                DiagnosticLog.Warn($"[Multiplayer] Disconnected: {failure.Message}");
                 ConnectionError = failure.Message;
             }
             else
             {
-                Plugin.Log.Information("[Multiplayer] Disconnected (no failure reported -- socket just closed).");
+                DiagnosticLog.Info("[Multiplayer] Disconnected (no failure reported -- socket just closed).");
             }
             LobbyChanged?.Invoke();
             BeginReconnect();
@@ -1805,7 +1923,7 @@ public sealed class MultiplayerManager : IDisposable
         }
         catch (Exception e)
         {
-            Plugin.Log.Warning($"[Multiplayer] Error handling {message.GetType().Name}: {e}");
+            DiagnosticLog.Warn($"[Multiplayer] Error handling {message.GetType().Name}: {e}");
         }
     }
 
@@ -1835,7 +1953,7 @@ public sealed class MultiplayerManager : IDisposable
                 peerLastSeenMs[hello.PeerId] = Environment.TickCount64;
                 Session.Names[hello.PeerId] = hello.DisplayName;
                 Session.Builds[hello.PeerId] = new PeerBuildInfo(hello.Version, hello.Checksum);
-                Plugin.Log.Information($"[Multiplayer] Hello from {hello.PeerId} ({hello.DisplayName}), build {hello.Version} ({new PeerBuildInfo(hello.Version, hello.Checksum).ShortChecksum}), mismatch={IsVersionMismatched(hello.PeerId)}.");
+                DiagnosticLog.Info($"[Multiplayer] Hello from {hello.PeerId} ({hello.DisplayName}), build {hello.Version} ({new PeerBuildInfo(hello.Version, hello.Checksum).ShortChecksum}), mismatch={IsVersionMismatched(hello.PeerId)}.");
                 BroadcastLobbyState();
                 break;
             case ClaimRoleMessage claim when IsHost:
@@ -1880,7 +1998,7 @@ public sealed class MultiplayerManager : IDisposable
                 break;
             }
             case StartCheckResponseMessage resp when IsHost:
-                Plugin.Log.Information($"[Multiplayer] StartCheck reply from {Session.NameOf(resp.PeerId)}: ready={resp.Ready}{(resp.Reason is { } r ? $" ({r})" : "")}.");
+                DiagnosticLog.Info($"[Multiplayer] StartCheck reply from {Session.NameOf(resp.PeerId)}: ready={resp.Ready}{(resp.Reason is { } r ? $" ({r})" : "")}.");
                 // Remove(...) returning false means either a duplicate/stale
                 // reply or one that arrived after the timeout already gave up
                 // on this peer -- either way there's nothing left to do with it.
@@ -1914,7 +2032,7 @@ public sealed class MultiplayerManager : IDisposable
             {
                 // Read the sender's name before LeaveSessionInternal wipes Session out from under it.
                 var who = Session.NameOf(ended.PeerId);
-                Plugin.Log.Information($"[Multiplayer] Host {who} left -- session ending for the whole group.");
+                DiagnosticLog.Info($"[Multiplayer] Host {who} left -- session ending for the whole group.");
                 // IsInInstance guard: Leave() -> Unload() assumes a zone was
                 // actually entered (it restores the real character to the
                 // position ZoneSession.Enter() saved); running can briefly be
@@ -1933,7 +2051,7 @@ public sealed class MultiplayerManager : IDisposable
                 RemovePeer(ended.PeerId);
                 break;
             case ResetRequestMessage req when IsHost:
-                Plugin.Log.Information($"[Multiplayer] {Session.NameOf(req.PeerId)} requested a reset.");
+                DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested a reset.");
                 Plugin.GameInstance.Reset();
                 break;
             // IsInInstance guard (not running -- Leave() must still work after
@@ -1945,7 +2063,7 @@ public sealed class MultiplayerManager : IDisposable
             // ever set true once that has genuinely happened (MapController.
             // TryLoad), so it alone is the correct signal here.
             case LeaveRequestMessage req when IsHost:
-                Plugin.Log.Information($"[Multiplayer] {Session.NameOf(req.PeerId)} requested to leave the instance.");
+                DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested to leave the instance.");
                 if (Plugin.GameInstance.World.Map.IsInInstance)
                     Plugin.GameInstance.Leave();
                 break;

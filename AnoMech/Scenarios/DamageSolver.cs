@@ -39,6 +39,9 @@ public class DamageSolver
         AnoMech.Windows.DamageDebugWindow.Instance?.Record(query);
 #endif
         var targets = query.Run(party.Find);
+        DiagnosticLog.Info(
+            $"[DamageSolver] Resolve: {ActionLookup.Name(actionId)} from ({placement.Position.X:F1},{placement.Position.Z:F1}) rot={placement.Rotation:F3} -- {targets.Count} target(s): "
+            + string.Join(", ", targets.Select(t => (t as ISimPartyMember)?.Role.ToString() ?? "?")));
         List<SimCharacter> deadTargets = [];
         if (excludeTargets is { Length: > 0 })
             targets = targets.Where(t => !excludeTargets.Contains(t)).ToList();

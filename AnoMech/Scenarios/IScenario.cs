@@ -22,4 +22,11 @@ public interface IScenario
     void Run(SimWorld world, int? selectedAi);
     void Tick(float delta, float elapsed) { }
     void DrawSettings() { }
+
+    // Deterministic, RNG-independent instance-progress replay (native
+    // DirectorUpdate/AddEffect calls) a scenario may schedule alongside its
+    // boss timeline. Unlike Run, this has no dependency on host-only state
+    // (random assignments, AI, DamageSolver), so Game.RunScenarioInternal
+    // calls it for a peer too, not just the host.
+    void RunInstanceEvents(SimWorld world) { }
 }

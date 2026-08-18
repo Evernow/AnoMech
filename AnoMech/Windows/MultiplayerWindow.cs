@@ -181,8 +181,9 @@ public class MultiplayerWindow : Window, IDisposable
         if (mp.IsHost && mp.SessionCode != null)
         {
             ImGui.TextUnformatted("Session code:");
-            ImGui.SameLine();
+            ImGui.SetWindowFontScale(2f);
             ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), mp.SessionCode);
+            ImGui.SetWindowFontScale(1f);
             ImGui.SameLine();
             if (ImGui.SmallButton("Copy")) ImGui.SetClipboardText(mp.SessionCode);
             ImGui.TextWrapped("Share this code and your relay URL with whoever is joining.");

@@ -162,6 +162,7 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
 
     public SimStatus? AddStatus(ushort statusId, float duration = 0f, int stacks = 1, bool overrideStacks = false)
     {
+        Core.DiagnosticLog.Info($"[SimCharacter] AddStatus: {DiagnosticName} gets status {statusId} (duration={duration:F1}, stacks={stacks}, overrideStacks={overrideStacks}).");
         if (FindStatus(statusId) is {} status)
         {
             // overrideStacks: stacks is the absolute target; otherwise it's a
@@ -183,6 +184,10 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
         return s;
     }
 
+    // Best-effort identity for diagnostic logging: party role when available, else the
+    // BNpc name id, else just "Character" -- SimCharacter itself has no name concept.
+    private string DiagnosticName => (this as ISimPartyMember)?.Role.ToString() ?? GetType().Name;
+
     public SimStatus AddStatusParam(ushort statusId, int param, float duration = 0f)
     {
         var s = new SimStatus(this, statusId, duration, (ushort)param);
@@ -192,7 +197,9 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
 
     public void RemoveStatus(ushort statusId)
     {
-        FindStatus(statusId)?.Despawn();
+        if (FindStatus(statusId) is not {} status) return;
+        Core.DiagnosticLog.Info($"[SimCharacter] RemoveStatus: {DiagnosticName} loses status {statusId}.");
+        status.Despawn();
     }
 
     public SimStatus? FindStatus(ushort statusId)

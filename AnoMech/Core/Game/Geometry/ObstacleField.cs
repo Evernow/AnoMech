@@ -52,14 +52,17 @@ public sealed class ObstacleField
     public void Clear() => obstacles.Clear();
 
     // Projects `p` out onto the boundary of the obstacle it is most deeply inside
-    // so a destination authored (or fallen) inside an obstacle becomes a
-    // reachable edge point instead of an unreachable center the bot orbits
-    // forever. Single-pass / single-obstacle: with overlapping obstacles the
-    // result may still sit inside another (acceptable; best-effort by design).
-    public Vector2 ClampOutside(Vector2 p)
+    // (or, with `margin` > 0, out to `margin` clear of it even if `p` was already
+    // outside) so a destination authored -- or computed, e.g. a tether pull spot
+    // that lands on/near an unrelated decorative obstacle -- becomes a reachable,
+    // comfortably-clear point instead of an unreachable center the bot orbits
+    // forever, or a boundary-grazing one Steer's tangent-glide can stall on.
+    // Single-pass / single-obstacle: with overlapping obstacles the result may
+    // still sit inside another (acceptable; best-effort by design).
+    public Vector2 ClampOutside(Vector2 p, float margin = 0f)
     {
-        if (Deepest(p, out var dist, out var normal) == null || dist >= 0f) return p;
-        return p - normal * dist;   // dist < 0, normal outward -> move out by |dist|
+        if (Deepest(p, out var dist, out var normal) == null || dist >= margin) return p;
+        return p - normal * (dist - margin);   // dist < margin, normal outward -> push out to margin clearance
     }
 
     // Nearest point to the projection `t0` on segment a->b (param clamped to

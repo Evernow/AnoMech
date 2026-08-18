@@ -5,6 +5,7 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using Lumina.Excel.Sheets;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 
@@ -52,32 +53,85 @@ public sealed unsafe class SimEnemy : SimNpc
     private readonly SimCast cast;
 
     // Peer-only smoothing for positions received via ApplyNetworkPosition (mirrors
-    // SimNetworkPuppet's CatchUpSpeed/SnapThreshold -- same reasoning, same values:
-    // fast enough to keep pace with the host's real per-frame movement between
-    // MultiplayerManager's 12Hz snapshots without visibly lagging behind, but still
-    // smooths out per-snapshot jitter instead of teleporting once per update).
+    // SimNetworkPuppet's CatchUpSpeed/SnapThreshold -- same reasoning, same values).
     // Distances beyond NetworkSnapThreshold (a scripted teleport/repositioning, a
     // lag spike) skip interpolation and snap immediately rather than gliding across
     // the arena. No effect on host-driven enemies: nothing calls
     // ApplyNetworkPosition there.
-    private const float NetworkCatchUpSpeed = 12f;
+    // Raised from 12f (~sprint speed): that value was tuned to "just barely don't
+    // fall behind," which is the wrong bias for a tank reading boss position in
+    // real time -- it's supposed to be a smoothing floor over per-snapshot jitter,
+    // not a second source of lag on top of MultiplayerManager's own snapshot
+    // interval. 20f keeps real headroom above any realistic host-side movement
+    // speed so the catch-up step essentially never becomes the bottleneck itself.
+    private const float NetworkCatchUpSpeed = 20f;
     private const float NetworkSnapThreshold = 15f;
     private const ushort NetworkRunTimelineId = 22; // mirrors Game.Movement.RunTimelineId
+
+    // Angular counterpart to NetworkCatchUpSpeed -- previously missing entirely,
+    // which meant Rotation was written raw from whatever the latest snapshot said
+    // rather than stepped toward it: an enemy tracking a moving target (Follow(),
+    // Face() during a slow re-aim, etc.) held one facing for up to a full snapshot
+    // interval then snapped straight to the next one, over and over, while its
+    // position glided smoothly the whole time -- a smooth-body/strobing-facing
+    // mismatch that reads as "laggy rotation" even though position was fine.
+    // Raised from a half-turn-in-1/8s: same reasoning as NetworkCatchUpSpeed above
+    // -- a tank tracking boss facing needs this to be a jitter filter, not a second
+    // lag source. A half-turn in 1/20s keeps a full re-aim inside roughly one
+    // snapshot interval at the current 24Hz rate; a genuine snap-to-target commit
+    // (Face() right before a cone/cast resolves) still reads as fast/decisive
+    // rather than a slow wind-up.
+    private const float NetworkAngularCatchUpSpeed = MathF.PI * 20f;
 
     private Vector3? networkTargetPosition;
     private float networkTargetRotation;
     private bool networkInterpAnimActive;
+    private bool networkMoving;
+
+    // Tolerance below which two consecutive network positions read as "the same
+    // spot" rather than motion -- filters quantization/floating-point noise
+    // between snapshots that are otherwise identical.
+    private const float NetworkMovementEpsilon = 0.01f;
 
     // Records the latest position/rotation broadcast by the host for this enemy --
     // see MultiplayerManager.OnWorldSnapshotReceived, the only caller. The actual
     // position write happens in Tick so the doppel steps toward it smoothly with a
     // run animation playing, instead of teleporting once per WorldSnapshotMessage.
+    // networkMoving is read off whether the host's *reported* position is actually
+    // advancing between updates, not off local interpolation state -- see
+    // TickNetworkPosition's doc comment for why that distinction is the whole fix.
     public void ApplyNetworkPosition(Vector3 position, float rotation)
     {
+        if (networkTargetPosition is { } previous)
+            networkMoving = Vector3.DistanceSquared(previous, position) > NetworkMovementEpsilon * NetworkMovementEpsilon;
         networkTargetPosition = position;
         networkTargetRotation = rotation;
     }
 
+    // Driving the run animation off networkInterpAnimActive alone (matched against
+    // "did local interpolation finish catching up this tick") was broken two
+    // different ways, confirmed via AnoMech-DamageDebug dumps showing bosses never
+    // animating for peers at all:
+    //   1. Movement.Tick() -- already run this frame via base.Tick() -- calls
+    //      StopAnim() and bails whenever AnimationLock (cast.IsBusy) holds,
+    //      resetting the native run animation with no way for this class to know
+    //      it happened. Since a boss in these fights is casting constantly,
+    //      networkInterpAnimActive goes stale (still says "already playing")
+    //      almost immediately, and the guard below then never re-requests
+    //      PlayActionTimeline for the rest of the fight.
+    //   2. Once snapshots arrive every host frame instead of on a slower fixed
+    //      interval (see MultiplayerManager's snapshot broadcast), the gap between
+    //      consecutive targets shrinks to the point that "dist <= step" -- meant
+    //      to mean "we've essentially arrived" -- became true almost every tick
+    //      instead of rarely, which would have kept re-triggering the same
+    //      reset-then-restart cycle.
+    // networkMoving sidesteps both: it's derived purely from whether the host's
+    // reported position is actually advancing (see ApplyNetworkPosition), which
+    // stays correct regardless of what Movement.Tick() resets natively or how
+    // fine-grained the per-tick position steps get -- the host's own position is
+    // just as frozen during its cast (its own Movement.Tick() pauses the same way
+    // for the same reason), so this self-corrects without needing a separate
+    // AnimationLock check here at all.
     private void TickNetworkPosition(float deltaSeconds)
     {
         if (networkTargetPosition is not { } target) return;
@@ -86,19 +140,21 @@ public sealed unsafe class SimEnemy : SimNpc
         var delta = target - basePos;
         var dist = delta.Length();
         var step = NetworkCatchUpSpeed * deltaSeconds;
+        var nextRotation = MathUtil.StepRotation(Rotation, networkTargetRotation, NetworkAngularCatchUpSpeed * deltaSeconds);
         if (dist > NetworkSnapThreshold || dist <= step)
-        {
-            SetPosition(new Placement(target, networkTargetRotation));
-            if (networkInterpAnimActive) { ResetActionTimeline(); networkInterpAnimActive = false; }
-            return;
-        }
+            SetPosition(new Placement(target, nextRotation));
+        else
+            SetPosition(new Placement(basePos + delta / dist * step, nextRotation));
 
-        var next = basePos + delta / dist * step;
-        SetPosition(new Placement(next, networkTargetRotation));
-        if (!networkInterpAnimActive)
+        if (networkMoving && !networkInterpAnimActive)
         {
             PlayActionTimeline(NetworkRunTimelineId, baseOverride: NetworkRunTimelineId);
             networkInterpAnimActive = true;
+        }
+        else if (!networkMoving && networkInterpAnimActive)
+        {
+            ResetActionTimeline();
+            networkInterpAnimActive = false;
         }
     }
 
@@ -152,6 +208,14 @@ public sealed unsafe class SimEnemy : SimNpc
     public bool IsCasting => cast.IsCasting;
     public uint CastActionId => cast.ActionId;
     public float CastProgress => cast.Progress;
+    public Vector3? CastTargetLocation => cast.TargetLocation;
+    public GameObjectId? CastTargetId => cast.TargetId;
+    public float CastTotalSeconds => cast.Total;
+    public float CastOmenDelay => cast.OmenDelay;
+    public int LastInstantCastSeq => cast.LastInstantCastSeq;
+    public uint LastInstantCastActionId => cast.LastInstantCastActionId;
+    public Vector3? LastInstantCastTargetLocation => cast.LastInstantCastTargetLocation;
+    public GameObjectId? LastInstantCastTargetId => cast.LastInstantCastTargetId;
 
     // The last value passed to SetVisible -- read by MultiplayerManager's host-side
     // sampler. Not the same as IsEngineVisible (that lags behind async model load).
@@ -408,6 +472,8 @@ public sealed unsafe class SimEnemy : SimNpc
     // tighter timing we can derive per-action values from captured ACT logs.
     public bool Cast(uint actionId, Vector3? targetLocation = null, float? castSeconds = null, GameObjectId? targetId = null, float omenDelay = 0f, float omenRotate = 0f, byte animationVariation = 0, float animationLock = 0.6f, float? fireDelay = null)
     {
+        Core.DiagnosticLog.Info(
+            $"[SimEnemy] Cast: {Core.ActionLookup.Name(actionId)} ({actionId}) from ({Position.X:F1},{Position.Z:F1}) rot={Rotation:F3} castSeconds={castSeconds?.ToString("F2") ?? "default"}.");
         // targetLocation stays scenario-local; SimCast lifts to world at native boundaries.
         return cast.Start(actionId, targetLocation, castSeconds, targetId, omenDelay, omenRotate, animationVariation, animationLock, fireDelay);
     }

@@ -28,6 +28,7 @@ public sealed unsafe class SimCast : ISimObject
     private bool casting;
     private float elapsed;
     private float total;
+    private float omenDelay;
     private float fireDelay;
     private float fireDelayElapsed;
     private Vector3? targetLocation;   // scenario-local coords
@@ -41,6 +42,67 @@ public sealed unsafe class SimCast : ISimObject
 
     public uint ActionId { get; private set; }
     public float Progress => total <= 0f ? 0f : Math.Clamp(elapsed / total, 0f, 1f);
+
+    // Scenario-local ground target for the current cast, if it's ground-targeted --
+    // read by MultiplayerManager's host-side sampler so a peer's replayed Cast()
+    // can pass the same targetLocation instead of defaulting to the caster's own
+    // position (see NativeCast's `position ?? parent.Position` fallback).
+    public Vector3? TargetLocation => targetLocation;
+
+    // The entity target for the current cast, if it's entity-targeted (e.g. UMAD P3's
+    // Thunder III tankbuster, cast with targetId: target?.GameObjectId so the hit
+    // lands on -- and the native hit-react animation plays on -- that specific tank).
+    // A raw GameObjectId isn't portable across the network: host and peer each spawn
+    // their own local party doppels, so the same role's GameObjectId differs between
+    // them. MultiplayerManager's host-side sampler resolves this to a PartyRole or
+    // enemy NetId instead (same approach as TetherState's A/B ends), and a peer
+    // resolves that back to whichever local SimCharacter/SimEnemy actually holds that
+    // role/NetId on its own side before replaying Cast(). Omitting this entirely (as
+    // the original TargetLocation-only fix did) leaves the peer's replayed Cast()
+    // with no entity target at all -- NativeActionEffect's NumTargets goes to 0, and
+    // the animation that plays off whoever got hit never appears on a peer's screen.
+    public GameObjectId? TargetId => targetId;
+
+    // The actual cast duration this cast is running with -- whatever Start() resolved
+    // castTime to, whether that was the caller's explicit override or the Lumina sheet
+    // lookup. Read by MultiplayerManager's host-side sampler for the same reason as
+    // TargetLocation above: a peer's replayed Cast() must pass this through explicitly
+    // instead of re-deriving it. Re-deriving isn't just "possibly a different number" --
+    // many of these scenario-scripted casts run on synthetic helper-enemy action IDs
+    // that either aren't in the real Action sheet at all (Start()'s sheet lookup then
+    // fails outright and the peer never casts anything) or whose sheet Cast100ms simply
+    // doesn't match the duration the scenario actually scripted, so the peer's telegraph
+    // runs on borrowed timing that has nothing to do with when the host's damage
+    // actually resolves.
+    public float Total => total;
+
+    // The omenDelay this cast started with -- read by MultiplayerManager's host-side
+    // sampler for the same reason as TargetLocation/Total above. Left at its 0f default
+    // (peer never passes one through), a cast like UMAD P3's Damning Edict -- which is
+    // scripted with omenDelay: 4.1f so its ground telegraph only appears for the final
+    // ~0.9s of its 5s cast -- would instead show that telegraph for the whole 5s on a
+    // peer's screen, since the native ActorCastPacket controls exactly when the omen
+    // fades in and nothing else about the cast conveys that.
+    public float OmenDelay => omenDelay;
+
+    // Instant casts (castTimeValue <= 0, see Start() below) fire and reset ActionId/
+    // TargetLocation back to their empty state within the same tick they ran in --
+    // CastInfo.IsCasting (what IsCasting reads) never goes true for them either, since
+    // NativeCast is skipped entirely for instants. That makes them structurally
+    // invisible to a level-sampled snapshot: MultiplayerManager's peer replay is a
+    // rising-edge check on IsCasting, and there is no edge to catch, and even if there
+    // were, ActionId/TargetLocation would already be cleared by the time the next
+    // snapshot samples them. LastInstantCast* mirrors AnimationTimelineId/LastLockonVfxId's
+    // own answer to this same shape of problem: a monotonically-incrementing counter the
+    // peer can edge-trigger on instead of a level value, paired with a snapshot of what
+    // that particular instant cast actually was (taken here, before ResetCastState wipes
+    // it) so the peer has something to replay. Confirmed via AnoMech-DamageDebug dumps:
+    // Nothingness (an instant cast) never appears anywhere in a peer's own diagnostic
+    // log, not even with wrong timing -- it just never ran there at all.
+    public int LastInstantCastSeq { get; private set; }
+    public uint LastInstantCastActionId { get; private set; }
+    public Vector3? LastInstantCastTargetLocation { get; private set; }
+    public GameObjectId? LastInstantCastTargetId { get; private set; }
 
     // True while the cast bar is up or the release animation is still playing. A
     // following boss roots itself while busy so the action animation finishes in
@@ -112,15 +174,20 @@ public sealed unsafe class SimCast : ISimObject
         this.targetId = targetId;
         this.animationVariation = animationVariation;
         ActionId = actionId;
+        this.omenDelay = omenDelay;
         this.fireDelay = fireDelay ?? 0;
-        
+
         if (castTimeValue <= 0)
         {
             FaceTarget(chara);
             FireActionEffect(chara, actionId, ActionType.Action, animationLock, targetLocation, targetId, animationVariation);
+            LastInstantCastActionId = actionId;
+            LastInstantCastTargetLocation = targetLocation;
+            LastInstantCastTargetId = targetId;
+            LastInstantCastSeq++;
             ResetCastState();
         }
-        
+
         return true;
     }
 

@@ -28,6 +28,14 @@ internal class Movement(SimCharacter parent)
     private SimTether? interceptTether;
     private float interceptMargin = 3f;   // park this many yards short of either tether endpoint
 
+    // Set around RetargetIntercept's and TickFollow's own re-issued MoveTo calls so
+    // InternalMoveTo doesn't cancel the very tracking that's driving them. Left false
+    // for every other caller (ai.Move, PullTether, Knockback, ...) so an externally
+    // issued move -- e.g. the Implosion dodge choreography firing mid-Intercept --
+    // correctly cancels a stale Intercept/Follow instead of having TickIntercept
+    // silently steer the character back toward the tether next frame.
+    private bool internalReissue;
+
     public bool IsMoving => destination != null;
 
     public virtual void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)
@@ -72,7 +80,8 @@ internal class Movement(SimCharacter parent)
         var src = new Vector2(a.Position.X, a.Position.Z);
         var seg = new Vector2(b.Position.X, b.Position.Z) - src;
         var len = seg.Length();
-        if (len < 1e-6f) { MoveTo(new Vector3(src.X, parent.Position.Y, src.Y)); return; }
+        internalReissue = true;
+        if (len < 1e-6f) { MoveTo(new Vector3(src.X, parent.Position.Y, src.Y)); internalReissue = false; return; }
         var rel = new Vector2(parent.Position.X, parent.Position.Z) - src;
         // Park `margin` yards short of either endpoint instead of standing right on it.
         // On a segment under 2*margin long the two insets cross, so settle on the midpoint.
@@ -84,6 +93,7 @@ internal class Movement(SimCharacter parent)
         // perpendicular off it when a black hole sits on the line.
         var target = parent.Obstacles.NearestClearOnSegment(src, src + seg, t, tMin, tMax);
         MoveTo(new Vector3(target.X, parent.Position.Y, target.Y));
+        internalReissue = false;
     }
 
     // Keep the intercept aimed at the moving tether each frame. Exception: once the
@@ -120,6 +130,16 @@ internal class Movement(SimCharacter parent)
         bool faceTravel = true, bool avoid = true)
     {
         if (!parent.IsAlive()) return;   // dead characters don't move
+        // An externally issued move (ai.Move, PullTether, Knockback, ...) supersedes
+        // whatever this character was doing -- cancel any stale Intercept/Follow so
+        // TickIntercept/TickFollow don't steer back over it next frame. RetargetIntercept
+        // and TickFollow's own re-issue set internalReissue around this call so they
+        // don't cancel the very tracking driving them.
+        if (!internalReissue)
+        {
+            interceptTether = null;
+            followTarget = null;
+        }
         destination = moveDestination;
         speed = MathF.Max(0f, sp);
         finalRotation = finalRot;
@@ -212,7 +232,9 @@ internal class Movement(SimCharacter parent)
         }
         else
         {
+            internalReissue = true;
             InternalMoveTo(followTarget.Position, speed);
+            internalReissue = false;
         }
     }
 

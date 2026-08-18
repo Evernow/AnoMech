@@ -1,11 +1,15 @@
 #if DEBUG
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Numerics;
+using System.Text;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Windowing;
+using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.SimObjects;
 using AnoMech.Scenarios.Top;
@@ -51,6 +55,12 @@ internal sealed class DamageDebugWindow : Window, IDisposable
     private float sourceRemaining;
     private IDalamudTextureWrap? tex;
 
+    // Captured on every Resolve regardless of IsOpen/frozen (unlike the grid/texture
+    // heatmap below, which is only built while the window is actually open) -- so
+    // Freeze()'s file dump has something to write even if the user never opened this
+    // window at all. See DumpToFile.
+    private AoeQuery? lastRecordedQuery;
+
     public DamageDebugWindow(Plugin plugin)
         : base("Damage Debug##AnoMechDamageDebug")
     {
@@ -73,6 +83,7 @@ internal sealed class DamageDebugWindow : Window, IDisposable
     // Draw on the same (main) thread.
     internal void Record(AoeQuery query)
     {
+        lastRecordedQuery = query;
         if (!IsOpen || frozen) return;
         EnsureGrid();
         var hits = query.Run(gridFind!);
@@ -156,10 +167,144 @@ internal sealed class DamageDebugWindow : Window, IDisposable
 
     // Auto-freeze hook for the wipe sequence (Game.Kill). Snapshots the heatmap as-is
     // so the killing AOE — recorded moments earlier in the same Resolve — stays visible.
-    internal void Freeze() { frozen = true; freezeRebuildPending = true; }
+    // Also dumps that same killing query to a file (see DumpToFile) -- this runs
+    // regardless of whether the window was ever opened, so a fresh Debug build hands
+    // you a shareable text file on the very first death with no setup.
+    internal void Freeze()
+    {
+        frozen = true;
+        freezeRebuildPending = true;
+        DumpToFile();
+    }
+
+    // Writes the AOE that just killed someone to a plain-text file next to the
+    // plugin DLL -- a screenshot of the heatmap isn't always practical to share, but
+    // a text file is. Re-derives the Action sheet's own shape fields (CastType/
+    // EffectRange/XAxisModifier) the same way CharacterFind.InsideActionAoe does, and
+    // re-runs the SAME query against every party member (dead ones included, via
+    // AllMembers -- Find/ActiveMembers would already exclude whoever this query just
+    // killed) so the dump shows exactly who was inside the shape. Also called
+    // periodically by Game.Tick (see PeriodicDumpInterval) so the file reflects
+    // near-live state even on a run where nobody dies -- a visually-observed
+    // problem ("the bot clipped the party") needs the same trace a death would
+    // have gotten, and waiting for an actual kill isn't always an option.
+    internal void DumpToFile()
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"AnoMech damage debug dump -- {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine();
+
+            CharacterFind<SimCharacter>? hitFind = null;
+            AoeQuery? query = lastRecordedQuery;
+            if (query is { } q)
+            {
+                var name = ActionLookup.Name(q.ActionId);
+                var actionSheet = Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+                sb.AppendLine($"Most recent AOE -- Action: {q.ActionId} (0x{q.ActionId:X}) \"{name}\"");
+                if (actionSheet.TryGetRow(q.ActionId, out var action))
+                    sb.AppendLine($"  CastType={action.CastType}  EffectRange={action.EffectRange}  XAxisModifier={action.XAxisModifier}");
+                else
+                    sb.AppendLine("  (row not found in Action sheet)");
+                sb.AppendLine($"  OmenRotate={q.OmenRotate:F3}  SizeOverride={(q.Size is { } sz ? sz.ToString("F3") : "(none)")}");
+                sb.AppendLine();
+
+                var src = q.Source;
+                sb.AppendLine($"Source position: ({src.Position.X:F2}, {src.Position.Y:F2}, {src.Position.Z:F2})  Rotation: {src.Rotation:F3} rad (forward = (sin, cos) of this)");
+                sb.AppendLine();
+                hitFind = new CharacterFind<SimCharacter>(() => plugin.Game.World.Party.AllMembers());
+            }
+            else
+            {
+                sb.AppendLine("(no AOE resolved yet this run)");
+                sb.AppendLine();
+            }
+
+            var hits = query is { } qq && hitFind is { } hf ? qq.Run(hf) : [];
+            sb.AppendLine("Party members at this moment:");
+            foreach (var member in plugin.Game.World.Party.AllMembers())
+            {
+                var role = (member as ISimPartyMember)?.Role.ToString() ?? member.GetType().Name;
+                var alive = member.IsAlive() ? "ALIVE" : "DEAD ";
+                var hitLabel = query is null ? "  -  " : hits.Contains(member) ? "HIT  " : "clear";
+                var distLabel = query is { } q2
+                    ? $"  dist from source={MathF.Sqrt(MathF.Pow(member.Position.X - q2.Source.Position.X, 2) + MathF.Pow(member.Position.Z - q2.Source.Position.Z, 2)):F2}"
+                    : "";
+                var statuses = member.ActiveStatusSnapshot;
+                var statusLabel = statuses.Count == 0
+                    ? ""
+                    : "  statuses=[" + string.Join(", ", statuses.Select(s => s.Stacks > 1 ? $"{s.StatusId}x{s.Stacks}" : $"{s.StatusId}")) + "]";
+                // Who's actually driving this slot on THIS client -- essential for comparing
+                // a host dump against a guest dump, since both list the same 8 party roles but
+                // only one slot on each side is "YOU"; everyone else is a network-mirrored PEER
+                // or a locally-simulated BOT doppel filling an empty seat.
+                var driver = member switch
+                {
+                    SimPlayer => DebugBotControl.Enabled ? "YOU(bot)" : "YOU",
+                    SimNetworkPuppet => "PEER",
+                    _ => "BOT",
+                };
+                sb.AppendLine($"  {role,-14} [{driver,-8}] {alive}  {hitLabel}  pos=({member.Position.X:F2}, {member.Position.Z:F2}){distLabel}{statusLabel}");
+            }
+            sb.AppendLine();
+
+            sb.AppendLine("Enemies currently in world:");
+            // world.Children accumulates every SimEnemy ever spawned this run and never drops
+            // despawned ones from the list -- IsActive (BattleCharaPtr != null) is what actually
+            // tells a live one from a torn-down leftover still holding its last position.
+            var enemies = plugin.Game.World.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
+            if (enemies.Count == 0)
+                sb.AppendLine("  (none)");
+            else
+                foreach (var enemy in enemies)
+                    sb.AppendLine($"  {enemy.DisplayName,-20} pos=({enemy.Position.X:F2}, {enemy.Position.Z:F2})  rot={enemy.Rotation:F3}");
+            sb.AppendLine();
+
+            sb.AppendLine("Tethers currently active:");
+            var tethers = plugin.Game.World.Children.OfType<SimTether>().Where(t => t.IsActive).ToList();
+            if (tethers.Count == 0)
+                sb.AppendLine("  (none)");
+            else
+                foreach (var t in tethers)
+                {
+                    var aLabel = t.A is { } a ? DescribeParticipant(a) : "(none)";
+                    var bLabel = t.B is { } b ? DescribeParticipant(b) : "(none)";
+                    sb.AppendLine($"  TetherId={t.TetherId}  {aLabel} -> {bLabel}");
+                }
+            sb.AppendLine();
+
+            // Folds in whatever's been logged through DiagnosticLog this run (moves, AOE
+            // resolves, casts, deaths, status changes, plus scenario-specific tracing) --
+            // so a bug report is one file instead of this dump plus a separately pasted
+            // Dalamud log.
+            var diag = AnoMech.Core.DiagnosticLog.Snapshot();
+            sb.AppendLine($"Diagnostic log this run ({diag.Count} lines):");
+            if (diag.Count == 0)
+                sb.AppendLine("  (none captured)");
+            else
+                foreach (var line in diag)
+                    sb.AppendLine($"  {line}");
+
+            var dir = Plugin.PluginInterface.AssemblyLocation.DirectoryName;
+            if (dir == null) return;
+            var path = Path.Combine(dir, "AnoMech-DamageDebug.txt");
+            File.WriteAllText(path, sb.ToString());
+            Plugin.Log.Information($"[DamageDebugWindow] Wrote damage debug dump to {path}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[DamageDebugWindow] Failed to write damage debug dump: {ex.Message}");
+        }
+    }
 
     // Cleared at the start of each run so a new scenario records from a blank, live map.
     internal void ResetFreeze() { frozen = false; freezeRebuildPending = false; Clear(); }
+
+    // Labels a tether endpoint as its party role if it's a party member, else its
+    // enemy display name -- tethers can end on either.
+    private static string DescribeParticipant(SimCharacter c) =>
+        (c as ISimPartyMember)?.Role.ToString() ?? (c as SimEnemy)?.DisplayName ?? c.GetType().Name;
 
     // Snapshot of every party dot's position (alive or dead), taken on the first
     // frozen frame — AllMembers, not Find, so the just-killed member is included.
