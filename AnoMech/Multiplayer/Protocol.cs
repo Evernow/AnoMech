@@ -33,6 +33,9 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(LeaveRequestMessage), "leaveRequest")]
 [JsonDerivedType(typeof(AiReplayStateMessage), "aiReplayState")]
 [JsonDerivedType(typeof(P2AiReplayStateMessage), "p2AiReplayState")]
+[JsonDerivedType(typeof(P2LockonsUpdateMessage), "p2LockonsUpdate")]
+[JsonDerivedType(typeof(MapEffectMessage), "mapEffect")]
+[JsonDerivedType(typeof(MapDirectorUpdateMessage), "mapDirectorUpdate")]
 [JsonDerivedType(typeof(P4AiReplayStateMessage), "p4AiReplayState")]
 [JsonDerivedType(typeof(P5AiReplayStateMessage), "p5AiReplayState")]
 public abstract record MpMessage;
@@ -309,6 +312,37 @@ public sealed record AiReplayStateMessage(
 // the host picked (see MultiplayerManager.SelectedAi).
 public sealed record P2AiReplayStateMessage(
     EndAttack[] EndAttacks, float NewNorthRadians, int Rotation, Dictionary<PartyRole, uint> Lockons) : MpMessage;
+
+// P2AiReplayStateMessage.Lockons is a one-time snapshot of whatever the RNG
+// picked at scenario start, but UmadP2ForsakenScenario.ReapplyLockons
+// reassigns state.Lockons dynamically as towers resolve through the fight --
+// host-only, since it's called from the full scenario's own event schedule,
+// which a peer never runs. Without a way to re-sync it, a peer's local
+// debug-bot replay keeps reading its stale, replay-start snapshot: the AI
+// helpers' ActiveRole/PassiveRole look up state.Lockons[role] to decide who
+// currently owns which mechanic, and once the peer's copy has drifted from
+// the host's real (reassigned) values, that lookup can find zero matching
+// roles and throw -- which EventScheduler.Tick has no try/catch around, so
+// it aborts whatever AiManager.Move callback was mid-computation, and every
+// later scheduled move that depends on the same stale lookup fails the same
+// way, forever. Host -> everyone, sent every time ReapplyLockons actually
+// changes something (see MultiplayerManager's edge-triggered broadcast), so
+// a peer's shadow state stays whatever the host currently has.
+public sealed record P2LockonsUpdateMessage(Dictionary<PartyRole, uint> Lockons) : MpMessage;
+
+// Host -> everyone, mirroring MapController.AddEffect/DirectorUpdate 1:1 (see
+// MapController.EffectApplied/DirectorUpdated). Every UMAD scenario (P2, P3, P4
+// at minimum) calls world.Map.AddEffect/DirectorUpdate directly from its own
+// event schedule -- host-only, since a peer never runs the full scenario -- to
+// drive native, this-client-only instance/effect state: arena floor color and
+// lighting changes, tower reveals, director progress flags. None of this is a
+// SimObject, so none of it was ever covered by the existing snapshot sync;
+// without this, a peer's own client just never applies any of it, regardless of
+// which scenario is running. Both are pure replays of the exact call the host
+// made -- a peer never needs to compute these itself, only mirror them.
+public sealed record MapEffectMessage(uint PacketFlags, byte Index) : MpMessage;
+public sealed record MapDirectorUpdateMessage(
+    uint Category, uint Arg1, uint Arg2, uint Arg3, uint Arg4, uint Arg5, uint Arg6) : MpMessage;
 
 // P4 Kefka Says' version of AiReplayStateMessage above -- same purpose/timing.
 // Carries only the subset UmadP4KefkaSaysAi actually reads (see

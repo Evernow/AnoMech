@@ -16,6 +16,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
+using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
@@ -258,7 +259,7 @@ public sealed class UmadP2ForsakenScenario : IScenario
                s += $"{role}=0,";
            }
        }
-       Plugin.Log.Info($"Lockons reassignment {s}");
+       DiagnosticLog.Info($"Lockons reassignment {s}");
     }
     
     private void ResolveTower(SimCharacter character, int index)
@@ -271,7 +272,7 @@ public sealed class UmadP2ForsakenScenario : IScenario
         world.Events.Add(0.5f, () =>
         {
             if (towerHelper[index]?.Placement() != position)
-                Plugin.Log.Warning($"tower helper position changed from {position} to {towerHelper[index]?.Placement()}");
+                DiagnosticLog.Warn($"tower helper position changed from {position} to {towerHelper[index]?.Placement()}");
             towerHelper[index]?.SetPosition(position);
             switch (lockon)
             {

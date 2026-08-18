@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using AnoMech.Core;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
@@ -102,8 +103,8 @@ public sealed class UmadP2ForsakenLpduBuddiesAiHelper
         }
         catch (InvalidOperationException)
         {
-            Plugin.Log.Warning($"Lockons {string.Join(",", state.Lockons)}");
-            Plugin.Log.Warning($"Can't find {mechanic}.{order}, for {towerId}, for {string.Join(",", array)}");
+            DiagnosticLog.Warn($"Lockons {string.Join(",", state.Lockons)}");
+            DiagnosticLog.Warn($"Can't find {mechanic}.{order}, for {towerId}, for {string.Join(",", array)}");
             throw;
         }
     }

@@ -123,6 +123,10 @@ public sealed class MultiplayerManager : IDisposable
     // but the role itself doesn't.
     private readonly Dictionary<PartyRole, string> hostRoleLastLoggedStatuses = new();
     private readonly Dictionary<PartyRole, uint> hostRoleLastLoggedLockonVfx = new();
+    // Host-only, edge-triggered against UmadP2ForsakenState.Lockons -- see
+    // P2LockonsUpdateMessage's doc comment for why this needs its own re-syncable
+    // channel instead of the one-time P2AiReplayStateMessage snapshot.
+    private string? hostLastBroadcastP2Lockons;
 
     private readonly Dictionary<SimEventObject, int> hostEventObjectNetIds = new();
     private int nextEventObjectNetId;
@@ -931,8 +935,34 @@ public sealed class MultiplayerManager : IDisposable
         Session.Started = false;
     }
 
+    // Subscribed lazily on first Tick rather than in the field initializer that
+    // constructs this class (Plugin.GameInstance isn't set yet at that point) --
+    // one-shot, since Plugin.GameInstance.World (and so World.Map) is a single
+    // long-lived instance for the plugin's lifetime, never recreated per run.
+    // Handlers themselves gate on IsHost so this is a harmless no-op for a peer
+    // or during solo play; see MapEffectMessage/MapDirectorUpdateMessage.
+    private bool mapEventsSubscribed;
+
+    private void SubscribeMapEventsOnce()
+    {
+        if (mapEventsSubscribed) return;
+        mapEventsSubscribed = true;
+        Plugin.GameInstance.World.Map.EffectApplied += (packetFlags, index) =>
+        {
+            if (!IsHost || relay is not { IsConnected: true }) return;
+            _ = relay.SendAsync(new MapEffectMessage(packetFlags, index));
+        };
+        Plugin.GameInstance.World.Map.DirectorUpdated += (category, arg1, arg2, arg3, arg4, arg5, arg6) =>
+        {
+            if (!IsHost || relay is not { IsConnected: true }) return;
+            _ = relay.SendAsync(new MapDirectorUpdateMessage(category, arg1, arg2, arg3, arg4, arg5, arg6));
+        };
+    }
+
     public void Tick(float deltaSeconds)
     {
+        SubscribeMapEventsOnce();
+
         // Checked before the IsConnected early-return below (this is exactly the
         // case where relay is down) -- see disconnectedSinceMs's own doc comment.
         // One-shot: nulled out immediately so this doesn't re-fire (and re-call
@@ -1080,6 +1110,24 @@ public sealed class MultiplayerManager : IDisposable
     private void SampleAndBroadcastSnapshot()
     {
         var world = Plugin.GameInstance.World;
+
+        // UMAD P2 only (harmless no-op elsewhere -- LastState is only non-null for
+        // the scenario that's actually running). See P2LockonsUpdateMessage's doc
+        // comment: UmadP2ForsakenScenario.ReapplyLockons reassigns state.Lockons
+        // dynamically as towers resolve, host-only, so a peer's replay-start
+        // snapshot of it goes stale the first time that happens. Re-broadcast
+        // whenever it actually changes, keyed by a sorted string (Dictionary has
+        // no value equality) so this doesn't spam a message every tick.
+        if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is UmadP2ForsakenScenario { LastState: { } p2State })
+        {
+            var lockonsKey = string.Join(",", p2State.Lockons.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}"));
+            if (hostLastBroadcastP2Lockons != lockonsKey)
+            {
+                hostLastBroadcastP2Lockons = lockonsKey;
+                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting P2 Lockons update -- [{lockonsKey}].");
+                _ = relay!.SendAsync(new P2LockonsUpdateMessage(new Dictionary<PartyRole, uint>(p2State.Lockons)));
+            }
+        }
 
         var liveEnemies = world.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
         foreach (var stale in hostEnemyNetIds.Keys.Where(e => !liveEnemies.Contains(e)).ToList())
@@ -2074,6 +2122,31 @@ public sealed class MultiplayerManager : IDisposable
             case P2AiReplayStateMessage p2State when !IsHost:
                 pendingP2AiReplayState = p2State;
                 TryStartDebugBotReplay();
+                break;
+            // Re-syncs the one field in P2AiReplayStateMessage's snapshot that
+            // actually changes mid-fight -- see P2LockonsUpdateMessage's own doc
+            // comment. Dropped if the shadow state doesn't exist yet: that only
+            // happens if this update raced ahead of the replay actually starting,
+            // in which case the initial P2AiReplayStateMessage.Lockons snapshot
+            // (sent before any tower has had a chance to resolve and reassign
+            // anything) already carries the same value.
+            case P2LockonsUpdateMessage lockonsUpdate when !IsHost:
+                if (debugShadowStateP2 is { } p2Shadow)
+                    p2Shadow.Lockons = lockonsUpdate.Lockons;
+                break;
+            // Pure replays of the exact host-side call -- see
+            // MapEffectMessage/MapDirectorUpdateMessage's doc comment. The
+            // handlers subscribed in SubscribeMapEventsOnce gate on IsHost, so
+            // this can't loop back into a re-broadcast: AddEffect/DirectorUpdate
+            // fire the same MapController events on a peer's own local call too,
+            // but that peer's own handler is a no-op since IsHost is false there.
+            case MapEffectMessage effect when !IsHost:
+                Plugin.GameInstance.World.Map.AddEffect(effect.PacketFlags, effect.Index);
+                break;
+            case MapDirectorUpdateMessage directorUpdate when !IsHost:
+                Plugin.GameInstance.World.Map.DirectorUpdate(
+                    directorUpdate.Category, directorUpdate.Arg1, directorUpdate.Arg2,
+                    directorUpdate.Arg3, directorUpdate.Arg4, directorUpdate.Arg5, directorUpdate.Arg6);
                 break;
             case P4AiReplayStateMessage p4State when !IsHost:
                 pendingP4AiReplayState = p4State;

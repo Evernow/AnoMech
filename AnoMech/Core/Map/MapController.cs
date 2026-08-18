@@ -123,14 +123,31 @@ public sealed class MapController : IDisposable
 
     // ── Map effects ───────────────────────────────────────────────────────────
 
+    // Fired after each native call below actually applies, purely so
+    // MultiplayerManager (Core.Map has no business knowing Multiplayer exists)
+    // can mirror it to peers without this class needing to know or care whether
+    // multiplayer is even active -- see the events' own doc comments for why a
+    // peer needs this at all: these are native, this-client-only calls with no
+    // other replication path (unlike SimEnemy/SimEventObject/party-role state,
+    // none of this flows through a SimObject the existing snapshot sync walks).
+    public event Action<uint, byte>? EffectApplied;
+    public event Action<uint, uint, uint, uint, uint, uint, uint>? DirectorUpdated;
+
     // Replay a single MapEffect state change. packetFlags: high16=State, low8=Flags.
-    public void AddEffect(uint packetFlags, byte index) => effects.Apply(packetFlags, index);
+    public void AddEffect(uint packetFlags, byte index)
+    {
+        effects.Apply(packetFlags, index);
+        EffectApplied?.Invoke(packetFlags, index);
+    }
 
     // Replay a native DirectorUpdate event (instance progress / state sync) — the
     // server-side InstanceContentDirector message a scenario timeline replays. Thin
     // forwarder so scenarios address it through world.Map alongside AddEffect.
     public void DirectorUpdate(uint category, uint arg1 = 0, uint arg2 = 0, uint arg3 = 0, uint arg4 = 0, uint arg5 = 0, uint arg6 = 0)
-        => InstanceContentDirectorHelper.ProcessDirectorUpdate(category, arg1, arg2, arg3, arg4, arg5, arg6);
+    {
+        InstanceContentDirectorHelper.ProcessDirectorUpdate(category, arg1, arg2, arg3, arg4, arg5, arg6);
+        DirectorUpdated?.Invoke(category, arg1, arg2, arg3, arg4, arg5, arg6);
+    }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
