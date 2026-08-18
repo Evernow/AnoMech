@@ -30,7 +30,13 @@ internal static class PluginBuildInfo
     {
         try
         {
-            var path = Assembly.GetExecutingAssembly().Location;
+            // Assembly.GetExecutingAssembly().Location is always "" here --
+            // Dalamud loads plugin DLLs via Assembly.Load(byte[]) rather than
+            // from a file path (so it isn't holding a file lock on the DLL
+            // while the game runs), and a byte-array-loaded assembly reports
+            // no Location. PluginInterface.AssemblyLocation is Dalamud's own
+            // answer to "where is my DLL actually on disk" for this exact case.
+            var path = Plugin.PluginInterface.AssemblyLocation.FullName;
             if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "unknown";
             using var stream = File.OpenRead(path);
             // First 16 hex chars (64 bits) of the DLL's SHA-256 -- plenty to tell

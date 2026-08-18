@@ -39,6 +39,18 @@ public unsafe class SimNpc : SimCharacter
         TimelineFunctions.SetModelState(&chara->Timeline, value);
     }
 
+    // Read side of SetModelState -- MultiplayerManager samples this so a scenario's
+    // SetModelState calls (Kefka's grow transformation, Omega-M's phase swaps, etc.)
+    // replicate to peers instead of only ever changing the host's own local model.
+    public byte ModelState
+    {
+        get
+        {
+            var chara = BattleCharaPtr;
+            return chara == null ? (byte)0 : chara->Timeline.ModelState;
+        }
+    }
+
     // ModelContainer.ModeAttributeFlags (e.g. Omega-M's shield: 0x00 = shield, 0x10 = none)
     // is an INPUT the engine reads only while building the monster model
     // (CharacterSetup.SetupBNpc / Monster::SetupFromData). A bare field write has no visible

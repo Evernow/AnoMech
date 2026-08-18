@@ -33,6 +33,7 @@ public sealed class RelayClient : IDisposable
         try
         {
             await socket.ConnectAsync(uri, cts.Token).ConfigureAwait(false);
+            Plugin.Log.Information($"[RelayClient] Connected to {uri}.");
         }
         catch (Exception e)
         {
@@ -81,7 +82,11 @@ public sealed class RelayClient : IDisposable
                 do
                 {
                     result = await socket.ReceiveAsync(buffer, cts.Token).ConfigureAwait(false);
-                    if (result.MessageType == WebSocketMessageType.Close) return;
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        Plugin.Log.Information($"[RelayClient] Received close frame: status={result.CloseStatus}, description=\"{result.CloseStatusDescription}\".");
+                        return;
+                    }
                     ms.Write(buffer, 0, result.Count);
                 } while (!result.EndOfMessage);
 
@@ -110,9 +115,12 @@ public sealed class RelayClient : IDisposable
         catch (Exception e)
         {
             failure = e;
+            var code = e is WebSocketException wse ? $" (WebSocketErrorCode={wse.WebSocketErrorCode})" : "";
+            Plugin.Log.Warning($"[RelayClient] Receive loop faulted: {e}{code}");
         }
         finally
         {
+            Plugin.Log.Debug($"[RelayClient] Receive loop exiting -- final socket state {socket.State}.");
             Disconnected?.Invoke(failure);
         }
     }
@@ -121,6 +129,7 @@ public sealed class RelayClient : IDisposable
     {
         if (disposed) return;
         disposed = true;
+        Plugin.Log.Debug($"[RelayClient] Dispose() -- socket state was {socket.State}.");
         cts.Cancel();
         try { socket.Abort(); } catch { /* best-effort teardown */ }
         socket.Dispose();

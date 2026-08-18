@@ -50,7 +50,43 @@ public sealed class UmadP3BlackHoleState
         MiniBlackHoleInitialAngle = rng.NextInt(2);
         MiniBlackHoleChirality = rng.NextSign();
     }
-    
+
+    // Network-replay constructor: reconstructs only the fields UmadP3BlackHoleAi
+    // actually reads (Roles/StackTargets/SlapAttacks/KefkaPosition/
+    // ImplosionAttack), from values the host already rolled and broadcast,
+    // instead of drawing fresh RNG. Used exclusively by a peer's local "debug:
+    // bot controls my character" mode (see MultiplayerManager) so its AI
+    // choreography matches what a host-side bot in that role would actually do.
+    // Every other property is a harmless placeholder -- no AI-only code path
+    // reads EdictTargets/ConeTargets/BlackHoleDirections/MiniBlackHole*, those
+    // only feed the scenario's own damage/VFX resolution, which peers never run.
+    private UmadP3BlackHoleState(
+        SimWorld world, RoleList roles, RoleList stackTargets,
+        IReadOnlyList<uint> slapAttacks, IReadOnlyList<Direction> kefkaPosition, uint implosionAttack)
+    {
+        ScenarioObjects = new UmadP3BlackHoleScenarioObjects(world);
+        Roles = roles;
+        StackTargets = stackTargets;
+        EdictTargets = RoleList.Empty();
+        ImplosionAttack = implosionAttack;
+        SlapAttacks = slapAttacks;
+        ConeTargets = [];
+        KefkaPosition = kefkaPosition;
+        BlackHoleDirections = [];
+        MiniBlackHoleInitialAngle = 0;
+        MiniBlackHoleChirality = 1;
+    }
+
+    public static UmadP3BlackHoleState FromNetworkReplay(
+        SimWorld world, IReadOnlyList<PartyRole> roles, IReadOnlyList<PartyRole> stackTargets,
+        IReadOnlyList<uint> slapAttacks, IReadOnlyList<float> kefkaPositionRadians, uint implosionAttack)
+        => new(world,
+               new RoleList(world.Party, roles),
+               new RoleList(world.Party, stackTargets),
+               slapAttacks,
+               kefkaPositionRadians.Select(r => new Direction(r)).ToList(),
+               implosionAttack);
+
     // Final-slot (post-swap) line number and Accretion, mirroring the per-index status
     // assignment in UmadP3BlackHoleScenario.Run_OtherDebuffs. Slots 0-3 hold the supports
     // (slot 3 never a tank), slots 4-7 the DPS; Swap(3,7) trades the two Accretion holders.

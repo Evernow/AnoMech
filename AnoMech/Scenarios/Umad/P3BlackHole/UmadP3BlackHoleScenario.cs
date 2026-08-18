@@ -40,12 +40,21 @@ public sealed class UmadP3BlackHoleScenario : IScenario
     private int PrimodialCrustsToResolve;
     private float CleanseCooldown;
     SimEnemy? CleanseHelper;
-    
+
+    // The current run's randomized per-run assignments, exposed so
+    // MultiplayerManager can read the AI-relevant subset (Roles/StackTargets/
+    // SlapAttacks/KefkaPosition/ImplosionAttack) after a host Start and
+    // broadcast it -- lets a peer's local "debug: bot controls my character"
+    // mode replay the exact same choreography a host-side bot would produce
+    // for that role, without the host needing to know or care who's using it.
+    public UmadP3BlackHoleState? LastState { get; private set; }
+
     public void Run(SimWorld worldParam, int? selectedAi)
     {
         world = worldParam;
         party = worldParam.Party;
         state = new UmadP3BlackHoleState(world, settingsWindow.Overrides);
+        LastState = state;
         if (selectedAi is { } idx && idx < AiStrats.Count)
             ((IScenarioAi<UmadP3BlackHoleState>)AiStrats[idx]).Run(state, world);
         damage = new DamageSolver(party);
@@ -534,13 +543,12 @@ public sealed class UmadP3BlackHoleScenario : IScenario
 
     private void Run_Black_Hole_40004166()
     {
-        // Point the tether ordering at each wave's Kefka direction so the AI reads
-        // state.ScenarioObjects.Tethers already sorted clockwise from it.
-        world.Events.Add(25.17f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[0]);
-        world.Events.Add(55.70f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[1]);
-        world.Events.Add(89.95f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[2]);
-        world.Events.Add(123.34f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[3]);
-
+        // TetherSortFrom scheduling lives in UmadP3BlackHoleAi.Run now -- it's
+        // AI bookkeeping (the AI is the only reader of ScenarioObjects.Tethers),
+        // and keeping it there means a peer's local AI replay (see
+        // MultiplayerManager's debug-bot-controlled mode) gets it for free by
+        // calling the same Run(state, world) the host calls here, instead of
+        // needing this scenario file's own timeline duplicated peer-side.
         RunActiveBlackHole(BlackHolePositions[0][2], 25.17f, 25.17f, 32.27f, 1);
         RunActiveBlackHole(BlackHolePositions[0][1], 25.17f, 32.27f, 39.33f, 1);
         RunActiveBlackHole(BlackHolePositions[0][0], 25.17f, 32.27f, 39.33f, 1);

@@ -190,8 +190,17 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     }
 
     public bool HasStatus(ushort statusId) => FindStatus(statusId) != null;
-    
-    
+
+    // Read side of AddStatus/RemoveStatus -- MultiplayerManager samples this so a
+    // scenario's stack-based status calls (e.g. UMAD P3's "Max" status, applied
+    // at 506 stacks purely to drive Kefka's VFX grow effect) replicate to peers.
+    // Without this, statuses set via AddStatus are entirely local: the host's own
+    // doppel renders correctly but a peer's independently-spawned doppel never
+    // gets them at all.
+    public IReadOnlyList<(ushort StatusId, ushort Stacks)> ActiveStatusSnapshot =>
+        statusList.Where(s => s.IsActive).Select(s => (s.StatusId, s.Stacks)).ToList();
+
+
     // -------------------------
     // Other Subsystem
     // -------------------------

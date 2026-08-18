@@ -18,6 +18,8 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(ClaimRoleMessage), "claim")]
 [JsonDerivedType(typeof(ReleaseRoleMessage), "release")]
 [JsonDerivedType(typeof(StartMessage), "start")]
+[JsonDerivedType(typeof(StartCheckMessage), "startCheck")]
+[JsonDerivedType(typeof(StartCheckResponseMessage), "startCheckResponse")]
 [JsonDerivedType(typeof(SelfPoseMessage), "pose")]
 [JsonDerivedType(typeof(WorldSnapshotMessage), "snapshot")]
 [JsonDerivedType(typeof(RoleKilledMessage), "killed")]
@@ -27,6 +29,8 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(PeerStatusMessage), "status")]
 [JsonDerivedType(typeof(SessionEndedMessage), "sessionEnded")]
 [JsonDerivedType(typeof(ResetRequestMessage), "resetRequest")]
+[JsonDerivedType(typeof(LeaveRequestMessage), "leaveRequest")]
+[JsonDerivedType(typeof(AiReplayStateMessage), "aiReplayState")]
 public abstract record MpMessage;
 
 // Peer -> host, sent once right after connecting so the host can register a
@@ -64,6 +68,20 @@ public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
 // of a few hundred ms of start skew (see MultiplayerManager).
 public sealed record StartMessage : MpMessage;
 
+// Host -> everyone, sent when the host clicks Start, *before* Session.Started
+// is set or StartMessage goes out. Game.RunScenarioInternal hard-gates on
+// ZoneSession.IsInInn() and silently no-ops (just a local log line) if it
+// fails -- without this round-trip, a peer who isn't in an inn would just
+// never enter the instance with no signal to the host beyond them eventually
+// going "stale". Every claimed peer answers with StartCheckResponseMessage;
+// the host only proceeds once everyone's confirmed (see MultiplayerManager).
+public sealed record StartCheckMessage : MpMessage;
+
+// Peer -> host, reply to StartCheckMessage. Reason is null when Ready is
+// true; otherwise a short human-readable explanation ("not in an inn",
+// "busy") surfaced verbatim in the host's "can't start" summary.
+public sealed record StartCheckResponseMessage(Guid PeerId, bool Ready, string? Reason) : MpMessage;
+
 // Peer -> host, sent at PoseSendRate for the sender's own real character. Host
 // applies it to that peer's SimNetworkPuppet and republishes it as part of the
 // next WorldSnapshot's Roles list (see MultiplayerManager.SampleAndBroadcast).
@@ -73,10 +91,24 @@ public sealed record SelfPoseMessage(Guid PeerId, float X, float Y, float Z, flo
 // stable id (not the game's own EntityId) used only to correlate this enemy
 // across snapshot ticks. The spawn-config fields let a peer reconstruct the
 // same doppel locally via world.SpawnEnemy on first sight of a NetId.
+// ModelState mirrors SimNpc.SetModelState -- a scenario's mid-fight model-swap
+// calls (Kefka's grow transformation, Omega-M's phase changes, etc.) are a
+// native Timeline write with no other signal a peer could pick up; without
+// this field a peer's doppel stays on its spawn-time model forever regardless
+// of what the host's own model actually transforms into.
+// Statuses mirrors SimCharacter.AddStatus/RemoveStatus -- direct StatusManager
+// writes (see Statuses.Apply) that never go through a real server packet, so a
+// peer's doppel has no other way to learn about them. This is how UMAD P3's
+// "Max" status (506 stacks, applied purely to drive Kefka's VFX grow effect)
+// reaches a peer -- without it Kefka renders on the peer at its un-grown base
+// size despite Position/Visible/ModelState all matching the host correctly.
+public sealed record EnemyStatusState(ushort StatusId, ushort Stacks);
+
 public sealed record EnemyState(
     int NetId, uint BNpcBaseId, uint NameId, byte Level, bool Targetable,
     EnemyListMode EnemyList, uint ModelCharaId, float Scale, float HitboxRadius,
-    byte? InitialModeAttributeFlags, bool Visible,
+    byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
+    IReadOnlyList<EnemyStatusState> Statuses,
     float X, float Y, float Z, float Rotation,
     bool IsCasting, uint CastActionId);
 
@@ -134,11 +166,14 @@ public sealed record PeerStatusMessage(Dictionary<Guid, PeerStatusEntry> Statuse
 
 // Sent by whoever clicks "Leave session" -- host or peer alike -- to every
 // other client (as opposed to Reset or a natural scenario end, see
-// EndMessage, which keep the session alive for a re-Start). Anyone leaving
-// ends the session for the whole group: every recipient reverts to the inn
-// if mid-fight and fully disconnects too, rather than the group splintering
-// into "some people still in, some out." PeerId is who left, purely for the
-// goodbye message the rest of the group sees.
+// EndMessage, which keep the session alive for a re-Start). Only ends the
+// session for the whole group when the host is who left (every recipient
+// reverts to the inn if mid-fight and fully disconnects too, rather than the
+// group splintering into "some people still in, some out"); a departing peer
+// instead just gets dropped from the roster (see MultiplayerManager.Dispatch)
+// -- the rest of the group keeps going. PeerId is who left: how the recipient
+// tells the two cases apart (PeerId == Session.HostId) and, for the
+// session-ending case, who to name in the goodbye message.
 public sealed record SessionEndedMessage(Guid PeerId) : MpMessage;
 
 // Peer -> host: "please reset the encounter for the group." The peer doesn't
@@ -147,3 +182,27 @@ public sealed record SessionEndedMessage(Guid PeerId) : MpMessage;
 // existing EndMessage broadcast, so there's one single code path for "the
 // run reset" regardless of who asked for it.
 public sealed record ResetRequestMessage(Guid PeerId) : MpMessage;
+
+// Peer -> host: "please end the run and send everyone back to the inn" --
+// the ordinary Leave button (distinct from SessionEndedMessage/"Leave
+// session", which disconnects the sender from the group entirely). The peer
+// doesn't leave locally itself -- the host leaves its own authoritative run
+// instead, which naturally reaches everyone (including the requester) via
+// the existing EndMessage broadcast, same single-code-path reasoning as
+// ResetRequestMessage. The session (roster, relay connection) is untouched;
+// only the current run ends.
+public sealed record LeaveRequestMessage(Guid PeerId) : MpMessage;
+
+// Host -> everyone, broadcast once per run as soon as the host's own
+// randomized per-run assignments are available after Start -- sent
+// unconditionally, regardless of whether anyone's actually using debug-bot
+// mode, so the host's own logic never needs to know or care who is. Carries
+// only the subset UmadP3BlackHoleAi actually reads (see
+// UmadP3BlackHoleState.FromNetworkReplay); everything else that state holds
+// only feeds the scenario's own damage/VFX resolution, which peers never run
+// regardless of debug-bot mode. A peer with debug-bot mode on uses this to
+// locally replay the exact choreography a host-side bot in that role would
+// produce, entirely client-side -- see MultiplayerManager.
+public sealed record AiReplayStateMessage(
+    PartyRole[] Roles, PartyRole[] StackTargets, uint[] SlapAttacks,
+    float[] KefkaPositionRadians, uint ImplosionAttack) : MpMessage;

@@ -51,6 +51,57 @@ public sealed unsafe class SimEnemy : SimNpc
     // SimCast. SimEnemy just converts target coords to world space and reads IsBusy.
     private readonly SimCast cast;
 
+    // Peer-only smoothing for positions received via ApplyNetworkPosition (mirrors
+    // SimNetworkPuppet's CatchUpSpeed/SnapThreshold -- same reasoning, same values:
+    // fast enough to keep pace with the host's real per-frame movement between
+    // MultiplayerManager's 12Hz snapshots without visibly lagging behind, but still
+    // smooths out per-snapshot jitter instead of teleporting once per update).
+    // Distances beyond NetworkSnapThreshold (a scripted teleport/repositioning, a
+    // lag spike) skip interpolation and snap immediately rather than gliding across
+    // the arena. No effect on host-driven enemies: nothing calls
+    // ApplyNetworkPosition there.
+    private const float NetworkCatchUpSpeed = 12f;
+    private const float NetworkSnapThreshold = 15f;
+    private const ushort NetworkRunTimelineId = 22; // mirrors Game.Movement.RunTimelineId
+
+    private Vector3? networkTargetPosition;
+    private float networkTargetRotation;
+    private bool networkInterpAnimActive;
+
+    // Records the latest position/rotation broadcast by the host for this enemy --
+    // see MultiplayerManager.OnWorldSnapshotReceived, the only caller. The actual
+    // position write happens in Tick so the doppel steps toward it smoothly with a
+    // run animation playing, instead of teleporting once per WorldSnapshotMessage.
+    public void ApplyNetworkPosition(Vector3 position, float rotation)
+    {
+        networkTargetPosition = position;
+        networkTargetRotation = rotation;
+    }
+
+    private void TickNetworkPosition(float deltaSeconds)
+    {
+        if (networkTargetPosition is not { } target) return;
+
+        var basePos = Position;
+        var delta = target - basePos;
+        var dist = delta.Length();
+        var step = NetworkCatchUpSpeed * deltaSeconds;
+        if (dist > NetworkSnapThreshold || dist <= step)
+        {
+            SetPosition(new Placement(target, networkTargetRotation));
+            if (networkInterpAnimActive) { ResetActionTimeline(); networkInterpAnimActive = false; }
+            return;
+        }
+
+        var next = basePos + delta / dist * step;
+        SetPosition(new Placement(next, networkTargetRotation));
+        if (!networkInterpAnimActive)
+        {
+            PlayActionTimeline(NetworkRunTimelineId, baseOverride: NetworkRunTimelineId);
+            networkInterpAnimActive = true;
+        }
+    }
+
     // Visibility runs through the DrawObject lifecycle: SetVisible records a desired
     // state; Tick's reconciler fires EnableDraw/DisableDraw once per change, gated on
     // IsReadyToDraw so toggles can't race the async model load. RenderFlags writes
@@ -205,7 +256,7 @@ public sealed unsafe class SimEnemy : SimNpc
         if (config.NameId != 0) chara->NameId = config.NameId;
         if (config.Level != 0) chara->Level = config.Level;
 
-        Plugin.Log.Info($"SimEnemy: spawned BNpcBase {config.BNpcBaseId} (ModelChara {bnpc.ModelChara.RowId}, scale {bnpc.Scale}) at index {idx}");
+        Plugin.Log.Info($"SimEnemy: spawned BNpcBase {config.BNpcBaseId} (ModelChara {bnpc.ModelChara.RowId}, scale {bnpc.Scale}) at index {idx}, goid {gameObj->GetGameObjectId()}, pos {config.Placement.Position}, visible {config.IsVisible}");
         var enemy = new SimEnemy(idx, config.BNpcBaseId, displayName, config.EnemyList, world.Coordinates)
         {
             SpawnConfig = config,
@@ -313,7 +364,12 @@ public sealed unsafe class SimEnemy : SimNpc
         obj->DrawObject->IsVisible = desiredVisible;
         currentVisible = desiredVisible;
 
-        Plugin.Log.Debug($"[SimEnemy.ReconcileVisibility] {DisplayName}'s visibility was set to {desiredVisible}");
+        // GameObjectId, not just DisplayName, since multiple simultaneous enemies can
+        // share the exact same display name (UMAD spawns several "Kefka"-named BNpcs at
+        // once, only one of which is the actual scaled-up model) -- without a stable ID
+        // here, two independent machines' logs can't be matched up to confirm they're
+        // even talking about the same enemy.
+        Plugin.Log.Debug($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId})'s visibility was set to {desiredVisible} at pos {Position}");
     }
 
     // Authoritative draw state (DrawObject.Flags bits 0 and 3, set by Enable/DisableDraw).
@@ -353,6 +409,7 @@ public sealed unsafe class SimEnemy : SimNpc
         base.Tick(deltaSeconds);
         ReconcileVisibility();
         cast.Tick(deltaSeconds);
+        TickNetworkPosition(deltaSeconds);
     }
 
     public CharacterFind<T> Find<T>(List<T> targets) where T : IPositioned

@@ -22,6 +22,17 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         world = worldParam;
         var ai = new AiManager(world);
 
+        // Point the tether ordering at each wave's Kefka direction so
+        // ScenarioObjects.Tethers below reads already sorted clockwise from
+        // it. Lives here (not the scenario) since the AI is this data's only
+        // reader -- keeping it self-contained is what lets a peer's local
+        // debug-bot replay (see MultiplayerManager) reproduce it by calling
+        // this same Run, without needing the scenario's own timeline at all.
+        world.Events.Add(25.17f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[0]);
+        world.Events.Add(55.70f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[1]);
+        world.Events.Add(89.95f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[2]);
+        world.Events.Add(123.34f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[3]);
+
         ai.Move(7f, StackCentreTanksHoldBossesCentred);
         ai.Move(11f, StackCentre);
         ai.Move(18f, () => DodgeSlap(slapIndex: 0, kefkaIndex: 0));

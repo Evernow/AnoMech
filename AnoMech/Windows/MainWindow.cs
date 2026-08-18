@@ -274,7 +274,19 @@ public unsafe class MainWindow : Window, IDisposable
         if (game.World.Map.IsInInstance)
         {
             ImGui.SameLine();
-            if (ImGui.Button("Leave")) game.Leave();
+            // Same redirect reasoning as Reset above: a peer's own Game.Leave()
+            // would only unload their own local zone, leaving the host still
+            // simulating/broadcasting to a puppet-driven world they've since
+            // torn down. Routing through the host ends the run for the whole
+            // group (see MultiplayerManager.RequestLeaveInstance) while
+            // leaving the session itself intact.
+            if (ImGui.Button("Leave"))
+            {
+                if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
+                    plugin.Multiplayer.RequestLeaveInstance();
+                else
+                    game.Leave();
+            }
         }
 
         if (_selectedScenario.SupportsSolo)

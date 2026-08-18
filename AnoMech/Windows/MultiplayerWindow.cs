@@ -77,7 +77,7 @@ public class MultiplayerWindow : Window, IDisposable
     {
         ImGui.TextWrapped("Point this at a relay server you or someone in your group is running " +
                            "-- there is no default/public one. See Relay/README.md for how to stand " +
-                           "one up (a few minutes on a small VPS, or free on your own PC for a LAN test).");
+                           "one up.");
 
         ImGui.SetNextItemWidth(300);
         if (ImGui.InputText("Relay URL##relayUrl", ref relayUrl, 256))
@@ -242,13 +242,37 @@ public class MultiplayerWindow : Window, IDisposable
         if (unclaimed.Count > 0)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), $"Connected, no role yet: {string.Join(", ", unclaimed)}");
 
+        // Peer-only testing aid -- the host is always the real, authoritative
+        // simulation, so this has nothing to attach to on that side (see
+        // MultiplayerManager.SetDebugBotControlled). Locked once Started so it
+        // can't flip mid-fight; the choreography only makes sense replayed
+        // from a fresh Start.
+        if (!mp.IsHost)
+        {
+            var botControlled = mp.DebugBotControlled;
+            ImGui.BeginDisabled(mp.Session.Started);
+            if (ImGui.Checkbox("Debug mode: AI control player character locally", ref botControlled))
+                mp.SetDebugBotControlled(botControlled);
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Testing aid -- your own claimed role gets driven locally by the " +
+                                  "same AI a host-side bot in that role would use, instead of you. " +
+                                  "Entirely client-side; the host sees no difference. Locked once the " +
+                                  "fight starts.");
+        }
+
         ImGui.Separator();
         if (!mp.Session.Started)
         {
             if (mp.IsHost)
             {
+                if (mp.IsStartCheckPending)
+                    ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), "Checking everyone's ready...");
+                else if (mp.StartCheckFailureReason is { } startFail)
+                    ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), startFail);
+
                 var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
-                var canStart = stable && mp.MyClaimedRole != null && !anyMismatch;
+                var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending;
                 ImGui.BeginDisabled(!canStart);
                 if (ImGui.Button("Start")) mp.StartScenario();
                 ImGui.EndDisabled();
@@ -257,7 +281,9 @@ public class MultiplayerWindow : Window, IDisposable
                         ? "Not connected to the relay."
                         : anyMismatch
                             ? "One or more players are on a different plugin build -- everyone needs to match before starting."
-                            : "Claim a role for yourself first.");
+                            : mp.IsStartCheckPending
+                                ? "Waiting for players to confirm they're ready..."
+                                : "Claim a role for yourself first.");
             }
             else
             {
@@ -271,7 +297,14 @@ public class MultiplayerWindow : Window, IDisposable
         if (ImGui.Button("Leave session"))
         {
             mp.LeaveSession();
-            plugin.Game.Leave();
+            // Game.Leave() -> World.Map.Unload() assumes a zone was actually
+            // entered (it restores the real character to the position saved by
+            // ZoneSession.Enter()) -- calling it having never clicked Start
+            // means that save was never populated, and it teleports the real
+            // character to garbage/default coordinates in whatever zone
+            // they're actually in. Mirrors the same IsInInstance gate
+            // MainWindow's own "Leave" button already uses.
+            if (plugin.Game.World.Map.IsInInstance) plugin.Game.Leave();
         }
     }
 

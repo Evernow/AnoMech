@@ -259,8 +259,23 @@ internal class Movement(SimCharacter parent)
 
 internal sealed class PlayerMovement(SimCharacter parent) : Movement(parent)
 {
+    // Normally a no-op ("player cannot be moved like this") since AiManager.Move
+    // and friends address every party slot uniformly, including whichever one
+    // holds the real player. DebugBotControl flips this for the one case that
+    // legitimately wants the real character driven by AI: MultiplayerManager's
+    // debug "bot controls my character" peer mode, which schedules the exact
+    // same AiManager/scenario-Ai MoveTo/Intercept calls a host-side bot would
+    // get. Falling through to base.MoveTo also sets SimPlayer's own
+    // destination/IsMoving, which SyncInputLock already reads to zero the real
+    // player's WASD input while a knockback is sliding them -- so it
+    // transparently suppresses manual input here too, no extra plumbing needed.
     public override void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)
     {
+        if (DebugBotControl.Enabled)
+        {
+            base.MoveTo(t, sp, finalRot, tl, baseOverride);
+            return;
+        }
         // NO-OP - player cannot be moved like this
     }
 }
