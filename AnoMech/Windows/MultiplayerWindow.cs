@@ -6,13 +6,16 @@ using AnoMech.Core.Game.Party;
 using AnoMech.Multiplayer;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
+using static AnoMech.Core.Game.Game;
 
 namespace AnoMech.Windows;
 
-// Vertical-slice multiplayer lobby, scoped to UMAD P3 Black Hole only (see
-// MultiplayerManager). Host picks a role, shares the session code + relay URL
-// out of band, up to 7 others join and claim the remaining roles; anything
-// left unclaimed stays an AI bot exactly like solo play.
+// Vertical-slice multiplayer lobby. Which scenario is hosted is whatever's
+// currently selected in MainWindow (see MultiplayerManager.SupportedScenarios /
+// StartScenario) -- this window has no scenario picker of its own, it only
+// shows the name. Host picks a role, shares the session code + relay URL out
+// of band, up to 7 others join and claim the remaining roles; anything left
+// unclaimed stays an AI bot exactly like solo play.
 public class MultiplayerWindow : Window, IDisposable
 {
     private static readonly string[] RoleLabels = ["MT", "OT", "H1", "H2", "M1", "M2", "R1", "R2"];
@@ -24,7 +27,7 @@ public class MultiplayerWindow : Window, IDisposable
     private string displayName = "Player";
     private bool namePrefilled;
 
-    public MultiplayerWindow(Plugin plugin) : base("AnoMech Multiplayer (P3 Black Hole)###AnoMechMultiplayer")
+    public MultiplayerWindow(Plugin plugin) : base("AnoMech Multiplayer###AnoMechMultiplayer")
     {
         this.plugin = plugin;
         mp = plugin.Multiplayer;
@@ -40,6 +43,21 @@ public class MultiplayerWindow : Window, IDisposable
 
     public void Dispose() { }
 
+    // Before Start, Session.ScenarioIndex is only meaningful once the host has
+    // actually clicked Start (StartScenario populates it) -- showing it any
+    // earlier would display whatever scenario happens to sit at index 0 in
+    // Game.Scenarios, not what's actually about to be hosted. So: once
+    // Started, the session's own (broadcast, authoritative for everyone
+    // including peers) scenario is shown; before that, only the host's own
+    // live MainWindow selection is meaningful, and a peer just sees "not
+    // chosen yet" since they have no visibility into what the host intends.
+    private string CurrentScenarioLabel()
+    {
+        if (mp.Session.Started) return DisplayName(Plugin.GameInstance.Scenarios[mp.Session.ScenarioIndex]);
+        if (mp.IsHost && Plugin.MainWindow.SelectedScenario is { } scenario) return DisplayName(scenario);
+        return "not chosen yet";
+    }
+
     public override void Draw()
     {
         if (!namePrefilled)
@@ -49,9 +67,23 @@ public class MultiplayerWindow : Window, IDisposable
             namePrefilled = true;
         }
 
+        WindowName = $"AnoMech Multiplayer ({CurrentScenarioLabel()})###AnoMechMultiplayer";
+
         ImGui.TextWrapped(
-            "Vertical-slice multiplayer for UMAD P3 Black Hole only. One host runs the real " +
+            $"Vertical-slice multiplayer for {CurrentScenarioLabel()}. One host runs the real " +
             "simulation; up to 7 others join and take over bot slots.");
+        if (mp.SessionCode == null
+            && (Plugin.MainWindow.SelectedScenario is not { } sel || !MultiplayerManager.SupportedScenarios.Contains(sel.GetType())))
+        {
+            // Not gated on mp.IsHost: that flag defaults to false and is never
+            // reset back to false on leaving a session (see LeaveSessionInternal),
+            // so gating on it meant this warning only ever showed for a *returning*
+            // host, never a first-time one. Harmless to show before joining too --
+            // it's specifically about hosting, and a would-be joiner can just
+            // ignore it.
+            ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f),
+                "Select a multiplayer-supported scenario in the main window before hosting.");
+        }
         ImGui.Separator();
 
         // Gated on SessionCode (cleared only by LeaveSession), not IsConnected --
@@ -242,16 +274,14 @@ public class MultiplayerWindow : Window, IDisposable
         if (unclaimed.Count > 0)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), $"Connected, no role yet: {string.Join(", ", unclaimed)}");
 
-        // Peer-only testing aid -- the host is always the real, authoritative
-        // simulation, so this has nothing to attach to on that side (see
+        // Testing aid, available to host and peer alike (see
         // MultiplayerManager.SetDebugBotControlled). Locked once Started so it
         // can't flip mid-fight; the choreography only makes sense replayed
         // from a fresh Start.
-        if (!mp.IsHost)
         {
             var botControlled = mp.DebugBotControlled;
             ImGui.BeginDisabled(mp.Session.Started);
-            if (ImGui.Checkbox("Debug mode: AI control player character locally", ref botControlled))
+            if (ImGui.Checkbox("Debug AI bot", ref botControlled))
                 mp.SetDebugBotControlled(botControlled);
             ImGui.EndDisabled();
             if (ImGui.IsItemHovered())
@@ -272,18 +302,29 @@ public class MultiplayerWindow : Window, IDisposable
                     ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), startFail);
 
                 var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
-                var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending;
+                var hasSupportedScenario = Plugin.MainWindow.SelectedScenario is { } sel2
+                    && MultiplayerManager.SupportedScenarios.Contains(sel2.GetType());
+                // A grouped scenario (e.g. P2 Forsaken's NA/EU strats) can leave
+                // SelectedStrat at -1 when the selected region has no strats --
+                // mirrors MainWindow's own solo-Start gate (HasStartableStrat),
+                // and matches the same check StartScenario itself enforces.
+                var hasStrat = hasSupportedScenario && Plugin.MainWindow.HasStartableStrat();
+                var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending && hasStrat;
                 ImGui.BeginDisabled(!canStart);
                 if (ImGui.Button("Start")) mp.StartScenario();
                 ImGui.EndDisabled();
                 if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
                     ImGui.SetTooltip(!stable
                         ? "Not connected to the relay."
-                        : anyMismatch
-                            ? "One or more players are on a different plugin build -- everyone needs to match before starting."
-                            : mp.IsStartCheckPending
-                                ? "Waiting for players to confirm they're ready..."
-                                : "Claim a role for yourself first.");
+                        : !hasSupportedScenario
+                            ? "Select a multiplayer-supported scenario in the main window first."
+                            : !hasStrat
+                                ? "No strat available for the selected scenario/region."
+                                : anyMismatch
+                                ? "One or more players are on a different plugin build -- everyone needs to match before starting."
+                                : mp.IsStartCheckPending
+                                    ? "Waiting for players to confirm they're ready..."
+                                    : "Claim a role for yourself first.");
             }
             else
             {

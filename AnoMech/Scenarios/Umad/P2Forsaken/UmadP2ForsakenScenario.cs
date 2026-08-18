@@ -54,12 +54,19 @@ public sealed class UmadP2ForsakenScenario : IScenario
     private SimParty party = null!;
     private DamageSolver damage = null!;
 
+    // The current run's randomized per-run assignments, exposed so
+    // MultiplayerManager can read them after a host Start and broadcast them --
+    // lets a peer's local "debug: bot controls my character" mode replay the
+    // same choreography a host-side bot in that role would produce. Mirrors
+    // UmadP3BlackHoleScenario.LastState.
+    public UmadP2ForsakenState? LastState { get; private set; }
 
     public void Run(SimWorld worldParam, int? selectedAi)
     {
         world = worldParam;
         party = worldParam.Party;
         state = new UmadP2ForsakenState(party, settingsWindow.Overrides);
+        LastState = state;
         if (selectedAi is { } idx && idx >= 0 && idx < AiStrats.Count)
             ((IScenarioAi<UmadP2ForsakenState>)AiStrats[idx]).Run(state, world);
         damage = new DamageSolver(party);
@@ -323,7 +330,7 @@ public sealed class UmadP2ForsakenScenario : IScenario
         world.Events.Add(start + 6f, () => enemy?.Face(party.Player));
         world.Events.Add(start + 6.1f, () => enemy?.Cast(end.AllThingsEnding, targetLocation: party.Player!.Position));
         world.Events.Add(start + 11.1f, () => damage.Resolve(enemy, end.AllThingsEnding, [DamageType.Lethal], [], size: Geometry.AllThingsEndHalfCone, coneRotationDelta: end.RotationOverride));
-        world.Events.Add(start + 14.1f, () => enemy?.PlayActionTimeline(TimelineId.WarpOut));
+        world.Events.Add(start + 14.1f, () => enemy?.PlayAnimationTimeline(TimelineId.WarpOut));
     }
 
     

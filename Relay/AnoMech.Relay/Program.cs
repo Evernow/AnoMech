@@ -182,6 +182,11 @@ internal static class Program
             return Sessions.TryGetValue(sessionCode, out var peers) ? peers.Count : 0;
     }
 
+    // How long a single peer's send may take before we give up on it. Broad
+    // enough to absorb ordinary latency/jitter, tight enough that one stalled
+    // connection can't noticeably delay the rest of the party for long.
+    private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(5);
+
     private static async Task BroadcastAsync(string sessionCode, WebSocket sender, string text)
     {
         List<WebSocket> targets;
@@ -192,16 +197,40 @@ internal static class Program
         }
 
         var bytes = Encoding.UTF8.GetBytes(text);
-        foreach (var target in targets)
+        // Parallel, not sequential: with a party's worth of peers in one session,
+        // a single slow/stalled connection must not delay delivery to everyone
+        // else -- the old sequential foreach blocked the whole broadcast (every
+        // message type, not just world snapshots) behind whichever peer happened
+        // to be unresponsive.
+        await Task.WhenAll(targets.Select(target => SendOneAsync(target, bytes)));
+    }
+
+    // Sends to one target with a hard timeout. A timeout is treated as fatal
+    // for that connection (aborted, not just skipped this round): cancelling a
+    // WebSocket send mid-flight can leave a half-written frame sitting in the
+    // OS send buffer, and reusing the connection for the next broadcast risks
+    // interleaving a fresh frame with that leftover partial one -- corrupting
+    // the whole message stream for that peer from then on, not just this one
+    // message. Aborting is a clean hard reset instead, and lets both sides'
+    // own receive loops notice and clean up the normal way: this relay's own
+    // per-connection loop (HandleConnectionAsync) sees its ReceiveAsync fail
+    // and calls Leave(); the client's RelayClient sees its ReceiveAsync fail
+    // and fires Disconnected, which starts its own reconnect-with-backoff loop.
+    private static async Task SendOneAsync(WebSocket target, byte[] bytes)
+    {
+        using var cts = new CancellationTokenSource(SendTimeout);
+        try
         {
-            try
-            {
-                await target.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
-            }
-            catch (WebSocketException)
-            {
-                // Dead socket -- its own receive loop will observe the failure and Leave().
-            }
+            await target.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.Error.WriteLine($"[Relay] Send to a peer timed out after {SendTimeout.TotalSeconds:F0}s -- aborting that connection.");
+            target.Abort();
+        }
+        catch (WebSocketException)
+        {
+            // Dead socket -- its own receive loop will observe the failure and Leave().
         }
     }
 }

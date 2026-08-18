@@ -55,7 +55,11 @@ public sealed class Plugin : IDalamudPlugin
     internal static LocalPlayerInputHooks PlayerInputHooks { get; private set; } = null!;
     internal static LogManager LogManager { get; private set; } = null!;
     private ConfigWindow ConfigWindow { get; init; }
-    private MainWindow MainWindow { get; init; }
+    // internal static (not init) so MultiplayerManager can read the host's current
+    // scenario/strat/waymark selection (SelectedScenario/SelectedStrat/SelectedWaymark)
+    // without needing its own Plugin/MainWindow reference -- mirrors the GameInstance
+    // static-accessor pattern just above.
+    internal static MainWindow MainWindow { get; private set; } = null!;
     internal MultiplayerWindow MultiplayerWindow { get; init; }
 #if DEBUG
     private DamageDebugWindow DamageDebugWindow { get; init; }

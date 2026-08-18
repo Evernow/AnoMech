@@ -5,10 +5,15 @@ using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
 using AnoMech.Core.Game;
+using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
+using AnoMech.Scenarios;
+using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
+using AnoMech.Scenarios.Umad.P4KefkaSays;
+using AnoMech.Scenarios.Umad.P5Exaflares;
 using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Multiplayer;
@@ -39,6 +44,28 @@ public sealed class MultiplayerManager : IDisposable
     private const float SnapshotIntervalSeconds = 1f / 12f;
     private const float PoseIntervalSeconds = 1f / 15f;
     private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+    // Mirrors UmadP5ExaflaresScenario.FrameGapCapSeconds -- a peer's P5 debug-bot
+    // replay ticks debugShadowStateP5.Timeline off this Tick's own deltaSeconds
+    // (see Tick()'s peer branch), which has no equivalent hitch guard of its own;
+    // without this, a pause/alt-tab/loading-stall frame would fire every event
+    // still queued on that timeline at once instead of skipping the frame like
+    // the real scenario's wall-clock Stopwatch does.
+    private const float P5ReplayFrameGapCapSeconds = 0.25f;
+
+    // Scenarios a multiplayer session can host/join/start -- gates MainWindow's
+    // "Multiplayer..." button and StartScenario's own validation. Core
+    // replication (enemies/tethers/roles/statuses/ModelState) works for any
+    // IScenario automatically; this list exists only because debug-bot AI
+    // replay (TrySendAiReplayState/TryStartDebugBotReplay) needs a hand-written
+    // per-scenario wire message and shadow-state factory, so a scenario has to
+    // be deliberately added here once that's been done for it.
+    public static readonly Type[] SupportedScenarios =
+    [
+        typeof(UmadP2ForsakenScenario),
+        typeof(UmadP3BlackHoleScenario),
+        typeof(UmadP4KefkaSaysScenario),
+        typeof(UmadP5ExaflaresScenario),
+    ];
 
     private RelayClient? relay;
     private bool running;
@@ -60,9 +87,26 @@ public sealed class MultiplayerManager : IDisposable
     // ActiveStatusSnapshot's list identity changes every call regardless of
     // content.
     private readonly Dictionary<SimEnemy, string> hostEnemyLastLoggedStatuses = new();
+    // Host-only: same edge-triggered-logging-only purpose, for
+    // PlayAnimationTimeline/AttachLockonVfx calls. Absent from the dictionary
+    // == "never logged yet" (distinct from "logged 0"), since 0 is a
+    // meaningful default-y value for both fields.
+    private readonly Dictionary<SimEnemy, ushort> hostEnemyLastLoggedAnimationTimeline = new();
+    private readonly Dictionary<SimEnemy, uint> hostEnemyLastLoggedLockonVfx = new();
+    // Host-only: same edge-triggered-logging-only purpose, for party-role
+    // AddStatus/RemoveStatus and AttachLockonVfx calls -- keyed by PartyRole
+    // (fixed 8-entry set) rather than a Dictionary<SimCharacter,...>, since
+    // whichever SimCharacter occupies a role changes across a claim/release
+    // but the role itself doesn't.
+    private readonly Dictionary<PartyRole, string> hostRoleLastLoggedStatuses = new();
+    private readonly Dictionary<PartyRole, uint> hostRoleLastLoggedLockonVfx = new();
+
+    private readonly Dictionary<SimEventObject, int> hostEventObjectNetIds = new();
+    private int nextEventObjectNetId;
 
     private readonly Dictionary<int, SimEnemy> peerEnemies = new();
     private readonly Dictionary<int, SimTether> peerTethers = new();
+    private readonly Dictionary<int, SimEventObject> peerEventObjects = new();
     // Peer-only: last ModelState actually applied per NetId, so SetModelState
     // is only re-issued on a genuine change -- its native rebuild briefly
     // disables/re-enables drawing (see SimEnemy's EnemyListMode doc), so
@@ -72,6 +116,37 @@ public sealed class MultiplayerManager : IDisposable
     // peerEnemyModelState above -- statuses are still reconciled against the
     // broadcast every snapshot regardless, this only gates the log line.
     private readonly Dictionary<int, string> peerEnemyLastLoggedStatuses = new();
+    // Peer-only: last-applied AnimationTimelineId/LastLockonVfxId per enemy
+    // NetId, edge-triggered like peerEnemyModelState -- re-issuing
+    // PlayAnimationTimeline/AttachLockonVfx every ~83ms snapshot even when
+    // unchanged would restart the same animation/VFX on a loop.
+    private readonly Dictionary<int, ushort> peerEnemyAnimationTimeline = new();
+    private readonly Dictionary<int, uint> peerEnemyLastLockonVfx = new();
+    // Peer-only: last-applied CurrentState per event-object NetId, edge-triggered
+    // the same way -- SetState is a plain field write with no native rebuild to
+    // worry about, but re-issuing it unconditionally every snapshot is still
+    // pointless churn once it's already correct.
+    private readonly Dictionary<int, ushort> peerEventObjectState = new();
+    // Peer-only role equivalents of the *Statuses/LastLockonVfx pairs above --
+    // keyed by PartyRole like their host-side counterparts. Reconciled/applied
+    // for every role INCLUDING the peer's own claimed one: unlike position
+    // (self-authoritative -- see OnWorldSnapshotReceived), a peer never runs
+    // any scenario logic themselves, so nothing else would ever call
+    // AddStatus/AttachLockonVfx against their own real character.
+    private readonly Dictionary<PartyRole, string> peerRoleLastLoggedStatuses = new();
+    private readonly Dictionary<PartyRole, uint> peerRoleLastLockonVfx = new();
+    // Peer-only: statusIds WE ourselves applied to a role via reconciliation
+    // below, as opposed to a status the local game client manages entirely on
+    // its own -- e.g. LocalPlayerInputHooks applies the real Sprint buff
+    // directly to Plugin.GameInstance.Player on a keypress, which is the exact
+    // same object as world.Party.Get(role) for the peer's own claimed role
+    // (SimParty.Player => Get(PlayerRole)). Unlike enemies (nothing local ever
+    // touches an enemy's statuses independent of the host's broadcast), a
+    // peer's own real character can have statuses applied by something other
+    // than this reconciliation, so removal here must only ever undo what THIS
+    // code added -- diffing raw ActiveStatusSnapshot against the broadcast
+    // (like the enemy path does) would strip Sprint the instant it's pressed.
+    private readonly Dictionary<PartyRole, HashSet<ushort>> peerRoleReconciledStatusIds = new();
     // RunScenarioAsPeer defers the actual zone load (World.Map.TryLoad, which
     // flips IsInInstance true) onto a Framework.Run callback that hasn't
     // necessarily executed yet by the time OnStartReceived sets running=true --
@@ -123,18 +198,22 @@ public sealed class MultiplayerManager : IDisposable
     public bool IsStartCheckPending => pendingStartResponses != null;
     public string? StartCheckFailureReason { get; private set; }
 
-    // ---- Debug: bot-controlled peer -----------------------------------------
-    // Testing aid: a peer can have its own claimed role driven locally by the
-    // exact same AiManager/scenario-Ai choreography a host-side bot in that
-    // role would produce, instead of a real person, so one developer can fill
-    // a multi-person session without needing real people in every slot.
-    // Entirely client-side: the host always broadcasts AiReplayStateMessage
-    // once per run regardless of who's using this (see TrySendAiReplayState),
-    // and never learns which peers, if any, replayed it locally. Sticky
-    // across multiple Start/Reset cycles in the same session (only cleared on
-    // LeaveSession) so a tester doesn't have to re-toggle it before every run;
-    // gated to lobby-only via SetDebugBotControlled since the choreography
-    // timeline only makes sense replayed from a fresh Start.
+    // ---- Debug: bot-controlled host or peer ---------------------------------
+    // Testing aid: whoever's using it (host or peer) can have their own
+    // claimed role driven locally by the exact same AiManager/scenario-Ai
+    // choreography a bot in that role would produce, instead of a real
+    // person, so one developer can fill a multi-person session without
+    // needing real people in every slot. For the host this is direct: their
+    // own scenario.Run already scheduled that choreography against the real
+    // (live) state for every role -- see ActuallyStartScenario -- flipping
+    // DebugBotControl.Enabled just lets PlayerMovement.MoveTo stop no-op'ing
+    // for it. For a peer it's reconstructed from a broadcast AiReplayStateMessage
+    // (see TrySendAiReplayState/TryStartDebugBotReplay), since a peer never
+    // runs scenario.Run at all. Sticky across multiple Start/Reset cycles in
+    // the same session (only cleared on LeaveSession) so a tester doesn't have
+    // to re-toggle it before every run; gated to lobby-only via
+    // SetDebugBotControlled since the choreography timeline only makes sense
+    // replayed from a fresh Start.
     private bool debugBotControlled;
     public bool DebugBotControlled => debugBotControlled;
 
@@ -165,21 +244,28 @@ public sealed class MultiplayerManager : IDisposable
     // weren't replicated yet the moment replay began.
     private AiReplayStateMessage? pendingAiReplayState;
     private UmadP3BlackHoleState? debugShadowState;
+    // Per-scenario siblings of the two fields above (see TryStartDebugBotReplay) --
+    // only one is ever non-null in a given run, matching whichever scenario is
+    // actually active; kept separate rather than a shared base type since each
+    // scenario's shadow-state shape/fields differ (same reasoning as
+    // MultiplayerManager.SupportedScenarios' comment on why this isn't a
+    // generic/opaque-payload abstraction).
+    private P2AiReplayStateMessage? pendingP2AiReplayState;
+    private UmadP2ForsakenState? debugShadowStateP2;
+    private P4AiReplayStateMessage? pendingP4AiReplayState;
+    private UmadP4KefkaSaysState? debugShadowStateP4;
+    private P5AiReplayStateMessage? pendingP5AiReplayState;
+    private UmadP5ExaflaresState? debugShadowStateP5;
     private bool debugBotReplayStarted;
 
-    // Lobby-only: SetDebugBotControlled refuses to change anything while
-    // running, so the toggle can't flip mid-fight -- flipping it after the
-    // choreography's already been scheduled against a shadow state would just
-    // silently do nothing useful anyway, so refusing outright is more honest
-    // than a no-op success.
+    // Lobby-only: refuses to change anything while running, so the toggle
+    // can't flip mid-fight -- flipping it after the choreography's already
+    // been scheduled (against the host's own live state, or a peer's replayed
+    // shadow state) would just silently do nothing useful anyway, so refusing
+    // outright is more honest than a no-op success.
     public bool SetDebugBotControlled(bool value)
     {
-        // Peer-only: TryStartDebugBotReplay only ever fires off a received
-        // AiReplayStateMessage, which a host never gets (the relay excludes
-        // the sender from its own broadcast) -- without this guard, a host
-        // flipping this on would silently do nothing, which is worse than
-        // just refusing outright.
-        if (IsHost || running) return false;
+        if (running) return false;
         debugBotControlled = value;
         return true;
     }
@@ -198,6 +284,15 @@ public sealed class MultiplayerManager : IDisposable
     private CancellationTokenSource? reconnectCts;
     private bool reconnecting;
     public bool IsReconnecting => reconnecting;
+    // Host-only: when the host's OWN connection to the relay went down (wall
+    // clock), null while connected. Symmetric to how a peer judges the host
+    // dead via IsHostStale/SecondsSinceHostMessage -- without this the host
+    // just keeps retrying to reconnect forever (BeginReconnect has no attempt
+    // limit by design) while the fight keeps running locally, oblivious that
+    // every peer has independently already given up and left via their own
+    // IsHostStale timeout. Set in OnDisconnectedOffThread, cleared on a
+    // successful FinishReconnectAttempt; read by Tick()'s host-stale check.
+    private long? disconnectedSinceMs;
     public int ReconnectAttempt { get; private set; }
 
     public MultiplayerSession Session { get; private set; } = new();
@@ -309,6 +404,7 @@ public sealed class MultiplayerManager : IDisposable
         reconnectCts = null;
         reconnecting = false;
         ReconnectAttempt = 0;
+        disconnectedSinceMs = null;
         if (IsHost) Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
 
         // Peers need to find out someone left -- otherwise they're stuck
@@ -335,11 +431,23 @@ public sealed class MultiplayerManager : IDisposable
         hostEnemyNetIds.Clear();
         hostEnemyLastLoggedModelState.Clear();
         hostEnemyLastLoggedStatuses.Clear();
+        hostEnemyLastLoggedAnimationTimeline.Clear();
+        hostEnemyLastLoggedLockonVfx.Clear();
+        hostRoleLastLoggedStatuses.Clear();
+        hostRoleLastLoggedLockonVfx.Clear();
         hostTetherNetIds.Clear();
+        hostEventObjectNetIds.Clear();
         peerEnemies.Clear();
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
+        peerEnemyAnimationTimeline.Clear();
+        peerEnemyLastLockonVfx.Clear();
+        peerRoleLastLoggedStatuses.Clear();
+        peerRoleLastLockonVfx.Clear();
+        peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
+        peerEventObjects.Clear();
+        peerEventObjectState.Clear();
         peerLastSeenMs.Clear();
         peerLatencyMs.Clear();
         peerStatuses.Clear();
@@ -409,6 +517,7 @@ public sealed class MultiplayerManager : IDisposable
         relay = client;
         reconnecting = false;
         ReconnectAttempt = 0;
+        disconnectedSinceMs = null;
         Plugin.Log.Information($"[Multiplayer] Reconnected to session {SessionCode}.");
         lastHostMessageMs = Environment.TickCount64; // same "don't read as decades-stale" reasoning as JoinSession
         ConnectionError = null;
@@ -597,6 +706,31 @@ public sealed class MultiplayerManager : IDisposable
             Plugin.Log.Warning("[Multiplayer] Cannot start: host has not claimed a role.");
             return;
         }
+        // Captures whatever's currently selected in the main window -- same
+        // scenario/strat/waymark a solo Start would use (Plugin.MainWindow.
+        // Selected*) -- so ActuallyStartScenario and, via LobbyStateMessage,
+        // every peer's OnStartReceived resolve the identical scenario/strat
+        // instead of each independently guessing.
+        if (Plugin.MainWindow.SelectedScenario is not { } selectedScenario
+            || !SupportedScenarios.Contains(selectedScenario.GetType()))
+        {
+            Plugin.Log.Warning("[Multiplayer] Cannot start: no multiplayer-supported scenario is selected in the main window.");
+            return;
+        }
+        // Reuses MainWindow's own solo-Start gate: a grouped scenario (e.g. P2
+        // Forsaken's NA/EU strats) can leave SelectedStrat at -1 when the
+        // selected region has no strats. Without this check that -1 would get
+        // broadcast as SelectedAi and later crash a debug-bot peer indexing
+        // AiStrats[SelectedAi] in TryStartDebugBotReplay.
+        if (!Plugin.MainWindow.HasStartableStrat())
+        {
+            Plugin.Log.Warning("[Multiplayer] Cannot start: no strat available for the selected scenario/region.");
+            return;
+        }
+        var scenarioIndex = Plugin.GameInstance.Scenarios.ToList().IndexOf(selectedScenario);
+        Session.ScenarioIndex = scenarioIndex;
+        Session.SelectedAi = Plugin.MainWindow.SelectedStrat;
+        Session.SelectedWaymark = Plugin.MainWindow.SelectedWaymark;
         // Belt-and-suspenders on top of ApplyClaim's own rejection: closes the
         // narrow window where a peer's ClaimRoleMessage could theoretically
         // race ahead of their Hello (see IsVersionMismatched).
@@ -655,7 +789,7 @@ public sealed class MultiplayerManager : IDisposable
     {
         if (MyClaimedRole is not { } myRole) return; // re-checked defensively; shouldn't change mid-check
 
-        var scenario = Plugin.GameInstance.Scenarios.OfType<UmadP3BlackHoleScenario>().First();
+        var scenario = Plugin.GameInstance.Scenarios[Session.ScenarioIndex];
         var networkRoles = Session.ClaimedBy.Where(kv => kv.Value != MyPeerId).Select(kv => kv.Key).ToHashSet();
         Plugin.Log.Information($"[Multiplayer] Host starting '{scenario.Name}' as {myRole}. Network roles: {string.Join(", ", networkRoles.Select(r => $"{r}={Session.NameOf(Session.ClaimedBy[r])}"))}.");
 
@@ -666,9 +800,15 @@ public sealed class MultiplayerManager : IDisposable
         hostEnemyNetIds.Clear();
         hostEnemyLastLoggedModelState.Clear();
         hostEnemyLastLoggedStatuses.Clear();
+        hostEnemyLastLoggedAnimationTimeline.Clear();
+        hostEnemyLastLoggedLockonVfx.Clear();
+        hostRoleLastLoggedStatuses.Clear();
+        hostRoleLastLoggedLockonVfx.Clear();
         hostTetherNetIds.Clear();
+        hostEventObjectNetIds.Clear();
         nextEnemyNetId = 0;
         nextTetherNetId = 0;
+        nextEventObjectNetId = 0;
         warnedStalePeers.Clear();
         aiReplayStateSent = false;
         hostScenarioStarted = false;
@@ -677,7 +817,23 @@ public sealed class MultiplayerManager : IDisposable
             if (peerId != MyPeerId)
                 peerLastSeenMs[peerId] = nowMs;
         Plugin.GameInstance.PartyMemberKilled += OnPartyMemberKilledHost;
-        Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, selectedAi: 0, selectedWaymark: 0, networkRoles);
+        Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, Session.SelectedAi, Session.SelectedWaymark, networkRoles);
+        // Host debug-bot mode needs no reconstruction (unlike a peer's
+        // TryStartDebugBotReplay): RunScenarioAsHost above already runs the
+        // scenario's own scenario.Run, which -- given a real SelectedAi index --
+        // has already scheduled that Ai's full choreography (AiManager.Move/
+        // Intercept calls) against every role, including the host's own,
+        // through the live world.Events/AiManager. Those calls already reach
+        // the host's own SimPlayer today; PlayerMovement.MoveTo is what
+        // silently no-ops them unless this flag is set. Timing-safe regardless
+        // of RunScenarioAsHost's own Plugin.Framework.Run deferral: this only
+        // needs to be true before the Ai's *scheduled* moves actually fire,
+        // seconds from now at the earliest, not before this line returns.
+        if (debugBotControlled)
+        {
+            Plugin.Log.Information("[Multiplayer] Host: debug-bot mode active for own character this run.");
+            DebugBotControl.Enabled = true;
+        }
         running = true;
         LobbyChanged?.Invoke();
     }
@@ -701,24 +857,67 @@ public sealed class MultiplayerManager : IDisposable
             return;
         }
 
-        var scenario = Plugin.GameInstance.Scenarios.OfType<UmadP3BlackHoleScenario>().First();
+        var scenario = Plugin.GameInstance.Scenarios[Session.ScenarioIndex];
         var networkRoles = Enum.GetValues<PartyRole>().Where(r => r != myRole).ToHashSet();
         Plugin.Log.Information($"[Multiplayer] Peer entering '{scenario.Name}' as {myRole}.");
 
         peerEnemies.Clear();
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
+        peerEnemyAnimationTimeline.Clear();
+        peerEnemyLastLockonVfx.Clear();
+        peerRoleLastLoggedStatuses.Clear();
+        peerRoleLastLockonVfx.Clear();
+        peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
+        peerEventObjects.Clear();
+        peerEventObjectState.Clear();
         peerEnteredInstance = false;
         StopDebugBotReplay();
-        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, selectedWaymark: 0, networkRoles);
+        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles);
         running = true;
     }
 
     // ---- Per-frame tick (framework thread; see Plugin.OnFrameworkUpdate) ----
 
+    // Host-only local bookkeeping for "my own run just ended," shared by the
+    // normal in-Tick detection (ActiveScenario went null via Reset/Leave/a
+    // natural finish, still connected -- broadcasts EndMessage right after
+    // this) and Tick()'s own-disconnection-timeout branch above (can't
+    // broadcast anything, every peer has already reached the same conclusion
+    // independently). Does NOT touch the relay/session/roster -- only that
+    // the host's own local run bookkeeping is consistent again.
+    private void EndHostRunLocally()
+    {
+        running = false;
+        // Mirrors StopDebugBotReplay's peer-side reset -- without this, a
+        // debug-bot host would stay bot-driven (or, on a fresh non-multiplayer
+        // solo run afterward, only by luck not still be) past the fight ending.
+        DebugBotControl.Enabled = false;
+        Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
+        // Without this, Session.Started stays true forever once a run ends --
+        // the Start button in MultiplayerWindow is gated on !Started, so the
+        // lobby would be permanently stuck past its first run with no way to
+        // retry short of leaving and re-hosting a brand new session/code.
+        Session.Started = false;
+    }
+
     public void Tick(float deltaSeconds)
     {
+        // Checked before the IsConnected early-return below (this is exactly the
+        // case where relay is down) -- see disconnectedSinceMs's own doc comment.
+        // One-shot: nulled out immediately so this doesn't re-fire (and re-call
+        // Leave()) every subsequent tick while still disconnected/reconnecting.
+        if (IsHost && disconnectedSinceMs is { } since && running && Plugin.GameInstance.World.Map.IsInInstance
+            && Environment.TickCount64 - since > PeerStaleTimeoutMs)
+        {
+            Plugin.Log.Warning($"[Multiplayer] Disconnected from the relay for over {PeerStaleTimeoutMs / 1000}s while running -- leaving the zone myself (every peer has likely already given up waiting and left on their own).");
+            Plugin.GameInstance.Leave();
+            EndHostRunLocally();
+            disconnectedSinceMs = null;
+            LobbyChanged?.Invoke();
+        }
+
         if (relay is not { IsConnected: true }) return;
 
         // Connection-quality tracking runs continuously -- lobby and mid-fight
@@ -788,13 +987,7 @@ public sealed class MultiplayerManager : IDisposable
                 // Reset/Leave clears ActiveScenario -- stop broadcasting once the local
                 // run has ended rather than spamming empty snapshots (or, worse, a
                 // later unrelated solo run) to peers who are still connected.
-                running = false;
-                Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
-                // Without this, Session.Started stays true forever once a run ends --
-                // the Start button in MultiplayerWindow is gated on !Started, so the
-                // lobby would be permanently stuck past its first run with no way to
-                // retry short of leaving and re-hosting a brand new session/code.
-                Session.Started = false;
+                EndHostRunLocally();
                 _ = relay?.SendAsync(Session.ToMessage());
                 // Reset() leaves World.Map.IsInInstance true (deliberately stays
                 // in-zone); only Leave()/a natural finish clears it. Read here,
@@ -821,6 +1014,23 @@ public sealed class MultiplayerManager : IDisposable
                 // internally on debugBotReplayStarted) -- simpler than a second
                 // edge-trigger flag alongside peerEnteredInstance.
                 TryStartDebugBotReplay();
+                // P5 Exaflares only: UmadP5ExaflaresAi schedules its dodges onto
+                // debugShadowStateP5.Timeline (a private EventScheduler), which the
+                // real scenario normally drives every frame from its own Tick (see
+                // UmadP5ExaflaresScenario.Tick) -- but a peer never runs
+                // IScenario.Tick at all (Game.RunScenarioInternal never sets
+                // ActiveScenario for isPeer:true), so nothing else would ever
+                // advance it. Mirrors that method's two calls exactly, using the
+                // same raw (EventTimeScale-independent) deltaSeconds this Tick
+                // already receives from Plugin.OnFrameworkUpdate -- capped the
+                // same way UmadP5ExaflaresScenario.Tick caps its own wall-clock
+                // delta, so a hitch/alt-tab frame skips this tick instead of
+                // dumping every still-queued event out at once.
+                if (debugShadowStateP5 is { } p5Shadow && deltaSeconds > 0f && deltaSeconds <= P5ReplayFrameGapCapSeconds)
+                {
+                    p5Shadow.Timeline.Tick(deltaSeconds);
+                    p5Shadow.SpreadTick?.Invoke(deltaSeconds);
+                }
             }
             else if (peerEnteredInstance)
             {
@@ -855,6 +1065,8 @@ public sealed class MultiplayerManager : IDisposable
             hostEnemyNetIds.Remove(stale);
             hostEnemyLastLoggedModelState.Remove(stale);
             hostEnemyLastLoggedStatuses.Remove(stale);
+            hostEnemyLastLoggedAnimationTimeline.Remove(stale);
+            hostEnemyLastLoggedLockonVfx.Remove(stale);
         }
 
         var enemies = new List<EnemyState>(liveEnemies.Count);
@@ -880,10 +1092,23 @@ public sealed class MultiplayerManager : IDisposable
                 hostEnemyLastLoggedStatuses[enemy] = statusKey;
                 Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) statuses -> [{statusKey}].");
             }
+            if (enemy.AnimationTimelineId is { } timelineId
+                && (!hostEnemyLastLoggedAnimationTimeline.TryGetValue(enemy, out var lastTimeline) || lastTimeline != timelineId))
+            {
+                hostEnemyLastLoggedAnimationTimeline[enemy] = timelineId;
+                Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
+            }
+            if (enemy.LastLockonVfxId is { } lockonId
+                && (!hostEnemyLastLoggedLockonVfx.TryGetValue(enemy, out var lastLockon) || lastLockon != lockonId))
+            {
+                hostEnemyLastLoggedLockonVfx[enemy] = lockonId;
+                Plugin.Log.Information($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
+            }
             enemies.Add(new EnemyState(
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, cfg.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
                 statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList(),
+                enemy.AnimationTimelineId, enemy.LastLockonVfxId,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
                 enemy.IsCasting, enemy.CastActionId));
         }
@@ -914,11 +1139,56 @@ public sealed class MultiplayerManager : IDisposable
         {
             var member = world.Party.Get(role);
             var dead = member is ISimPartyMember { Dead: true };
+            IReadOnlyList<EnemyStatusState> statuses = [];
+            if (member != null)
+            {
+                var statusSnapshot = member.ActiveStatusSnapshot;
+                var statusKey = string.Join(",", statusSnapshot.Select(s => $"{s.StatusId}:{s.Stacks}"));
+                if (!hostRoleLastLoggedStatuses.TryGetValue(role, out var lastStatusKey) || lastStatusKey != statusKey)
+                {
+                    hostRoleLastLoggedStatuses[role] = statusKey;
+                    Plugin.Log.Information($"[Multiplayer] Host: role {role} statuses -> [{statusKey}].");
+                }
+                if (member.LastLockonVfxId is { } lockonId
+                    && (!hostRoleLastLoggedLockonVfx.TryGetValue(role, out var lastLockon) || lastLockon != lockonId))
+                {
+                    hostRoleLastLoggedLockonVfx[role] = lockonId;
+                    Plugin.Log.Information($"[Multiplayer] Host: role {role} LastLockonVfxId -> {lockonId}.");
+                }
+                statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList();
+            }
+            else
+            {
+                hostRoleLastLoggedStatuses.Remove(role);
+                hostRoleLastLoggedLockonVfx.Remove(role);
+            }
             roles.Add(new RoleState(role, member != null, dead,
-                member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f));
+                member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f,
+                statuses, member?.LastLockonVfxId));
         }
 
-        _ = relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, roles));
+        var liveEventObjects = world.Children.OfType<SimEventObject>().Where(o => o.IsActive).ToList();
+        foreach (var stale in hostEventObjectNetIds.Keys.Where(o => !liveEventObjects.Contains(o)).ToList())
+        {
+            Plugin.Log.Debug($"[Multiplayer] Host: event object NetId {hostEventObjectNetIds[stale]} (EObj 0x{stale.EObjRowId:X}) no longer active -- dropping from broadcast.");
+            hostEventObjectNetIds.Remove(stale);
+        }
+
+        var eventObjects = new List<EventObjectState>(liveEventObjects.Count);
+        foreach (var eo in liveEventObjects)
+        {
+            if (!hostEventObjectNetIds.TryGetValue(eo, out var netId))
+            {
+                netId = nextEventObjectNetId++;
+                hostEventObjectNetIds[eo] = netId;
+                Plugin.Log.Information($"[Multiplayer] Host: broadcasting new event object NetId {netId} -- EObj 0x{eo.EObjRowId:X}, pos {eo.Position}, state {eo.CurrentState}.");
+            }
+            eventObjects.Add(new EventObjectState(
+                netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
+                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation));
+        }
+
+        _ = relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, roles, eventObjects));
     }
 
     private (int? enemyNetId, PartyRole? role) ResolveEnd(SimWorld world, SimCharacter? c)
@@ -970,7 +1240,25 @@ public sealed class MultiplayerManager : IDisposable
             if (peerId == MyPeerId) continue;
             var stale = IsPeerStale(peerId);
             if (stale && warnedStalePeers.Add(peerId))
+            {
                 Plugin.Log.Warning($"[Multiplayer] {Session.NameOf(peerId)} ({role}) hasn't reported in over {PeerStaleTimeoutMs / 1000}s -- likely disconnected.");
+                // Mid-fight, a silently-vanished party member dooms the run the same
+                // way an explicit "Leave session" click does (see RemovePeer's mid-
+                // fight branch) -- but unlike that click, going stale isn't
+                // necessarily permanent (a network blip, not a deliberate leave), so
+                // only end the run here; their role claim and roster slot are left
+                // alone so a reconnect (their own client already retries the same
+                // relay/session automatically -- see BeginReconnect) drops them back
+                // into a normal lobby instead of finding their role already handed
+                // to someone else. IsInInstance guard: Leave() -> Unload() assumes a
+                // zone was actually entered, same reasoning as everywhere else this
+                // guard appears in this file.
+                if (running && Plugin.GameInstance.World.Map.IsInInstance)
+                {
+                    Plugin.Log.Information($"[Multiplayer] Ending the run because {Session.NameOf(peerId)} went stale mid-fight.");
+                    Plugin.GameInstance.Leave();
+                }
+            }
             else if (!stale && warnedStalePeers.Remove(peerId))
                 Plugin.Log.Information($"[Multiplayer] {Session.NameOf(peerId)} ({role}) is reporting in again.");
         }
@@ -1077,6 +1365,23 @@ public sealed class MultiplayerManager : IDisposable
             // the same code path solo play already exercises.
             if (e.IsCasting && !enemy.IsCasting)
                 enemy.Cast(e.CastActionId);
+            // Edge-triggered like ModelState -- PlayAnimationTimeline/AttachLockonVfx
+            // are one-shot cues, so re-issuing them every ~83ms snapshot even when
+            // unchanged would restart the same animation/VFX on a loop.
+            if (e.AnimationTimelineId is { } timelineId
+                && (!peerEnemyAnimationTimeline.TryGetValue(e.NetId, out var lastTimeline) || lastTimeline != timelineId))
+            {
+                peerEnemyAnimationTimeline[e.NetId] = timelineId;
+                Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
+                enemy.PlayAnimationTimeline(timelineId);
+            }
+            if (e.LastLockonVfxId is { } lockonId
+                && (!peerEnemyLastLockonVfx.TryGetValue(e.NetId, out var lastLockon) || lastLockon != lockonId))
+            {
+                peerEnemyLastLockonVfx[e.NetId] = lockonId;
+                Plugin.Log.Information($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
+                enemy.AttachLockonVfx(lockonId, persistent: false);
+            }
         }
         foreach (var staleId in peerEnemies.Keys.Where(id => !seenEnemyIds.Contains(id)).ToList())
         {
@@ -1085,6 +1390,8 @@ public sealed class MultiplayerManager : IDisposable
             peerEnemies.Remove(staleId);
             peerEnemyModelState.Remove(staleId);
             peerEnemyLastLoggedStatuses.Remove(staleId);
+            peerEnemyAnimationTimeline.Remove(staleId);
+            peerEnemyLastLockonVfx.Remove(staleId);
         }
 
         // Debug-bot replay: Chaos/Exdeath might not have been replicated yet
@@ -1135,9 +1442,92 @@ public sealed class MultiplayerManager : IDisposable
         var myRole = MyClaimedRole;
         foreach (var r in snap.Roles)
         {
-            if (r.Role == myRole) continue; // our own real SimPlayer -- never network-driven
-            if (world.Party.Get(r.Role) is SimNetworkPuppet puppet)
+            // Position is self-authoritative for our own claimed role (a real
+            // SimPlayer reports its own pose via SelfPoseMessage, never network-driven
+            // here) -- but statuses/lockon VFX are NOT: we never run any scenario
+            // logic ourselves, so nothing else would ever call AddStatus/
+            // AttachLockonVfx against our own real character. Reconcile those for
+            // every role, including our own.
+            if (r.Role != myRole && world.Party.Get(r.Role) is SimNetworkPuppet puppet)
                 puppet.ApplyNetworkPose(new Vector3(r.X, r.Y, r.Z), r.Rotation);
+
+            if (world.Party.Get(r.Role) is not { } member) continue;
+            var currentStatuses = member.ActiveStatusSnapshot;
+            if (!peerRoleReconciledStatusIds.TryGetValue(r.Role, out var reconciledIds))
+                peerRoleReconciledStatusIds[r.Role] = reconciledIds = new HashSet<ushort>();
+            foreach (var target in r.Statuses)
+            {
+                // Tracked regardless of whether AddStatus actually needs to run this
+                // tick, so the removal loop below recognizes it as host-managed even
+                // on a snapshot where nothing changed.
+                reconciledIds.Add(target.StatusId);
+                if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
+                member.AddStatus(target.StatusId, stacks: target.Stacks, overrideStacks: true);
+            }
+            // Only ever removes a statusId THIS reconciliation previously added --
+            // never diffs against the character's full ActiveStatusSnapshot the way
+            // the enemy path does, since a peer's own real character can carry
+            // statuses nothing here put there (see peerRoleReconciledStatusIds).
+            foreach (var trackedId in reconciledIds.ToList())
+            {
+                if (r.Statuses.Any(s => s.StatusId == trackedId)) continue;
+                member.RemoveStatus(trackedId);
+                reconciledIds.Remove(trackedId);
+            }
+            var statusKey = string.Join(",", r.Statuses.Select(s => $"{s.StatusId}:{s.Stacks}"));
+            if (!peerRoleLastLoggedStatuses.TryGetValue(r.Role, out var lastStatusKey) || lastStatusKey != statusKey)
+            {
+                peerRoleLastLoggedStatuses[r.Role] = statusKey;
+                Plugin.Log.Information($"[Multiplayer] Peer: role {r.Role} statuses -> [{statusKey}].");
+            }
+            if (r.LastLockonVfxId is { } lockonId
+                && (!peerRoleLastLockonVfx.TryGetValue(r.Role, out var lastLockon) || lastLockon != lockonId))
+            {
+                peerRoleLastLockonVfx[r.Role] = lockonId;
+                Plugin.Log.Information($"[Multiplayer] Peer: role {r.Role} LastLockonVfxId -> {lockonId}.");
+                member.AttachLockonVfx(lockonId, persistent: false);
+            }
+        }
+
+        var seenEventObjectIds = new HashSet<int>();
+        foreach (var o in snap.EventObjects)
+        {
+            seenEventObjectIds.Add(o.NetId);
+            if (!peerEventObjects.TryGetValue(o.NetId, out var eo))
+            {
+                var config = new EventObjectSpawnConfig
+                {
+                    EObjId = o.EObjId,
+                    Placement = new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation),
+                    TimelineState = o.TimelineState,
+                    SpawnVisible = true,
+                };
+                Plugin.Log.Information($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
+                eo = world.SpawnEventObject(config);
+                if (eo == null)
+                {
+                    Plugin.Log.Warning($"[Multiplayer] Peer: SpawnEventObject returned null for NetId {o.NetId} (EObj 0x{o.EObjId:X}) -- skipping.");
+                    continue;
+                }
+                peerEventObjects[o.NetId] = eo;
+            }
+            eo.SetPosition(new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation));
+            // Edge-triggered like ModelState -- SetState is a plain field write with
+            // no rebuild to worry about, but re-issuing it every ~83ms snapshot even
+            // when unchanged is pointless churn.
+            if (!peerEventObjectState.TryGetValue(o.NetId, out var lastState) || lastState != o.CurrentState)
+            {
+                peerEventObjectState[o.NetId] = o.CurrentState;
+                Plugin.Log.Information($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) CurrentState -> {o.CurrentState}.");
+                eo.SetState(o.CurrentState);
+            }
+        }
+        foreach (var staleId in peerEventObjects.Keys.Where(id => !seenEventObjectIds.Contains(id)).ToList())
+        {
+            Plugin.Log.Information($"[Multiplayer] Peer: event object NetId {staleId} no longer in snapshot -- despawning local copy.");
+            peerEventObjects[staleId].Despawn();
+            peerEventObjects.Remove(staleId);
+            peerEventObjectState.Remove(staleId);
         }
     }
 
@@ -1191,49 +1581,161 @@ public sealed class MultiplayerManager : IDisposable
 
     // Host-only, edge-triggered once per run. LastState isn't guaranteed set on
     // the very first Tick() after StartScenario -- RunScenarioAsHost's actual
-    // work (including constructing UmadP3BlackHoleState) is deferred via
+    // work (including constructing the scenario's *State) is deferred via
     // Plugin.Framework.Run, same reasoning as peerEnteredInstance below -- so
     // this polls instead of reading it synchronously right after the call.
     // Sent unconditionally: the host never knows or cares which peers, if any,
-    // are using it locally.
+    // are using it locally. One case per multiplayer-supported scenario (see
+    // SupportedScenarios) -- add a new one here alongside a new *AiReplayStateMessage
+    // and *State.FromNetworkReplay when porting another scenario.
     private void TrySendAiReplayState()
     {
-        if (Plugin.GameInstance.Scenarios.OfType<UmadP3BlackHoleScenario>().First().LastState is not { } state) return;
-        aiReplayStateSent = true;
-        Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
-        _ = relay!.SendAsync(new AiReplayStateMessage(
-            state.Roles.List, state.StackTargets.List, state.SlapAttacks.ToArray(),
-            state.KefkaPosition.Select(d => d.RadiansFromNorth).ToArray(), state.ImplosionAttack));
+        switch (Plugin.GameInstance.Scenarios[Session.ScenarioIndex])
+        {
+            case UmadP3BlackHoleScenario p3Scenario:
+                if (p3Scenario.LastState is not { } p3State) return;
+                aiReplayStateSent = true;
+                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                _ = relay!.SendAsync(new AiReplayStateMessage(
+                    p3State.Roles.List, p3State.StackTargets.List, p3State.SlapAttacks.ToArray(),
+                    p3State.KefkaPosition.Select(d => d.RadiansFromNorth).ToArray(), p3State.ImplosionAttack));
+                break;
+            case UmadP2ForsakenScenario p2Scenario:
+                if (p2Scenario.LastState is not { } p2State) return;
+                aiReplayStateSent = true;
+                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                _ = relay!.SendAsync(new P2AiReplayStateMessage(
+                    p2State.EndAttacks, p2State.NewNorth.RadiansFromNorth, p2State.Rotation, p2State.Lockons));
+                break;
+            case UmadP4KefkaSaysScenario p4Scenario:
+                if (p4Scenario.LastState is not { } p4State) return;
+                aiReplayStateSent = true;
+                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                _ = relay!.SendAsync(new P4AiReplayStateMessage(
+                    p4State.Mystery.Select(m => m.BlizzardOffset).ToArray(),
+                    p4State.Mystery.Select(m => m.LightningOffset).ToArray(),
+                    p4State.Mystery.Select(m => m.LightningOrientation).ToArray(),
+                    p4State.Wave1First, p4State.Wave1.List, p4State.Wave1True,
+                    p4State.Wave2.List, p4State.Wave2True,
+                    p4State.InfernoMystery.IsTrue, p4State.TsunamiMystery.IsTrue,
+                    p4State.Wave3.List, p4State.Wounds,
+                    p4State.Antilights[0].Antilight == Antilight.White,
+                    p4State.NeoExdeathDirection.RadiansFromNorth));
+                break;
+            case UmadP5ExaflaresScenario p5Scenario:
+                if (p5Scenario.LastState is not { } p5State) return;
+                aiReplayStateSent = true;
+                Plugin.Log.Information("[Multiplayer] Host: broadcasting AiReplayState for this run.");
+                _ = relay!.SendAsync(new P5AiReplayStateMessage(p5State.LeftOrder.ToArray(), p5State.RightOrder.ToArray()));
+                break;
+        }
     }
 
+    // Guards the AiStrats[Session.SelectedAi] indexing every multi-strat
+    // scenario's replay branch does below. StartScenario/MultiplayerWindow
+    // already refuse to broadcast an out-of-range SelectedAi (see
+    // MainWindow.HasStartableStrat), but a peer has no independent way to
+    // verify what the host sent, so this is the last line of defense against
+    // an IndexOutOfRangeException here.
+    private bool IsValidAiIndex(IScenario scenario) =>
+        Session.SelectedAi >= 0 && Session.SelectedAi < scenario.AiStrats.Count;
+
     // Peer-only, idempotent, edge-triggered once per run: fires once both the
-    // host's AiReplayStateMessage has arrived (pendingAiReplayState) and our
+    // host's *AiReplayStateMessage has arrived (pending*AiReplayState) and our
     // own zone/party is actually ready (peerEnteredInstance) -- arrival order
     // between those two isn't guaranteed, so both call sites (Dispatch and
     // Tick) funnel through here. A no-op entirely unless debug-bot mode is on.
+    // Branches on the active scenario the same way TrySendAiReplayState does.
     private void TryStartDebugBotReplay()
     {
         if (!debugBotControlled || debugBotReplayStarted) return;
-        if (pendingAiReplayState is not { } msg || !peerEnteredInstance) return;
+        if (!peerEnteredInstance) return;
         if (MyClaimedRole is not { } myRole) return;
-
-        debugBotReplayStarted = true;
-        Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
         var world = Plugin.GameInstance.World;
-        var shadowState = UmadP3BlackHoleState.FromNetworkReplay(
-            world, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack);
-        // Chaos/Exdeath might not have been replicated yet (WorldSnapshot and
-        // this message are independent flows) -- OnWorldSnapshotReceived keeps
-        // retrying this resolution against debugShadowState below as new
-        // enemies come in, so a still-null boss here isn't a lost cause, just
-        // not needed until each choreography step that reads it, tens of
-        // seconds into the fight at the earliest.
-        shadowState.ScenarioObjects.Chaos = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.ChaosP3);
-        shadowState.ScenarioObjects.Exdeath = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.Exdeath);
-        debugShadowState = shadowState;
 
-        DebugBotControl.Enabled = true;
-        new UmadP3BlackHoleAi().Run(shadowState, world);
+        switch (Plugin.GameInstance.Scenarios[Session.ScenarioIndex])
+        {
+            case UmadP3BlackHoleScenario when pendingAiReplayState is { } msg:
+            {
+                debugBotReplayStarted = true;
+                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                var shadowState = UmadP3BlackHoleState.FromNetworkReplay(
+                    world, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack);
+                // Chaos/Exdeath might not have been replicated yet (WorldSnapshot
+                // and this message are independent flows) -- OnWorldSnapshotReceived
+                // keeps retrying this resolution against debugShadowState below as
+                // new enemies come in, so a still-null boss here isn't a lost
+                // cause, just not needed until each choreography step that reads
+                // it, tens of seconds into the fight at the earliest.
+                shadowState.ScenarioObjects.Chaos = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.ChaosP3);
+                shadowState.ScenarioObjects.Exdeath = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.Exdeath);
+                debugShadowState = shadowState;
+                DebugBotControl.Enabled = true;
+                new UmadP3BlackHoleAi().Run(shadowState, world);
+                break;
+            }
+            case UmadP2ForsakenScenario p2Scenario when pendingP2AiReplayState is { } p2Msg:
+            {
+                // Belt-and-suspenders: StartScenario/MultiplayerWindow already refuse
+                // to broadcast an out-of-range SelectedAi (see HasStartableStrat), but
+                // marking replay "started" either way (rather than just `break`) stops
+                // this from silently re-attempting -- and re-logging nothing -- every
+                // single frame if it's ever somehow reached anyway.
+                debugBotReplayStarted = true;
+                if (!IsValidAiIndex(p2Scenario))
+                {
+                    Plugin.Log.Warning($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p2Scenario.Name} ({p2Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
+                    break;
+                }
+                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                var shadowState = UmadP2ForsakenState.FromNetworkReplay(
+                    p2Msg.EndAttacks, p2Msg.NewNorthRadians, p2Msg.Rotation, p2Msg.Lockons);
+                debugShadowStateP2 = shadowState;
+                DebugBotControl.Enabled = true;
+                ((IScenarioAi<UmadP2ForsakenState>)p2Scenario.AiStrats[Session.SelectedAi]).Run(shadowState, world);
+                break;
+            }
+            case UmadP4KefkaSaysScenario p4Scenario when pendingP4AiReplayState is { } p4Msg:
+            {
+                debugBotReplayStarted = true;
+                if (!IsValidAiIndex(p4Scenario))
+                {
+                    Plugin.Log.Warning($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p4Scenario.Name} ({p4Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
+                    break;
+                }
+                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                var shadowState = UmadP4KefkaSaysState.FromNetworkReplay(
+                    world.Party, p4Msg.MysteryBlizzardOffset, p4Msg.MysteryLightningOffset, p4Msg.MysteryLightningOrientation,
+                    p4Msg.Wave1First, p4Msg.Wave1, p4Msg.Wave1True, p4Msg.Wave2, p4Msg.Wave2True,
+                    p4Msg.InfernoIsTrue, p4Msg.TsunamiIsTrue, p4Msg.Wave3, p4Msg.Wounds,
+                    p4Msg.Antilight0IsWhite, p4Msg.NeoExdeathDirectionRadians);
+                debugShadowStateP4 = shadowState;
+                DebugBotControl.Enabled = true;
+                ((IScenarioAi<UmadP4KefkaSaysState>)p4Scenario.AiStrats[Session.SelectedAi]).Run(shadowState, world);
+                break;
+            }
+            case UmadP5ExaflaresScenario p5Scenario when pendingP5AiReplayState is { } p5Msg:
+            {
+                debugBotReplayStarted = true;
+                if (!IsValidAiIndex(p5Scenario))
+                {
+                    Plugin.Log.Warning($"[Multiplayer] Peer: SelectedAi {Session.SelectedAi} is out of range for {p5Scenario.Name} ({p5Scenario.AiStrats.Count} strats) -- skipping debug-bot replay.");
+                    break;
+                }
+                Plugin.Log.Information($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
+                // A fresh, peer-owned EventScheduler -- NOT the host's -- since
+                // UmadP5ExaflaresAi schedules its dodges directly onto it, and
+                // nothing would ever drive one shared with anything else. See
+                // MultiplayerManager.Tick's P5-specific branch just below for
+                // what actually ticks it every frame (mirrors UmadP5ExaflaresScenario.Tick,
+                // which normally does this but never runs on a peer).
+                var shadowState = UmadP5ExaflaresState.FromNetworkReplay(p5Msg.LeftOrder, p5Msg.RightOrder, new EventScheduler());
+                debugShadowStateP5 = shadowState;
+                DebugBotControl.Enabled = true;
+                ((IScenarioAi<UmadP5ExaflaresState>)p5Scenario.AiStrats[Session.SelectedAi]).Run(shadowState, world);
+                break;
+            }
+        }
     }
 
     // Clears just the current run's replay state, not the debugBotControlled
@@ -1246,7 +1748,13 @@ public sealed class MultiplayerManager : IDisposable
         if (debugBotReplayStarted) Plugin.Log.Information("[Multiplayer] Peer: stopping debug-bot replay.");
         DebugBotControl.Enabled = false;
         pendingAiReplayState = null;
+        pendingP2AiReplayState = null;
+        pendingP4AiReplayState = null;
+        pendingP5AiReplayState = null;
         debugShadowState = null;
+        debugShadowStateP2 = null;
+        debugShadowStateP4 = null;
+        debugShadowStateP5 = null;
         debugBotReplayStarted = false;
     }
 
@@ -1271,6 +1779,7 @@ public sealed class MultiplayerManager : IDisposable
             if (!ReferenceEquals(relay, source)) return;
             source.Dispose();
             relay = null;
+            disconnectedSinceMs ??= Environment.TickCount64;
             if (failure != null)
             {
                 Plugin.Log.Warning($"[Multiplayer] Disconnected: {failure.Message}");
@@ -1315,7 +1824,8 @@ public sealed class MultiplayerManager : IDisposable
         // regardless; when it's a departing peer instead, it plainly isn't a
         // host message at all and must not be mistaken for one.
         if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage
-            or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage or AiReplayStateMessage)
+            or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage
+            or AiReplayStateMessage or P2AiReplayStateMessage or P4AiReplayStateMessage or P5AiReplayStateMessage)
             lastHostMessageMs = Environment.TickCount64;
 
         switch (message)
@@ -1441,6 +1951,18 @@ public sealed class MultiplayerManager : IDisposable
                 break;
             case AiReplayStateMessage state when !IsHost:
                 pendingAiReplayState = state;
+                TryStartDebugBotReplay();
+                break;
+            case P2AiReplayStateMessage p2State when !IsHost:
+                pendingP2AiReplayState = p2State;
+                TryStartDebugBotReplay();
+                break;
+            case P4AiReplayStateMessage p4State when !IsHost:
+                pendingP4AiReplayState = p4State;
+                TryStartDebugBotReplay();
+                break;
+            case P5AiReplayStateMessage p5State when !IsHost:
+                pendingP5AiReplayState = p5State;
                 TryStartDebugBotReplay();
                 break;
         }

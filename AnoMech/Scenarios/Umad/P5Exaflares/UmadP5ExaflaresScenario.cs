@@ -72,11 +72,19 @@ public sealed class UmadP5ExaflaresScenario : IScenario
     // Despawn the arrow this far before completion to suppress its native release.
     private const float ArrowReleaseSuppressLead = 0.05f;
 
+    // The current run's randomized per-run assignments, exposed so
+    // MultiplayerManager can read them after a host Start and broadcast them --
+    // lets a peer's local "debug: bot controls my character" mode replay the
+    // same choreography a host-side bot in that role would produce. Mirrors
+    // UmadP3BlackHoleScenario.LastState.
+    public UmadP5ExaflaresState? LastState { get; private set; }
+
     public void Run(SimWorld worldParam, int? selectedAi)
     {
         world = worldParam;
         party = worldParam.Party;
         state = new UmadP5ExaflaresState(settingsWindow.Overrides, timeline);
+        LastState = state;
         damage = new DamageSolver(party); // ApplyDamage deals % of max HP; godmode drop/heal handled in Game.Kill
         spreadHelpers.Clear();
 

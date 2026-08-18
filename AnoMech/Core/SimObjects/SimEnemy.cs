@@ -346,6 +346,26 @@ public sealed unsafe class SimEnemy : SimNpc
 
     public void SetVisible(bool visible) => desiredVisible = visible;
 
+    // Read side of PlayAnimationTimeline -- MultiplayerManager samples this so a
+    // scenario's discrete, one-shot animation cues (Kefka's WarpOut/Spawn teleport,
+    // etc.) replicate to peers. A byte-for-byte sibling of ModelState/edge-triggered
+    // application, not the inherited PlayActionTimeline: that base method is also
+    // what Movement uses internally to drive the locomotion run-cycle every time this
+    // enemy starts/stops moving (see Movement.StartAnim), and TickNetworkPosition
+    // above independently re-triggers that same run-cycle on a peer while smoothing
+    // toward a broadcast position -- tracking/replicating every PlayActionTimeline
+    // call indiscriminately would make those two "who's driving the animation right
+    // now" mechanisms fight each other every movement tick. PlayAnimationTimeline is
+    // therefore a separate, deliberate method scenarios call ONLY for a real
+    // scenario-authored animation cue, never used by Movement.
+    public ushort? AnimationTimelineId { get; private set; }
+
+    public void PlayAnimationTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
+    {
+        AnimationTimelineId = timelineId;
+        PlayActionTimeline(timelineId, loopId, baseOverride);
+    }
+
     public void Follow(SimCharacter? target = null, float speed = 6f) => Movement.Follow(target, speed);
 
     private void ReconcileVisibility()

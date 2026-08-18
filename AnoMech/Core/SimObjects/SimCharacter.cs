@@ -125,10 +125,21 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
             vfx.Add(spawned);
     }
     
+    // Read side of AttachLockonVfx -- MultiplayerManager samples this so a scenario's
+    // lockon markers (stack targets, mystery-magic cones, etc.) replicate to peers.
+    // Every current call site in the codebase uses persistent: false (the AVFX
+    // self-completes; nothing becomes a tracked SimVfx -- see AddVfx), so this is a
+    // fire-and-forget "last attached" marker, not an ongoing/removable state: peers
+    // re-fire AttachLockonVfx on this value changing, the same edge-triggered
+    // approach ModelState already uses, rather than a full add/remove reconcile like
+    // ActiveStatusSnapshot.
+    public uint? LastLockonVfxId { get; private set; }
+
     public void AttachLockonVfx(uint lockonId, float duration = 0f, bool persistent = true)
     {
-        if (VfxFunctions.LockonVfxIconName(lockonId) is {} iconName)
-            AddVfx($"vfx/lockon/eff/{iconName}.avfx", duration, persistent);
+        if (VfxFunctions.LockonVfxIconName(lockonId) is not {} iconName) return;
+        AddVfx($"vfx/lockon/eff/{iconName}.avfx", duration, persistent);
+        LastLockonVfxId = lockonId;
     }
 
     public SimVfx? FindVfx(string path)

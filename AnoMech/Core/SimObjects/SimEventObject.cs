@@ -112,6 +112,21 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     public Vector3 Position { get; private set; }
     public float Rotation { get; private set; }
 
+    // Read side of the spawn-time TimelineState (EventObjectSpawnConfig.TimelineState)
+    // -- MultiplayerManager needs this alongside CurrentState below so a peer's
+    // reconstructed local copy (via world.SpawnEventObject) uses the identical
+    // per-instance "visible" state value SetVisible(true) resolves to for this EObj.
+    public ushort VisibleState => visibleState;
+
+    // Read side of SetState -- MultiplayerManager samples this so a scenario's (or
+    // SimTower's proximity-driven) state changes replicate to peers. SimEventObjects
+    // render via the LayoutEngine SharedGroup, not GameObject.DrawObject, so there is
+    // no equivalent to SimEnemy's DrawObject-visibility flag to read back; this native
+    // write (actor+0x1B2) has no other observable signal a peer could pick up on its
+    // own. Defaults to 0, matching the engine's own unwritten default -- correct
+    // whether or not Spawn ever calls SetVisible(false) at construction (see SetState).
+    public ushort CurrentState { get; private set; }
+
     private float lifetimeElapsed { get; set; } = 0;
 
     protected SimEventObject(int slot, GameObject* obj, Coordinates coordinates, uint eObjRowId, ushort visibleState, float lifetime)
@@ -171,6 +186,7 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     public void SetState(ushort state)
     {
         if (obj == null) return;
+        CurrentState = state;
         EventObjectHelper.SetState(obj, state);
     }
 

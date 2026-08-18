@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text.Json.Serialization;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
+using AnoMech.Scenarios.Umad.P2Forsaken;
 
 namespace AnoMech.Multiplayer;
 
@@ -31,6 +32,9 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(ResetRequestMessage), "resetRequest")]
 [JsonDerivedType(typeof(LeaveRequestMessage), "leaveRequest")]
 [JsonDerivedType(typeof(AiReplayStateMessage), "aiReplayState")]
+[JsonDerivedType(typeof(P2AiReplayStateMessage), "p2AiReplayState")]
+[JsonDerivedType(typeof(P4AiReplayStateMessage), "p4AiReplayState")]
+[JsonDerivedType(typeof(P5AiReplayStateMessage), "p5AiReplayState")]
 public abstract record MpMessage;
 
 // Peer -> host, sent once right after connecting so the host can register a
@@ -51,12 +55,21 @@ public sealed record PeerBuildInfo(string Version, string Checksum)
 
 // Host -> everyone, full-state (not delta) so a client that missed an update
 // self-heals on the next broadcast instead of drifting from a merge bug.
+// ScenarioIndex/SelectedAi/SelectedWaymark mirror what the host passes to its own
+// RunScenarioAsHost (indices into Game.Scenarios and that scenario's own
+// AiStrats/WaymarkPresets, same convention MainWindow's solo Start already uses) --
+// carried here rather than only in StartMessage so a late joiner who missed the
+// original StartMessage (this is the full-state broadcast, not a delta) still
+// resolves the same scenario/strat/waymark as everyone else on OnStartReceived.
 public sealed record LobbyStateMessage(
     Guid HostId,
     Dictionary<PartyRole, Guid> ClaimedBy,
     Dictionary<Guid, string> Names,
     Dictionary<Guid, PeerBuildInfo> Builds,
-    bool Started) : MpMessage;
+    bool Started,
+    int ScenarioIndex,
+    int SelectedAi,
+    int SelectedWaymark) : MpMessage;
 
 public sealed record ClaimRoleMessage(Guid PeerId, PartyRole Role) : MpMessage;
 public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
@@ -104,11 +117,19 @@ public sealed record SelfPoseMessage(Guid PeerId, float X, float Y, float Z, flo
 // size despite Position/Visible/ModelState all matching the host correctly.
 public sealed record EnemyStatusState(ushort StatusId, ushort Stacks);
 
+// AnimationTimelineId mirrors SimEnemy.PlayAnimationTimeline -- a scenario's
+// discrete one-shot animation cues (Kefka's WarpOut/Spawn teleport, Neo Exdeath's
+// warp-in, etc.), tracked separately from Movement's own internal locomotion
+// PlayActionTimeline calls (see PlayAnimationTimeline's own doc comment for why).
+// Null until a scenario ever calls it for this enemy; edge-triggered on the peer
+// side like ModelState, once per actual value change.
+// LastLockonVfxId mirrors SimCharacter.AttachLockonVfx (stack-target markers,
+// mystery-magic cones, etc.) -- see SimCharacter.LastLockonVfxId's own doc comment.
 public sealed record EnemyState(
     int NetId, uint BNpcBaseId, uint NameId, byte Level, bool Targetable,
     EnemyListMode EnemyList, uint ModelCharaId, float Scale, float HitboxRadius,
     byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
-    IReadOnlyList<EnemyStatusState> Statuses,
+    IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, uint? LastLockonVfxId,
     float X, float Y, float Z, float Rotation,
     bool IsCasting, uint CastActionId);
 
@@ -117,12 +138,42 @@ public sealed record EnemyState(
 // it gets the real VFX plumbing, not a fake beam.
 public sealed record TetherState(int NetId, ushort TetherId, int? AEnemyNetId, PartyRole? ARole, int? BEnemyNetId, PartyRole? BRole);
 
-public sealed record RoleState(PartyRole Role, bool Filled, bool Dead, float X, float Y, float Z, float Rotation);
+// Statuses/LastLockonVfxId mirror EnemyState's own fields, same reasoning -- a
+// scenario's AddStatus/RemoveStatus/AttachLockonVfx calls against a party-role
+// member (First/Second/Third In Line, Primordial Crust, Accretion, stack
+// markers, etc.) are exactly as local/unreplicated-by-default as they are for
+// an enemy. Unlike X/Y/Z/Rotation (self-authoritative for whichever role a
+// given peer has claimed -- see OnWorldSnapshotReceived), Statuses/
+// LastLockonVfxId are NOT self-authoritative even for a peer's own claimed
+// role: peers never run any scenario logic at all, so nothing else would ever
+// call AddStatus/AttachLockonVfx against a peer's own real character.
+public sealed record RoleState(
+    PartyRole Role, bool Filled, bool Dead, float X, float Y, float Z, float Rotation,
+    IReadOnlyList<EnemyStatusState> Statuses, uint? LastLockonVfxId);
+
+// One SimEventObject (or SimTower, a subclass) as host currently has it. NetId
+// mirrors EnemyState.NetId -- a host-assigned, per-run stable id used only to
+// correlate this object across snapshot ticks. EObjId/TimelineState let a peer
+// reconstruct the same prop locally via world.SpawnEventObject on first sight
+// (TimelineState must match the host's exact spawn config: it's what
+// SetVisible(true) resolves to for this specific EObj -- see
+// SimEventObject.VisibleState). CurrentState mirrors SimEventObject.SetState,
+// a native write with no packet/observable signal a peer could pick up on its
+// own -- see SimEventObject.CurrentState. Without this whole message type,
+// SimEventObject actors don't replicate at all: MultiplayerManager's enemy
+// sampler only ever walked world.Children.OfType&lt;SimEnemy&gt;(), so a
+// scenario's props (UMAD P3's EarthCore, any SimTower) simply never spawned
+// for a peer regardless of what fields EnemyState carried.
+public sealed record EventObjectState(
+    int NetId, uint EObjId, ushort TimelineState, ushort CurrentState,
+    float X, float Y, float Z, float Rotation);
 
 // Host -> everyone, at SnapshotSendRate. Stateless/full-state by design (see
 // LobbyStateMessage) -- a dropped frame just means one tick of staleness, not
 // a permanently wrong reconstruction.
-public sealed record WorldSnapshotMessage(List<EnemyState> Enemies, List<TetherState> Tethers, List<RoleState> Roles) : MpMessage;
+public sealed record WorldSnapshotMessage(
+    List<EnemyState> Enemies, List<TetherState> Tethers, List<RoleState> Roles,
+    List<EventObjectState> EventObjects) : MpMessage;
 
 // Host -> everyone, one per Game.PartyMemberKilled. A receiving client calls
 // Game.Kill on whatever currently occupies that role locally -- their own real
@@ -206,3 +257,33 @@ public sealed record LeaveRequestMessage(Guid PeerId) : MpMessage;
 public sealed record AiReplayStateMessage(
     PartyRole[] Roles, PartyRole[] StackTargets, uint[] SlapAttacks,
     float[] KefkaPositionRadians, uint ImplosionAttack) : MpMessage;
+
+// P2 Forsaken's version of AiReplayStateMessage above -- same purpose/timing,
+// UmadP2ForsakenState's own shape (see UmadP2ForsakenState.FromNetworkReplay).
+// Unlike P3, this carries the state's *entire* public surface rather than a
+// curated subset: every field here is a plain value (no live SimEnemy handles
+// to resolve), and P2 has 7 different debug-bot Ai variants rather than one,
+// so there's no single "what does the Ai read" answer to trim against --
+// reconstructing everything is simpler and correct regardless of which strat
+// the host picked (see MultiplayerManager.SelectedAi).
+public sealed record P2AiReplayStateMessage(
+    EndAttack[] EndAttacks, float NewNorthRadians, int Rotation, Dictionary<PartyRole, uint> Lockons) : MpMessage;
+
+// P4 Kefka Says' version of AiReplayStateMessage above -- same purpose/timing.
+// Carries only the subset UmadP4KefkaSaysAi actually reads (see
+// UmadP4KefkaSaysState.FromNetworkReplay) -- notably MysteryCast is reduced to
+// its three scalar fields (the Ai never reads the KefkaCast objects
+// themselves), and ChaosMystery.Cast is reconstructed from a fixed constant
+// per element (InfernoMystery is always Cast=Inferno, TsunamiMystery always
+// Cast=Tsunami) so only each one's IsTrue needs to cross the wire.
+public sealed record P4AiReplayStateMessage(
+    int[] MysteryBlizzardOffset, int[] MysteryLightningOffset, float[] MysteryLightningOrientation,
+    bool Wave1First, PartyRole[] Wave1, bool Wave1True, PartyRole[] Wave2, bool Wave2True,
+    bool InfernoIsTrue, bool TsunamiIsTrue, PartyRole[] Wave3, bool[] Wounds,
+    bool Antilight0IsWhite, float NeoExdeathDirectionRadians) : MpMessage;
+
+// P5 Exaflares' version of AiReplayStateMessage above -- same purpose/timing.
+// UmadP5ExaflaresState's entire meaningful surface is LeftOrder/RightOrder (see
+// UmadP5ExaflaresState.FromNetworkReplay); Timeline/SpreadTick are plumbing the
+// peer constructs locally, not broadcast.
+public sealed record P5AiReplayStateMessage(int[] LeftOrder, int[] RightOrder) : MpMessage;

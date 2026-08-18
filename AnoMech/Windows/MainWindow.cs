@@ -11,7 +11,6 @@ using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
 using AnoMech.Multiplayer;
 using AnoMech.Scenarios;
-using AnoMech.Scenarios.Umad.P3BlackHole;
 using static AnoMech.Core.Game.Game;
 
 namespace AnoMech.Windows;
@@ -220,7 +219,7 @@ public unsafe class MainWindow : Window, IDisposable
         var game = plugin.Game;
 
         ImGui.TextUnformatted(FullName(_selectedScenario));
-        if (_selectedScenario is UmadP3BlackHoleScenario)
+        if (MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()))
         {
             ImGui.SameLine();
             if (ImGui.SmallButton("Multiplayer...")) plugin.MultiplayerWindow.Toggle();
@@ -244,7 +243,7 @@ public unsafe class MainWindow : Window, IDisposable
         // guest stuck on "waiting for the host to start" forever; a peer clicking
         // it would start a second, fully independent local simulation instead of
         // waiting for the host's broadcast.
-        var mpBlocked = _selectedScenario is UmadP3BlackHoleScenario && plugin.Multiplayer.IsConnected;
+        var mpBlocked = MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()) && plugin.Multiplayer.IsConnected;
         var canStart = envReady && hasStrat && !mpBlocked;
         ImGui.BeginDisabled(!canStart);
         if (ImGui.Button("Start")) game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
@@ -434,7 +433,10 @@ public unsafe class MainWindow : Window, IDisposable
 
     // True when Start may run a strat: ungrouped scenarios are always fine; grouped
     // scenarios require the current selection to be a real strat in the active region.
-    private bool HasStartableStrat()
+    // internal (not private): MultiplayerManager.StartScenario reuses this exact check
+    // before broadcasting SelectedAi -- an out-of-range/-1 index would throw when a
+    // debug-bot peer later indexes AiStrats[SelectedAi] (see TryStartDebugBotReplay).
+    internal bool HasStartableStrat()
     {
         if (_selectedScenario is not { } scenario) return false;
         if (StratGroups(scenario).Count == 0) return true;
