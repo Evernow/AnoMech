@@ -4,6 +4,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using AnoMech.Core;
 
@@ -19,8 +20,19 @@ public sealed class RelayClient : IDisposable
     private readonly ClientWebSocket socket = new();
     private readonly CancellationTokenSource cts = new();
     // ClientWebSocket allows only one outstanding SendAsync at a time; MultiplayerManager
-    // fires sends from independent tick-rate timers (pose vs snapshot) that could otherwise overlap.
-    private readonly SemaphoreSlim sendGate = new(1, 1);
+    // fires sends from independent tick-rate timers (pose vs snapshot) that could otherwise
+    // overlap, plus bursts of many sequential sends from a single native event (e.g. a
+    // MapEffect hook firing once per changed tile). A SemaphoreSlim gate here does NOT
+    // guarantee FIFO release order for waiters queued up behind it -- confirmed via
+    // AnoMech-DamageDebug dumps: a 9-call MapEffect burst sent host-side in order 1-8,0
+    // arrived peer-side as 7,1,3,0,2,5,4,6,8, leaving a peer's replicated arena-color
+    // transition (P2 Forsaken's gold->black swap) visually wrong even though every
+    // individual native call did eventually fire. A Channel's writer queue is strictly
+    // FIFO: the enqueue in SendAsync below is synchronous, so callers invoking it
+    // sequentially (as the MapEffect hook does, once per native call in the same frame)
+    // get a deterministic wire order regardless of how many race to enqueue.
+    private readonly Channel<(byte[] Bytes, TaskCompletionSource Completion)> sendQueue =
+        Channel.CreateUnbounded<(byte[], TaskCompletionSource)>();
     private bool disposed;
 
     public event Action<MpMessage>? MessageReceived;
@@ -49,24 +61,45 @@ public sealed class RelayClient : IDisposable
             return;
         }
         _ = Task.Run(ReceiveLoopAsync);
+        _ = Task.Run(SendLoopAsync);
     }
 
     public async Task SendAsync(MpMessage message)
     {
         if (!IsConnected) return;
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions));
-        await sendGate.WaitAsync(cts.Token).ConfigureAwait(false);
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // TryWrite on an unbounded channel is synchronous and never fails while the
+        // channel is open -- the enqueue itself happens before this method's first
+        // await, so sequential callers land in the queue in the exact order they called
+        // SendAsync, however many of them race to get here.
+        if (!sendQueue.Writer.TryWrite((bytes, completion))) return;
+        await completion.Task.ConfigureAwait(false);
+    }
+
+    // Single consumer draining sendQueue strictly in enqueue order -- this is what
+    // actually makes SendAsync's ordering guarantee hold, not just the enqueue step.
+    private async Task SendLoopAsync()
+    {
         try
         {
-            await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cts.Token).ConfigureAwait(false);
+            await foreach (var (bytes, completion) in sendQueue.Reader.ReadAllAsync(cts.Token).ConfigureAwait(false))
+            {
+                try
+                {
+                    await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cts.Token).ConfigureAwait(false);
+                    completion.SetResult();
+                }
+                catch (Exception e)
+                {
+                    DiagnosticLog.Warn($"[RelayClient] Send failed: {e.Message}");
+                    completion.SetException(e);
+                }
+            }
         }
-        catch (Exception e)
+        catch (OperationCanceledException)
         {
-            DiagnosticLog.Warn($"[RelayClient] Send failed: {e.Message}");
-        }
-        finally
-        {
-            sendGate.Release();
+            // Dispose() cancelled us -- not a failure.
         }
     }
 
@@ -131,10 +164,17 @@ public sealed class RelayClient : IDisposable
         if (disposed) return;
         disposed = true;
         DiagnosticLog.Debug($"[RelayClient] Dispose() -- socket state was {socket.State}.");
+        // Completed before Cancel: cts.Cancel() can make SendLoopAsync's ReadAllAsync
+        // throw immediately without draining what's left, which would otherwise leave
+        // any already-enqueued SendAsync callers awaiting a TaskCompletionSource that
+        // never gets set -- hanging them forever instead of letting them observe the
+        // disconnect like a normal failed send.
+        sendQueue.Writer.TryComplete();
+        while (sendQueue.Reader.TryRead(out var pending))
+            pending.Completion.TrySetException(new ObjectDisposedException(nameof(RelayClient)));
         cts.Cancel();
         try { socket.Abort(); } catch { /* best-effort teardown */ }
         socket.Dispose();
         cts.Dispose();
-        sendGate.Dispose();
     }
 }

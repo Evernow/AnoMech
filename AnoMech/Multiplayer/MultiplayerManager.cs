@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -77,6 +78,7 @@ public sealed class MultiplayerManager : IDisposable
     // the real scenario's wall-clock Stopwatch does.
     private const float P5ReplayFrameGapCapSeconds = 0.25f;
 
+
     // Scenarios a multiplayer session can host/join/start -- gates MainWindow's
     // "Multiplayer..." button and StartScenario's own validation. Core
     // replication (enemies/tethers/roles/statuses/ModelState) works for any
@@ -111,18 +113,18 @@ public sealed class MultiplayerManager : IDisposable
     // content.
     private readonly Dictionary<SimEnemy, string> hostEnemyLastLoggedStatuses = new();
     // Host-only: same edge-triggered-logging-only purpose, for
-    // PlayAnimationTimeline/AttachLockonVfx calls. Absent from the dictionary
-    // == "never logged yet" (distinct from "logged 0"), since 0 is a
-    // meaningful default-y value for both fields.
+    // PlayAnimationTimeline calls. Absent from the dictionary == "never
+    // logged yet" (distinct from "logged 0"), since 0 is a meaningful
+    // default-y value for the field. AttachLockonVfx no longer needs an
+    // edge-triggered dictionary of its own -- see SimCharacter.
+    // DrainPendingLockonVfxIds's doc comment: every call since the last drain
+    // is inherently new, so there's nothing to compare against.
     private readonly Dictionary<SimEnemy, ushort> hostEnemyLastLoggedAnimationTimeline = new();
-    private readonly Dictionary<SimEnemy, uint> hostEnemyLastLoggedLockonVfx = new();
     // Host-only: same edge-triggered-logging-only purpose, for party-role
-    // AddStatus/RemoveStatus and AttachLockonVfx calls -- keyed by PartyRole
-    // (fixed 8-entry set) rather than a Dictionary<SimCharacter,...>, since
-    // whichever SimCharacter occupies a role changes across a claim/release
-    // but the role itself doesn't.
+    // AddStatus/RemoveStatus calls -- keyed by PartyRole (fixed 8-entry set)
+    // rather than a Dictionary<SimCharacter,...>, since whichever SimCharacter
+    // occupies a role changes across a claim/release but the role itself doesn't.
     private readonly Dictionary<PartyRole, string> hostRoleLastLoggedStatuses = new();
-    private readonly Dictionary<PartyRole, uint> hostRoleLastLoggedLockonVfx = new();
     // Host-only, edge-triggered against UmadP2ForsakenState.Lockons -- see
     // P2LockonsUpdateMessage's doc comment for why this needs its own re-syncable
     // channel instead of the one-time P2AiReplayStateMessage snapshot.
@@ -143,12 +145,14 @@ public sealed class MultiplayerManager : IDisposable
     // peerEnemyModelState above -- statuses are still reconciled against the
     // broadcast every snapshot regardless, this only gates the log line.
     private readonly Dictionary<int, string> peerEnemyLastLoggedStatuses = new();
-    // Peer-only: last-applied AnimationTimelineId/LastLockonVfxId per enemy
-    // NetId, edge-triggered like peerEnemyModelState -- re-issuing
-    // PlayAnimationTimeline/AttachLockonVfx every snapshot even when
-    // unchanged would restart the same animation/VFX on a loop.
+    // Peer-only: last-applied AnimationTimelineId per enemy NetId,
+    // edge-triggered like peerEnemyModelState -- re-issuing
+    // PlayAnimationTimeline every snapshot even when unchanged would restart
+    // the same animation on a loop. EnemyState.NewLockonVfxIds needs no
+    // equivalent tracking: it's already a drained since-last-snapshot list
+    // (see SimCharacter.DrainPendingLockonVfxIds), so every id it carries is
+    // inherently new and gets applied unconditionally below.
     private readonly Dictionary<int, ushort> peerEnemyAnimationTimeline = new();
-    private readonly Dictionary<int, uint> peerEnemyLastLockonVfx = new();
     // Peer-only: last-seen LastInstantCastSeq per enemy NetId, edge-triggered the
     // same way -- see EnemyState.LastInstantCastSeq's doc comment for why instant
     // casts need this separate counter instead of the IsCasting rising edge.
@@ -158,14 +162,13 @@ public sealed class MultiplayerManager : IDisposable
     // worry about, but re-issuing it unconditionally every snapshot is still
     // pointless churn once it's already correct.
     private readonly Dictionary<int, ushort> peerEventObjectState = new();
-    // Peer-only role equivalents of the *Statuses/LastLockonVfx pairs above --
-    // keyed by PartyRole like their host-side counterparts. Reconciled/applied
-    // for every role INCLUDING the peer's own claimed one: unlike position
+    // Peer-only role equivalent of peerEnemyLastLoggedStatuses above -- keyed
+    // by PartyRole like its host-side counterpart. Reconciled/applied for
+    // every role INCLUDING the peer's own claimed one: unlike position
     // (self-authoritative -- see OnWorldSnapshotReceived), a peer never runs
     // any scenario logic themselves, so nothing else would ever call
     // AddStatus/AttachLockonVfx against their own real character.
     private readonly Dictionary<PartyRole, string> peerRoleLastLoggedStatuses = new();
-    private readonly Dictionary<PartyRole, uint> peerRoleLastLockonVfx = new();
     // Peer-only: statusIds WE ourselves applied to a role via reconciliation
     // below, as opposed to a status the local game client manages entirely on
     // its own -- e.g. LocalPlayerInputHooks applies the real Sprint buff
@@ -198,6 +201,16 @@ public sealed class MultiplayerManager : IDisposable
     // always start these fresh via LeaveSession.
     private const float PingIntervalSeconds = 2f;
     private const long PeerStaleTimeoutMs = 8000;
+    // Distinct, shorter timeout for "never heard from a host at all since joining" --
+    // used to detect a mistyped/nonexistent session code. The relay is a dumb
+    // broadcast room keyed purely by code (see Relay/AnoMech.Relay/Program.cs's
+    // TryJoin): it auto-creates an empty room for any code, so there is no
+    // "session not found" at the transport level -- a bad code just looks like an
+    // empty room nobody else ever joins. PeerStaleTimeoutMs is tuned for the much
+    // worse case of a host that WAS present going silent mid-fight, hence the
+    // longer grace; this case has no established connection to preserve, so it can
+    // fail fast.
+    private const long NoHostFoundTimeoutMs = 4000;
     private float pingTimer;
     private readonly Dictionary<Guid, long> peerLastSeenMs = new();
     private readonly Dictionary<Guid, float> peerLatencyMs = new();
@@ -217,6 +230,14 @@ public sealed class MultiplayerManager : IDisposable
     // host-only ground truth about *its* peers) by watching every host-
     // originated broadcast a peer receives -- see DispatchCore.
     private long lastHostMessageMs;
+    // True once any actual host-broadcast message has ever been received this
+    // session (set in DispatchCore) -- distinguishes "never heard from a host"
+    // (IsSessionNotFound) from "was hearing from one, then stopped" (IsHostStale).
+    // lastHostMessageMs alone can't make that distinction: it's seeded to "now" on
+    // every join/reconnect specifically so it doesn't read as decades-stale before
+    // the first real message, which also means it can't tell a fresh join apart
+    // from a session that's actually been silent the whole time.
+    private bool everHeardFromHost;
 
     // ---- Pre-Start readiness check -----------------------------------------
     // Host-only: mid-flight state for a StartScenario call while it's waiting
@@ -359,7 +380,16 @@ public sealed class MultiplayerManager : IDisposable
     // Peer-only equivalents of IsPeerStale/GetPeerStatus for the host's own
     // roster row -- see lastHostMessageMs.
     public float SecondsSinceHostMessage => (Environment.TickCount64 - lastHostMessageMs) / 1000f;
-    public bool IsHostStale => !IsHost && SecondsSinceHostMessage * 1000f > PeerStaleTimeoutMs;
+    // Lets MultiplayerWindow hold a peer on a "connecting" screen instead of the
+    // full role-list lobby until a host is actually confirmed present -- SessionCode
+    // alone (what Draw() used to gate on) is set synchronously on JoinSession, well
+    // before any confirmation a host exists on the other end of that code.
+    public bool EverHeardFromHost => everHeardFromHost;
+    // everHeardFromHost required so this can't overlap with IsSessionNotFound below --
+    // a host that goes silent before ever sending anything is a nonexistent/mistyped
+    // session, not a stale one.
+    public bool IsHostStale => !IsHost && everHeardFromHost && SecondsSinceHostMessage * 1000f > PeerStaleTimeoutMs;
+    public bool IsSessionNotFound => !IsHost && !everHeardFromHost && SecondsSinceHostMessage * 1000f > NoHostFoundTimeoutMs;
 
     // ---- Session lifecycle ----------------------------------------------
 
@@ -395,6 +425,7 @@ public sealed class MultiplayerManager : IDisposable
         // row would read as having gone silent for decades until the very first
         // host broadcast arrives.
         lastHostMessageMs = Environment.TickCount64;
+        everHeardFromHost = false;
 
         DiagnosticLog.Info($"[Multiplayer] Joining session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
         relay = new RelayClient();
@@ -463,19 +494,15 @@ public sealed class MultiplayerManager : IDisposable
         hostEnemyLastLoggedModelState.Clear();
         hostEnemyLastLoggedStatuses.Clear();
         hostEnemyLastLoggedAnimationTimeline.Clear();
-        hostEnemyLastLoggedLockonVfx.Clear();
         hostRoleLastLoggedStatuses.Clear();
-        hostRoleLastLoggedLockonVfx.Clear();
         hostTetherNetIds.Clear();
         hostEventObjectNetIds.Clear();
         peerEnemies.Clear();
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
-        peerEnemyLastLockonVfx.Clear();
         peerEnemyLastInstantCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
-        peerRoleLastLockonVfx.Clear();
         peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
         peerEventObjects.Clear();
@@ -833,9 +860,7 @@ public sealed class MultiplayerManager : IDisposable
         hostEnemyLastLoggedModelState.Clear();
         hostEnemyLastLoggedStatuses.Clear();
         hostEnemyLastLoggedAnimationTimeline.Clear();
-        hostEnemyLastLoggedLockonVfx.Clear();
         hostRoleLastLoggedStatuses.Clear();
-        hostRoleLastLoggedLockonVfx.Clear();
         hostTetherNetIds.Clear();
         hostEventObjectNetIds.Clear();
         nextEnemyNetId = 0;
@@ -897,10 +922,8 @@ public sealed class MultiplayerManager : IDisposable
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
-        peerEnemyLastLockonVfx.Clear();
         peerEnemyLastInstantCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
-        peerRoleLastLockonVfx.Clear();
         peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
         peerEventObjects.Clear();
@@ -950,18 +973,27 @@ public sealed class MultiplayerManager : IDisposable
         Plugin.GameInstance.World.Map.EffectApplied += (packetFlags, index) =>
         {
             if (!IsHost || relay is not { IsConnected: true }) return;
+            DiagnosticLog.Info($"[Multiplayer] Host: broadcasting MapEffect packetFlags=0x{packetFlags:X8} index=0x{index:X}.");
             _ = relay.SendAsync(new MapEffectMessage(packetFlags, index));
         };
         Plugin.GameInstance.World.Map.DirectorUpdated += (category, arg1, arg2, arg3, arg4, arg5, arg6) =>
         {
             if (!IsHost || relay is not { IsConnected: true }) return;
+            DiagnosticLog.Info($"[Multiplayer] Host: broadcasting MapDirectorUpdate category=0x{category:X8}.");
             _ = relay.SendAsync(new MapDirectorUpdateMessage(category, arg1, arg2, arg3, arg4, arg5, arg6));
+        };
+        Plugin.GameInstance.World.Map.WeatherChanged += (weatherId, transition) =>
+        {
+            if (!IsHost || relay is not { IsConnected: true }) return;
+            DiagnosticLog.Info($"[Multiplayer] Host: broadcasting SetWeather weatherId={weatherId} transition={transition}.");
+            _ = relay.SendAsync(new SetWeatherMessage(weatherId, transition));
         };
     }
 
     public void Tick(float deltaSeconds)
     {
         SubscribeMapEventsOnce();
+        DrainPendingMessages();
 
         // Checked before the IsConnected early-return below (this is exactly the
         // case where relay is down) -- see disconnectedSinceMs's own doc comment.
@@ -1002,6 +1034,21 @@ public sealed class MultiplayerManager : IDisposable
                     FinishStartCheck();
                 }
             }
+        }
+        else if (IsSessionNotFound)
+        {
+            // No host-broadcast message ever arrived since joining -- the relay's
+            // room for this code is either empty (mistyped/nonexistent session) or
+            // has only non-host peers in it. Fails fast rather than sitting on
+            // NoHostFoundTimeoutMs's much shorter window than PeerStaleTimeoutMs's
+            // grace period below, which is tuned for a host that WAS confirmed
+            // present going silent -- a worse, rarer case that deserves more benefit
+            // of the doubt against transient lag than a bad code does.
+            DiagnosticLog.Warn($"[Multiplayer] No host responded within {NoHostFoundTimeoutMs / 1000}s of joining session {SessionCode} -- session not found.");
+            LeaveSession();
+            SessionEndReason = "Session not found.";
+            LobbyChanged?.Invoke();
+            return;
         }
         else if (IsHostStale)
         {
@@ -1137,7 +1184,6 @@ public sealed class MultiplayerManager : IDisposable
             hostEnemyLastLoggedModelState.Remove(stale);
             hostEnemyLastLoggedStatuses.Remove(stale);
             hostEnemyLastLoggedAnimationTimeline.Remove(stale);
-            hostEnemyLastLoggedLockonVfx.Remove(stale);
         }
 
         var enemies = new List<EnemyState>(liveEnemies.Count);
@@ -1169,19 +1215,16 @@ public sealed class MultiplayerManager : IDisposable
                 hostEnemyLastLoggedAnimationTimeline[enemy] = timelineId;
                 DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
             }
-            if (enemy.LastLockonVfxId is { } lockonId
-                && (!hostEnemyLastLoggedLockonVfx.TryGetValue(enemy, out var lastLockon) || lastLockon != lockonId))
-            {
-                hostEnemyLastLoggedLockonVfx[enemy] = lockonId;
-                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
-            }
+            var newLockonVfxIds = enemy.DrainPendingLockonVfxIds();
+            if (newLockonVfxIds.Count > 0)
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
             var (castTargetEnemyNetId, castTargetRole) = ResolveTargetId(world, enemy.CastTargetId);
             var (instantTargetEnemyNetId, instantTargetRole) = ResolveTargetId(world, enemy.LastInstantCastTargetId);
             enemies.Add(new EnemyState(
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, cfg.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
                 statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList(),
-                enemy.AnimationTimelineId, enemy.LastLockonVfxId,
+                enemy.AnimationTimelineId, newLockonVfxIds,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
                 enemy.IsCasting, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
                 enemy.CastTargetLocation?.X, enemy.CastTargetLocation?.Y, enemy.CastTargetLocation?.Z,
@@ -1218,6 +1261,7 @@ public sealed class MultiplayerManager : IDisposable
             var member = world.Party.Get(role);
             var dead = member is ISimPartyMember { Dead: true };
             IReadOnlyList<EnemyStatusState> statuses = [];
+            IReadOnlyList<uint> newLockonVfxIds = [];
             if (member != null)
             {
                 var statusSnapshot = member.ActiveStatusSnapshot;
@@ -1227,22 +1271,18 @@ public sealed class MultiplayerManager : IDisposable
                     hostRoleLastLoggedStatuses[role] = statusKey;
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} statuses -> [{statusKey}].");
                 }
-                if (member.LastLockonVfxId is { } lockonId
-                    && (!hostRoleLastLoggedLockonVfx.TryGetValue(role, out var lastLockon) || lastLockon != lockonId))
-                {
-                    hostRoleLastLoggedLockonVfx[role] = lockonId;
-                    DiagnosticLog.Info($"[Multiplayer] Host: role {role} LastLockonVfxId -> {lockonId}.");
-                }
+                newLockonVfxIds = member.DrainPendingLockonVfxIds();
+                if (newLockonVfxIds.Count > 0)
+                    DiagnosticLog.Info($"[Multiplayer] Host: role {role} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
                 statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList();
             }
             else
             {
                 hostRoleLastLoggedStatuses.Remove(role);
-                hostRoleLastLoggedLockonVfx.Remove(role);
             }
             roles.Add(new RoleState(role, member != null, dead,
                 member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f,
-                statuses, member?.LastLockonVfxId));
+                statuses, newLockonVfxIds));
         }
 
         var liveEventObjects = world.Children.OfType<SimEventObject>().Where(o => o.IsActive).ToList();
@@ -1511,12 +1551,11 @@ public sealed class MultiplayerManager : IDisposable
                 DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
                 enemy.PlayAnimationTimeline(timelineId);
             }
-            if (e.LastLockonVfxId is { } lockonId
-                && (!peerEnemyLastLockonVfx.TryGetValue(e.NetId, out var lastLockon) || lastLockon != lockonId))
+            if (e.NewLockonVfxIds.Count > 0)
             {
-                peerEnemyLastLockonVfx[e.NetId] = lockonId;
-                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) LastLockonVfxId -> {lockonId}.");
-                enemy.AttachLockonVfx(lockonId, persistent: false);
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) NewLockonVfxIds -> [{string.Join(",", e.NewLockonVfxIds)}].");
+                foreach (var lockonId in e.NewLockonVfxIds)
+                    enemy.AttachLockonVfx(lockonId, persistent: false);
             }
         }
         foreach (var staleId in peerEnemies.Keys.Where(id => !seenEnemyIds.Contains(id)).ToList())
@@ -1527,7 +1566,6 @@ public sealed class MultiplayerManager : IDisposable
             peerEnemyModelState.Remove(staleId);
             peerEnemyLastLoggedStatuses.Remove(staleId);
             peerEnemyAnimationTimeline.Remove(staleId);
-            peerEnemyLastLockonVfx.Remove(staleId);
             peerEnemyLastInstantCastSeq.Remove(staleId);
         }
 
@@ -1646,12 +1684,11 @@ public sealed class MultiplayerManager : IDisposable
                 peerRoleLastLoggedStatuses[r.Role] = statusKey;
                 DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} statuses -> [{statusKey}].");
             }
-            if (r.LastLockonVfxId is { } lockonId
-                && (!peerRoleLastLockonVfx.TryGetValue(r.Role, out var lastLockon) || lastLockon != lockonId))
+            if (r.NewLockonVfxIds.Count > 0)
             {
-                peerRoleLastLockonVfx[r.Role] = lockonId;
-                DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} LastLockonVfxId -> {lockonId}.");
-                member.AttachLockonVfx(lockonId, persistent: false);
+                DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} NewLockonVfxIds -> [{string.Join(",", r.NewLockonVfxIds)}].");
+                foreach (var lockonId in r.NewLockonVfxIds)
+                    member.AttachLockonVfx(lockonId, persistent: false);
             }
         }
 
@@ -1716,7 +1753,15 @@ public sealed class MultiplayerManager : IDisposable
 
     private void OnEndReceived(EndMessage msg)
     {
-        if (IsHost || !running) return;
+        if (IsHost) return;
+        // Not gated on `running`: OnWorldSnapshotReceived spawns/tracks enemies for
+        // any non-host peer regardless of role or running state (e.g. a spectator who
+        // joined but never claimed a role -- see the MyClaimedRole check in
+        // OnStartReceived, which leaves running false for them for the whole run).
+        // That peer still has live snapshot-spawned doppels/enmity-list entries to
+        // tear down here; bailing on !running left them stuck on screen for exactly
+        // that case. The IsInInstance check below already safely no-ops this for a
+        // peer who hasn't actually entered the zone yet.
         DiagnosticLog.Info($"[Multiplayer] Peer received EndMessage (ReturnedToInn={msg.ReturnedToInn}).");
         running = false;
         StopDebugBotReplay();
@@ -1926,8 +1971,30 @@ public sealed class MultiplayerManager : IDisposable
 
     // ---- Message pump -------------------------------------------------------
 
-    private void OnMessageReceivedOffThread(MpMessage message)
-        => Plugin.Framework.Run(() => Dispatch(message));
+    // Ordering, not just marshalling onto the Framework thread, is why this exists.
+    // RelayClient.ReceiveLoopAsync invokes MessageReceived synchronously and
+    // sequentially, one message fully handled before the next ReceiveAsync -- so this
+    // enqueue always happens in true wire-arrival order. But firing a separate
+    // Plugin.Framework.Run(() => Dispatch(message)) per message (the old approach)
+    // does NOT preserve that order once queued: Dalamud's Framework.Run schedules
+    // onto ThreadBoundTaskScheduler, whose Run() iterates a ConcurrentDictionary of
+    // pending tasks -- not insertion order. Confirmed via AnoMech-DamageDebug dumps:
+    // a burst of MapEffectMessages sent host-side in order 1-8,0 (and by then
+    // already verified arriving wire-ordered peer-side, per RelayClient's own FIFO
+    // send queue) still executed out of order once each hit its own Framework.Run,
+    // scrambling a peer's replicated arena-color transition (P2 Forsaken's
+    // gold->black swap). Draining this queue once per Tick (already called
+    // unconditionally every frame from Plugin.OnFrameworkUpdate) sidesteps that
+    // scheduler entirely instead of fighting its ordering.
+    private readonly ConcurrentQueue<MpMessage> pendingMessages = new();
+
+    private void OnMessageReceivedOffThread(MpMessage message) => pendingMessages.Enqueue(message);
+
+    private void DrainPendingMessages()
+    {
+        while (pendingMessages.TryDequeue(out var message))
+            Dispatch(message);
+    }
 
     // `source` is the specific RelayClient instance this event came from --
     // compared against the current `relay` field so a stale event from a
@@ -1992,7 +2059,10 @@ public sealed class MultiplayerManager : IDisposable
         if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage
             or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage
             or AiReplayStateMessage or P2AiReplayStateMessage or P4AiReplayStateMessage or P5AiReplayStateMessage)
+        {
             lastHostMessageMs = Environment.TickCount64;
+            everHeardFromHost = true;
+        }
 
         switch (message)
         {
@@ -2081,15 +2151,16 @@ public sealed class MultiplayerManager : IDisposable
                 // Read the sender's name before LeaveSessionInternal wipes Session out from under it.
                 var who = Session.NameOf(ended.PeerId);
                 DiagnosticLog.Info($"[Multiplayer] Host {who} left -- session ending for the whole group.");
-                // IsInInstance guard: Leave() -> Unload() assumes a zone was
-                // actually entered (it restores the real character to the
-                // position ZoneSession.Enter() saved); running can briefly be
-                // true before a peer's deferred zone entry actually completes
-                // (and, on the host side, before RunScenarioAsHost's deferred
-                // work finishes), and calling it too early teleports the real
-                // character to garbage coordinates instead of reverting them
-                // cleanly.
-                if (running && Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
+                // IsInInstance guard, not running -- same reasoning as
+                // LeaveRequestMessage below: a Reset earlier in the session (e.g. the
+                // peer clicking Reset before the host later leaves) clears running
+                // while leaving the group stuck in-instance, so gating on running here
+                // would skip Leave() and strand this peer in-instance with no session
+                // left to recover through. IsInInstance is only ever true once a zone
+                // was genuinely entered (MapController.TryLoad), which is the actual
+                // precondition Leave() -> Unload() needs (it restores the real
+                // character to the position ZoneSession.Enter() saved).
+                if (Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
                 LeaveSessionInternal(notifyOthers: false);
                 SessionEndReason = $"{who} left -- session ended.";
                 LobbyChanged?.Invoke();
@@ -2141,12 +2212,18 @@ public sealed class MultiplayerManager : IDisposable
             // fire the same MapController events on a peer's own local call too,
             // but that peer's own handler is a no-op since IsHost is false there.
             case MapEffectMessage effect when !IsHost:
+                DiagnosticLog.Info($"[Multiplayer] Peer: applying MapEffect packetFlags=0x{effect.PacketFlags:X8} index=0x{effect.Index:X}.");
                 Plugin.GameInstance.World.Map.AddEffect(effect.PacketFlags, effect.Index);
                 break;
             case MapDirectorUpdateMessage directorUpdate when !IsHost:
+                DiagnosticLog.Info($"[Multiplayer] Peer: applying MapDirectorUpdate category=0x{directorUpdate.Category:X8}.");
                 Plugin.GameInstance.World.Map.DirectorUpdate(
                     directorUpdate.Category, directorUpdate.Arg1, directorUpdate.Arg2,
                     directorUpdate.Arg3, directorUpdate.Arg4, directorUpdate.Arg5, directorUpdate.Arg6);
+                break;
+            case SetWeatherMessage weather when !IsHost:
+                DiagnosticLog.Info($"[Multiplayer] Peer: applying SetWeather weatherId={weather.WeatherId} transition={weather.Transition}.");
+                Plugin.GameInstance.World.Map.SetWeather(weather.WeatherId, weather.Transition);
                 break;
             case P4AiReplayStateMessage p4State when !IsHost:
                 pendingP4AiReplayState = p4State;

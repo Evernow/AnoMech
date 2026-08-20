@@ -129,17 +129,32 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     // lockon markers (stack targets, mystery-magic cones, etc.) replicate to peers.
     // Every current call site in the codebase uses persistent: false (the AVFX
     // self-completes; nothing becomes a tracked SimVfx -- see AddVfx), so this is a
-    // fire-and-forget "last attached" marker, not an ongoing/removable state: peers
-    // re-fire AttachLockonVfx on this value changing, the same edge-triggered
-    // approach ModelState already uses, rather than a full add/remove reconcile like
-    // ActiveStatusSnapshot.
+    // fire-and-forget "last attached" marker, not an ongoing/removable state.
     public uint? LastLockonVfxId { get; private set; }
+
+    // Queue of lockon ids attached since the last DrainPendingLockonVfxIds call. A
+    // single "last value" field (LastLockonVfxId above) silently drops earlier calls
+    // when a scenario attaches more than one lockon to the same character in the same
+    // tick (e.g. P4 Kefka Says firing Blizzard+Lightning orbs together) -- the second
+    // call overwrites the first before any snapshot ever samples it, so a peer only
+    // ever sees whichever one happened to be called last. This queue accumulates every
+    // call between drains so MultiplayerManager can replicate all of them, not just one.
+    private readonly List<uint> pendingLockonVfxIds = [];
+
+    public IReadOnlyList<uint> DrainPendingLockonVfxIds()
+    {
+        if (pendingLockonVfxIds.Count == 0) return [];
+        var result = pendingLockonVfxIds.ToArray();
+        pendingLockonVfxIds.Clear();
+        return result;
+    }
 
     public void AttachLockonVfx(uint lockonId, float duration = 0f, bool persistent = true)
     {
         if (VfxFunctions.LockonVfxIconName(lockonId) is not {} iconName) return;
         AddVfx($"vfx/lockon/eff/{iconName}.avfx", duration, persistent);
         LastLockonVfxId = lockonId;
+        pendingLockonVfxIds.Add(lockonId);
     }
 
     public SimVfx? FindVfx(string path)

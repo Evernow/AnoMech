@@ -49,7 +49,27 @@ public sealed class AiManager
     // -- comfortably above RunSpeed, comfortably within reach of a sprint. If even
     // sprinting isn't enough, sprinting wouldn't help and just adds visual noise,
     // so that case still falls through to the plain "leave now, arrive late" path.
-    public void Move(float time, Func<IAiMove> positions, float jitter = DefaultJitter, float arrivalTime = 0f)
+    //
+    // `leaveImmediately` opts a caller out of the defer-until-the-last-moment
+    // part of that: the member still walks/sprints at whatever speed makes
+    // `arrivalTime`, but departs after LeaveImmediatelyDelay instead of standing
+    // frozen at the old spot until the last possible moment then dashing.
+    // Confirmed via dump: UMAD P2 Forsaken's tower reassignments have enough
+    // slack that the old default made bots visibly freeze for 5-6s then snap
+    // to the next spot in under a second. Off by default -- this only flips for
+    // P2 Forsaken's own Move calls so P3/P4/TOP's already-verified timing (where
+    // the deferred wait is presumably intentional/tuned) is untouched.
+    //
+    // The departure itself is delayed by LeaveImmediatelyDelay rather than fired
+    // in the same tick the event scheduler wakes: a peer-controlled role's
+    // Position (used by the host's own damage.Resolve, e.g. UmadP2Forsaken's
+    // AllThingsEnding cone check) comes from that peer's last broadcast pose
+    // snapshot, not a host-local simulation -- moving in the exact same frame an
+    // event fires risks the host resolving a cone/hitbox check against a stale
+    // pre-move snapshot for that role before its next pose broadcast lands.
+    private const float LeaveImmediatelyDelay = 0.3f;
+
+    public void Move(float time, Func<IAiMove> positions, float jitter = DefaultJitter, float arrivalTime = 0f, bool leaveImmediately = false)
     {
         world.Events.Add(time, () =>
         {
@@ -75,6 +95,13 @@ public sealed class AiManager
                         member.AddStatus(SprintStatusId, available, SprintStatusParam);
                         AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) sprinting -- {dist:F1}y in {available:F2}s needs {neededSpeed:F2}y/s.");
                         member.MoveTo(target, speed: SprintSpeed);
+                        continue;
+                    }
+
+                    if (leaveImmediately)
+                    {
+                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) leaving in {LeaveImmediatelyDelay:F2}s (arrive {arrivalTime:F1}).");
+                        world.Events.Add(LeaveImmediatelyDelay, () => member.MoveTo(target));
                         continue;
                     }
 

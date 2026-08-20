@@ -36,6 +36,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(P2LockonsUpdateMessage), "p2LockonsUpdate")]
 [JsonDerivedType(typeof(MapEffectMessage), "mapEffect")]
 [JsonDerivedType(typeof(MapDirectorUpdateMessage), "mapDirectorUpdate")]
+[JsonDerivedType(typeof(SetWeatherMessage), "setWeather")]
 [JsonDerivedType(typeof(P4AiReplayStateMessage), "p4AiReplayState")]
 [JsonDerivedType(typeof(P5AiReplayStateMessage), "p5AiReplayState")]
 public abstract record MpMessage;
@@ -168,7 +169,7 @@ public sealed record EnemyState(
     int NetId, uint BNpcBaseId, uint NameId, byte Level, bool Targetable,
     EnemyListMode EnemyList, uint ModelCharaId, float Scale, float HitboxRadius,
     byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
-    IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, uint? LastLockonVfxId,
+    IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, IReadOnlyList<uint> NewLockonVfxIds,
     float X, float Y, float Z, float Rotation,
     bool IsCasting, uint CastActionId, float CastSeconds, float CastOmenDelay,
     float? CastTargetX, float? CastTargetY, float? CastTargetZ,
@@ -182,18 +183,18 @@ public sealed record EnemyState(
 // it gets the real VFX plumbing, not a fake beam.
 public sealed record TetherState(int NetId, ushort TetherId, int? AEnemyNetId, PartyRole? ARole, int? BEnemyNetId, PartyRole? BRole);
 
-// Statuses/LastLockonVfxId mirror EnemyState's own fields, same reasoning -- a
+// Statuses/NewLockonVfxIds mirror EnemyState's own fields, same reasoning -- a
 // scenario's AddStatus/RemoveStatus/AttachLockonVfx calls against a party-role
 // member (First/Second/Third In Line, Primordial Crust, Accretion, stack
 // markers, etc.) are exactly as local/unreplicated-by-default as they are for
 // an enemy. Unlike X/Y/Z/Rotation (self-authoritative for whichever role a
 // given peer has claimed -- see OnWorldSnapshotReceived), Statuses/
-// LastLockonVfxId are NOT self-authoritative even for a peer's own claimed
+// NewLockonVfxIds are NOT self-authoritative even for a peer's own claimed
 // role: peers never run any scenario logic at all, so nothing else would ever
 // call AddStatus/AttachLockonVfx against a peer's own real character.
 public sealed record RoleState(
     PartyRole Role, bool Filled, bool Dead, float X, float Y, float Z, float Rotation,
-    IReadOnlyList<EnemyStatusState> Statuses, uint? LastLockonVfxId);
+    IReadOnlyList<EnemyStatusState> Statuses, IReadOnlyList<uint> NewLockonVfxIds);
 
 // One SimEventObject (or SimTower, a subclass) as host currently has it. NetId
 // mirrors EnemyState.NetId -- a host-assigned, per-run stable id used only to
@@ -343,6 +344,11 @@ public sealed record P2LockonsUpdateMessage(Dictionary<PartyRole, uint> Lockons)
 public sealed record MapEffectMessage(uint PacketFlags, byte Index) : MpMessage;
 public sealed record MapDirectorUpdateMessage(
     uint Category, uint Arg1, uint Arg2, uint Arg3, uint Arg4, uint Arg5, uint Arg6) : MpMessage;
+
+// Pure replay of a host-side world.SetWeather call (see MapController.WeatherChanged) --
+// scenarios use this mid-fight for arena-transform lighting cues, not just initial spawn
+// weather, so a peer needs the exact same call a host/solo run would make.
+public sealed record SetWeatherMessage(byte WeatherId, float Transition) : MpMessage;
 
 // P4 Kefka Says' version of AiReplayStateMessage above -- same purpose/timing.
 // Carries only the subset UmadP4KefkaSaysAi actually reads (see

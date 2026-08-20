@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
@@ -149,6 +150,9 @@ public sealed class UmadP4KefkaSaysScenario : IScenario
     {
         var player = party.Player;
         if (player == null || !player.IsAlive()) return;
+        // Unconditional so a survival shows up in the dump too -- otherwise there's
+        // no way to tell "the fix worked" from "this run's bomb never resolved".
+        DiagnosticLog.Info($"[AccelerationBomb] real={real} IsActing={player.IsActing} IsMoving={player.IsMoving} role={player.Role} pos=({player.Position.X:F1},{player.Position.Z:F1}).");
         // real (honest) -> must be still, die if acting; fake (lie) -> must move, die if still.
         if (real ? player.IsActing : !player.IsActing)
             player.Die(real ? "Moved during Acceleration Bomb"

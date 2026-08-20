@@ -92,8 +92,25 @@ public class MultiplayerWindow : Window, IDisposable
         // connect form, which would look like they'd been kicked out entirely.
         if (mp.SessionCode == null)
             DrawConnectPanel();
+        // SessionCode alone doesn't mean a host actually exists on the other end --
+        // it's set synchronously on JoinSession, before any real confirmation. Without
+        // this, a joiner briefly sees the full role-list lobby for a mistyped/dead
+        // session code before MultiplayerManager's IsSessionNotFound timeout (several
+        // seconds later) kicks them back out -- looking, for that window, like a real
+        // session they're free to interact with.
+        else if (!mp.IsHost && !mp.EverHeardFromHost)
+            DrawJoiningPanel();
         else
             DrawConnectedPanel();
+    }
+
+    private void DrawJoiningPanel()
+    {
+        ImGui.TextUnformatted($"Connecting to session {mp.SessionCode}...");
+        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "Waiting for the host to respond.");
+        ImGui.Spacing();
+        if (ImGui.Button("Cancel"))
+            mp.LeaveSession();
     }
 
     // No relay is baked into the plugin -- every group runs its own (see

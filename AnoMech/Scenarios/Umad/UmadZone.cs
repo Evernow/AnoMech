@@ -21,7 +21,19 @@ public sealed class UmadZone : IZone
     public IReadOnlyList<WaymarkLayout> WaymarkPresets => Waymarks;
     public IReadOnlyList<Vector3> ColliderRemovalPoints => [new(0f, 0f, -10f)];
 
-    public void Run(SimWorld world) => UmadReplayData.Seed();
+    // Nothing host-only needed here -- all of Umad's zone setup is the client-asset
+    // seeding below, which peers need too. See RunClientSetup.
+    public void Run(SimWorld world) { }
+
+    // Replay-derived RSV/RSF data (action/status text, resource file paths) that a real
+    // duty's server would deliver automatically -- since scenarios run inn-only, the
+    // server never sends it, so each client has to seed it locally. Previously only ran
+    // via Run() (host/solo only), which left a peer's own client without these resource
+    // paths: their SharedGroup/BgPart objects could report HavePrimary/IsPrimaryLoaded/
+    // IsActive all True (the object itself loaded fine) while pointing at an unseeded
+    // RSV-tokenized path that resolves to nothing -- rendering black despite every
+    // engine-level readiness check passing. Idempotent; safe to call every run.
+    public void RunClientSetup(SimWorld world) => UmadReplayData.Seed();
 
     private static void InitP5Arena(SimWorld world) => world.Events.Add(1f, () =>
     {

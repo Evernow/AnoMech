@@ -18,6 +18,7 @@ public unsafe class SimNpc : SimCharacter
 
     private int index;
     private bool pendingDraw;
+    private int pendingDrawFrames;
 
     private protected override Movement Movement => field ??= new Movement(this);
     
@@ -74,7 +75,7 @@ public unsafe class SimNpc : SimCharacter
     // pendingDraw path (the rebuild is async, gated on IsReadyToDraw). Only cycles draw when
     // the model is currently drawn: a hidden NPC keeps the written flags and applies them on
     // its next EnableDraw from the visibility system, so we never force it visible.
-    private void ReloadModel()
+    protected void ReloadModel()
     {
         var obj = BattleCharaPtr;
         if (obj == null) return;
@@ -100,11 +101,25 @@ public unsafe class SimNpc : SimCharacter
         if (pendingDraw)
         {
             var obj = BattleCharaPtr;
-            if (obj == null) { pendingDraw = false; }
+            if (obj == null)
+            {
+                pendingDraw = false;
+            }
             else if (obj->IsReadyToDraw())
             {
                 obj->EnableDraw();
                 pendingDraw = false;
+                DiagnosticLog.Info($"[SimNpc] EnableDraw fired for goid {obj->GetGameObjectId()} at pos {Position}.");
+            }
+            else
+            {
+                pendingDrawFrames++;
+                // Only once, well past the point a normal model load should have
+                // resolved -- catches an IsReadyToDraw() that's stuck permanently
+                // false (e.g. a peer's early-reconstructed doppel) without spamming
+                // every frame in between.
+                if (pendingDrawFrames == 300)
+                    DiagnosticLog.Warn($"[SimNpc] still pendingDraw after {pendingDrawFrames} ticks, goid {obj->GetGameObjectId()} -- IsReadyToDraw() never returned true.");
             }
         }
     }

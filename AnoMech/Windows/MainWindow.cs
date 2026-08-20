@@ -169,14 +169,22 @@ public unsafe class MainWindow : Window, IDisposable
             {
                 if (!ImGui.CollapsingHeader(zone.Name, ImGuiTreeNodeFlags.DefaultOpen)) continue;
                 ImGui.Indent();
+                var mpWindowOpen = plugin.MultiplayerWindow.IsOpen;
+                var mpConnected = plugin.Multiplayer.IsConnected;
                 foreach (var phase in plugin.Game.PhasesOf(zone))
                     foreach (var scenario in plugin.Game.ScenariosOf(phase))
                     {
                         var selected = _selectedScenario == scenario;
+                        var mpUnsupported = (mpWindowOpen || mpConnected)
+                            && !MultiplayerManager.SupportedScenarios.Contains(scenario.GetType());
                         if (selected) ImGui.PushStyleColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive));
                         ImGui.PushID(scenario.Name);
+                        ImGui.BeginDisabled(mpUnsupported);
                         if (ImGui.Button(DisplayName(scenario), new Vector2(-1, 0)))
                             SelectScenario(scenario);
+                        ImGui.EndDisabled();
+                        if (mpUnsupported && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                            ImGui.SetTooltip($"This scenario doesn't support multiplayer. {MpDisabledReason(mpWindowOpen, mpConnected)}");
                         ImGui.PopID();
                         if (selected) ImGui.PopStyleColor();
                     }
@@ -198,6 +206,17 @@ public unsafe class MainWindow : Window, IDisposable
         // Restore the last region picked for this scenario; null self-heals to its first region when drawn.
         _selectedStratGroup = _stratGroupMemory.GetValueOrDefault(scenario);
     }
+
+    // Explains a control disabled for multiplayer reasons -- shared by every BeginDisabled
+    // site keyed on the Multiplayer window being open and/or an active connection, so the
+    // wording (and which of the two actually applies) stays consistent everywhere it appears.
+    private static string MpDisabledReason(bool windowOpen, bool connected) => (windowOpen, connected) switch
+    {
+        (true, true) => "Disabled: the Multiplayer window is open and you're connected to a multiplayer session.",
+        (true, false) => "Disabled while the Multiplayer window is open.",
+        (false, true) => "Disabled while connected to a multiplayer session.",
+        _ => "",
+    };
 
     // Distinct, ordered region labels from the strats' IScenarioAi.Group; empty = ungrouped.
     private static IReadOnlyList<string> StratGroups(IScenario scenario)
@@ -227,8 +246,40 @@ public unsafe class MainWindow : Window, IDisposable
         ImGui.Separator();
         DrawLocationHint();
 
+        // Role is claimed via the Multiplayer window's own buttons once connected, not this
+        // selector (which picks which slot the real player occupies in solo play) -- disabled
+        // for host and guest alike so it can't drift out of sync with the actual claim. Forced
+        // back to Auto (not just disabled) so a role picked before connecting can't silently
+        // keep applying underneath the real multiplayer role claim.
+        var mpConnectedForRole = plugin.Multiplayer.IsConnected;
+        if (mpConnectedForRole) _roleOverride = null;
+        ImGui.BeginDisabled(mpConnectedForRole);
+        ImGui.BeginGroup();
         DrawRoleSelector();
+        ImGui.EndGroup();
+        ImGui.EndDisabled();
+        if (mpConnectedForRole && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("Role is claimed via the Multiplayer window instead. " + MpDisabledReason(false, true));
+
+        // Region/strat only matter as the HOST's choice -- that's what gets broadcast and
+        // actually run (see MultiplayerManager.StartScenario). A guest's own local selection
+        // here does nothing but could confuse them into thinking they're choosing something.
+        // Forced back to the first region/strat (same defaults SelectScenario sets) rather than
+        // just disabled, so a guest's dropdown doesn't sit frozen on whatever they'd picked
+        // right before someone else started the run.
+        var mpGuest = plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost;
+        if (mpGuest)
+        {
+            _selectedStrat = 0;
+            _selectedStratGroup = null;
+        }
+        ImGui.BeginDisabled(mpGuest);
+        ImGui.BeginGroup();
         DrawStratSelector();
+        ImGui.EndGroup();
+        ImGui.EndDisabled();
+        if (mpGuest && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("Only the host's selection is used in multiplayer. " + MpDisabledReason(false, true));
         DrawWaymarkSelector();
 
         var inInn = ZoneSession.IsInInn();
@@ -303,22 +354,49 @@ public unsafe class MainWindow : Window, IDisposable
             }
         }
 
+        // God mode, the speed toggle, and Scenario config all tune solo-play behavior that a
+        // multiplayer session doesn't use (see MultiplayerManager.StartScenario/RunScenarioAsHost)
+        // -- disabled both while setting up a session (Multiplayer window open) and once one's
+        // actually live (IsConnected), not just one or the other.
+        var mpWindowOpen = plugin.MultiplayerWindow.IsOpen;
+        var mpConnected = plugin.Multiplayer.IsConnected;
+        var mpActive = mpWindowOpen || mpConnected;
+        // Forced to its default (not just disabled) so a value left on from before the
+        // Multiplayer window opened / a session connected can't keep silently applying.
+        if (mpActive) game.GodMode = false;
+        ImGui.BeginDisabled(mpActive);
         var god = game.GodMode;
         if (ImGui.Checkbox("God mode", ref god)) game.GodMode = god;
+        ImGui.EndDisabled();
+        if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
 
 #if DEBUG
+        if (mpActive) game.EventTimeScale = 1f;
+        ImGui.BeginDisabled(mpActive);
+        ImGui.BeginGroup();
         debugMenu.DrawSpeedControl();
+        ImGui.EndGroup();
+        ImGui.EndDisabled();
+        if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
 #endif
 
         if (game.Paused) ImGui.TextDisabled("(scenario paused — press Reset to clear)");
 
         ImGui.Spacing();
+        ImGui.BeginDisabled(mpActive);
+        ImGui.BeginGroup();
         if (ImGui.CollapsingHeader("Scenario config", ImGuiTreeNodeFlags.DefaultOpen))
         {
             ImGui.Indent();
             _selectedScenario.DrawSettings();
             ImGui.Unindent();
         }
+        ImGui.EndGroup();
+        ImGui.EndDisabled();
+        if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
 
 #if DEBUG
         ImGui.Spacing();

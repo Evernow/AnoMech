@@ -190,6 +190,15 @@ public sealed class Game : IDisposable
             return;
         }
 
+#if DEBUG
+        // Cleared here (not just inside scenario.Run, which peers skip below) so a
+        // peer's own diagnostic dump starts fresh per run too, same as the host's.
+        // Must run before TryLoad below -- TryLoad logs freshLoad, and that line is
+        // exactly what distinguishes a real zone reload from a reused (possibly
+        // stale-SGB) one, so it needs to survive into the dump.
+        AnoMech.Core.DiagnosticLog.Clear();
+#endif
+
         // Captured before TryLoad: false only on the first start from the inn (a true
         // zone entry), true for any restart/switch within the already-loaded zone.
         var freshLoad = !World.Map.IsZoneLoaded;
@@ -202,11 +211,9 @@ public sealed class Game : IDisposable
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
         World.PlaceWaymarks(ResolveWaymarks(zone, selectedWaymark));
         World.CreateParty(player.ClassJob.RowId, roleOverride, solo, networkRoles);
-#if DEBUG
-        // Cleared here (not just inside scenario.Run, which peers skip below) so a
-        // peer's own diagnostic dump starts fresh per run too, same as the host's.
-        AnoMech.Core.DiagnosticLog.Clear();
-#endif
+        // Client-asset setup (e.g. Umad's replay-derived RSV/RSF resource paths) a peer's
+        // own client needs just as much as the host's -- see IZone.RunClientSetup.
+        zone.RunClientSetup(World);
         // A peer runs no scenario logic at all (no RNG, AI, or DamageSolver) — its
         // arena boundary, boss timeline, and mechanic resolution all come from the
         // host via WorldSnapshot/RoleKilled instead. zone.Run creates the

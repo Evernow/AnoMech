@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using AnoMech.Core;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.SimObjects;
 
@@ -58,7 +59,11 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
         ai.Move(88f, () => StrayFlames(state.InfernoMystery), jitter: 0.5f, arrivalTime: 92f);
 
         // Elemental wave 2 (~96.5s) folded into Mystery[3]'s Blizzard-safe wedges (~97.4s).
-        ai.Move(92.5f, () => ResolveElementsUnderBlizzard(state.ElemRoles[1], state.ElemTrue[1], state.Mystery[3]), arrivalTime: 96.3f);
+        // Arrival pulled in from 96.3 to 96.0: still comfortably ahead of both the
+        // elemental resolve (~96.5) and the cones (~97.4), but that 0.3s also happens
+        // to clear an Acceleration Bomb resolve at 96.28 (see
+        // ScheduleAccelerationBombDodge) that would otherwise land mid-flight here.
+        ai.Move(92.5f, () => ResolveElementsUnderBlizzard(state.ElemRoles[1], state.ElemTrue[1], state.Mystery[3]), arrivalTime: 96.0f);
 
         // Wave2 Death Shriek (~104.4s): a pure positioning+facing solve in the middle,
         // nothing else live. Position the pair, then nudge to set the gaze facing.
@@ -70,6 +75,58 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
         // (in for the real Donut / out for the fake Chariot) and solves Mystery[4].
         ai.Move(106f, () => Stack(new Vector2(0f, 0f)), jitter: 0.8f, arrivalTime: 109.5f);
         ai.Move(111f, () => StraySprayAndMystery(state.TsunamiMystery, state.Mystery[4]), jitter: 0.3f, arrivalTime: 114.5f);
+
+        ScheduleAccelerationBombDodge(state, world);
+    }
+
+    // Acceleration Bomb (UmadP4KefkaSaysScenario.ResolveAccelerationBomb) checks
+    // party.Player.IsActing at one single scheduled instant -- itself now correctly
+    // fed by an in-flight debug-bot MoveTo (see SimPlayer.IsMoving), but nothing in
+    // this file's general choreography is guaranteed to be moving (or not) at that
+    // exact moment for whichever specific role happens to be party.Player. Mirrors
+    // the scenario's own branch selection exactly (same wave/slot -> resolve-time
+    // mapping, same real/fake source) since only one of the four ever actually
+    // applies per run.
+    //
+    // Fake (must move): a deliberate, tiny, slow in-place wiggle -- not a real
+    // relocation -- so it can't cross into whatever hazard boundary another
+    // mechanic resolving in the same window depends on. 0.3y at 0.4y/s takes 0.75s;
+    // fired 0.6s before the resolve instant, that's still in flight until 0.15s
+    // after it, comfortably bracketing the check with margin either side.
+    //
+    // Real (must stand still): needs no action here for any of the four possible
+    // resolve times -- 71.28/71.36 fall in the dead gap between the wave-1 element
+    // move (arrives 70.5) and the gaze move (fires 72), and 96.28/96.36 are now
+    // clear of the wave-2 element move's own in-flight window since its arrival
+    // above was pulled in to 96.0.
+    private static void ScheduleAccelerationBombDodge(UmadP4KefkaSaysState state, SimWorld world)
+    {
+        var role = world.Party.PlayerRole;
+        var w1 = Array.IndexOf(state.Wave1.List, role) % 4;
+        var w2 = Array.IndexOf(state.Wave2.List, role) % 4;
+
+        (float resolveTime, bool real)? bomb =
+            w2 == 0 ? (96.28f, state.Wave2True) :
+            w2 == 1 ? (71.28f, state.Wave2True) :
+            w1 == 0 ? (71.36f, state.Wave1True) :
+            w1 == 1 ? (96.36f, state.Wave1True) :
+            null;
+
+        DiagnosticLog.Info($"[AccelerationBombDodge] role={role} w1={w1} w2={w2} bomb={(bomb is { } b ? $"resolve={b.resolveTime:F2} real={b.real}" : "none")}.");
+
+        if (bomb is not ({ } resolveTime, false)) return; // no bomb this run, or a real one -- already handled
+
+        world.Events.Add(resolveTime - 0.6f, () =>
+        {
+            var member = world.Party.Get(role);
+            if (member == null || !member.IsAlive())
+            {
+                DiagnosticLog.Info($"[AccelerationBombDodge] wiggle skipped (member null or dead) at scheduled t={resolveTime - 0.6f:F2}.");
+                return;
+            }
+            DiagnosticLog.Info($"[AccelerationBombDodge] wiggle firing at t={resolveTime - 0.6f:F2} (resolve at {resolveTime:F2}) from ({member.Position.X:F1},{member.Position.Z:F1}).");
+            member.MoveTo(member.Position + new Vector3(0.3f, 0f, 0f), speed: 0.4f);
+        });
     }
 
     // The two gaze sources (Wave1[0]/Wave1[4]) stack 0.5y apart and opposite, just off

@@ -4,9 +4,12 @@ using AnoMech.Pointers;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
+using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
+using FFXIVClientStructs.FFXIV.Client.System.Resource.Handle;
 using Lumina.Excel.Sheets;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 
 namespace AnoMech.Core.SimObjects;
@@ -162,10 +165,23 @@ public sealed unsafe class SimEnemy : SimNpc
     // state; Tick's reconciler fires EnableDraw/DisableDraw once per change, gated on
     // IsReadyToDraw so toggles can't race the async model load. RenderFlags writes
     // were tried and don't reliably keep enemies visible — only this path does.
-    // currentVisible starts true because base SimNpc.Tick fires the initial EnableDraw.
-    // FIXME: this is not valid, but good enough i guess
+    // currentVisible starts true only as a label for "spawned visible"; ReconcileVisibility
+    // always performs one explicit native write on the first tick regardless, since that
+    // starting value was never a verified read of the actual DrawObject flag.
     private bool desiredVisible = true;
     private bool currentVisible = true;
+    private bool loggedInitialVisibility;
+
+    // Diagnostic-only: EnableDraw/DrawObject.IsVisible only gate the draw object itself,
+    // not whether CharacterBase's per-slot equipment/body models finished streaming in --
+    // a peer's reconstructed doppel was observed rendering weapon/shadow/VFX but never the
+    // body, with both of the above already confirmed correct. Logs CharacterBase's
+    // HasModelInSlotLoaded bitmask (temporary during load, 0 once every slot is done) and
+    // each slot's Models[] pointer, once shortly after spawn and once a few seconds later,
+    // to see whether a slot is genuinely stuck rather than just slow.
+    private int slotCheckFrames;
+    private bool slotCheckDone;
+    private bool slotReloadAttempted;
 
     public uint BNpcBaseId { get; }
 
@@ -320,7 +336,11 @@ public sealed unsafe class SimEnemy : SimNpc
         if (config.NameId != 0) chara->NameId = config.NameId;
         if (config.Level != 0) chara->Level = config.Level;
 
-        Plugin.Log.Info($"SimEnemy: spawned BNpcBase {config.BNpcBaseId} (ModelChara {bnpc.ModelChara.RowId}, scale {bnpc.Scale}) at index {idx}, goid {gameObj->GetGameObjectId()}, pos {config.Placement.Position}, visible {config.IsVisible}");
+        // Was Plugin.Log.Info (invisible in dumps) -- upgraded plus the actually-resolved
+        // values (not just the BNpcBase sheet defaults) so a host/guest dump pair can be
+        // diffed directly for a config mismatch, e.g. a peer resolving a different
+        // modelCharaId/scale/skeleton than the host used for the same enemy.
+        DiagnosticLog.Info($"[SimEnemy.Spawn] BNpcBase {config.BNpcBaseId}: resolved modelCharaId={modelCharaId} (sheet default {bnpc.ModelChara.RowId}), scale={scale} (sheet default {bnpc.Scale}), hitboxRadius={chara->HitboxRadius} (nativeHitbox={nativeHitbox}), modelChara.Type={modelChara.Type}, ModelSkeletonId={chara->ModelContainer.ModelSkeletonId}, ModeAttributeFlags=0x{chara->ModelContainer.ModeAttributeFlags:X2} -- at index {idx}, goid {gameObj->GetGameObjectId()}, pos {config.Placement.Position}, visible {config.IsVisible}.");
         var enemy = new SimEnemy(idx, config.BNpcBaseId, displayName, config.EnemyList, world.Coordinates)
         {
             SpawnConfig = config,
@@ -434,7 +454,24 @@ public sealed unsafe class SimEnemy : SimNpc
 
     private void ReconcileVisibility()
     {
-        if (desiredVisible == currentVisible)
+        var firstTick = !loggedInitialVisibility;
+        if (firstTick)
+        {
+            loggedInitialVisibility = true;
+            var chara = BattleCharaPtr;
+            DiagnosticLog.Info($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId}) first tick: desiredVisible={desiredVisible} currentVisible={currentVisible} DrawObject={(chara == null ? "no BattleChara" : chara->DrawObject == null ? "null" : "present")}.");
+        }
+
+        // currentVisible defaulting true was only an assumption that the initial
+        // EnableDraw (base SimNpc.Tick) leaves the native DrawObject visible -- observed
+        // false for a peer's reconstructed doppel (host's own boss rendered fine,
+        // identical config, same IsVisible: true from spawn) even though our own
+        // desiredVisible/currentVisible already agreed, so ReconcileVisibility never
+        // wrote the native flag at all. Forcing one explicit write on the first tick,
+        // regardless of that agreement, closes the gap without touching the
+        // already-correct explicit-reveal case (spawn IsVisible: false, SetVisible(true)
+        // later) that exercised this write path before and masked the bug.
+        if (!firstTick && desiredVisible == currentVisible)
         {
             return;
         }
@@ -453,7 +490,7 @@ public sealed unsafe class SimEnemy : SimNpc
         // once, only one of which is the actual scaled-up model) -- without a stable ID
         // here, two independent machines' logs can't be matched up to confirm they're
         // even talking about the same enemy.
-        Plugin.Log.Debug($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId})'s visibility was set to {desiredVisible} at pos {Position}");
+        DiagnosticLog.Info($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId})'s visibility was set to {desiredVisible} at pos {Position}");
     }
 
     // Authoritative draw state (DrawObject.Flags bits 0 and 3, set by Enable/DisableDraw).
@@ -496,6 +533,81 @@ public sealed unsafe class SimEnemy : SimNpc
         ReconcileVisibility();
         cast.Tick(deltaSeconds);
         TickNetworkPosition(deltaSeconds);
+
+        if (!slotCheckDone && desiredVisible)
+        {
+            slotCheckFrames++;
+            if (slotCheckFrames == 1) LogModelSlotState("+1 frame");
+            else if (slotCheckFrames == 5) LogModelSlotState("+5 frames");
+            else if (slotCheckFrames == 210)
+            {
+                var anyStuck = LogModelSlotState("+210 frames (~3.5s)");
+                // A stuck slot here means the load attempt already gave up (HasModelInSlotLoaded
+                // cleared to 0) without ever populating Models[] -- confirmed via local
+                // FFXIVClientStructs source, this is a failed load, not just a slow one, so
+                // waiting longer won't help. ReloadModel's DisableDraw->pendingDraw->EnableDraw
+                // cycle is the same mechanism SetModeAttributeFlags already uses to force a full
+                // sub-mesh rebuild; retried once here to give the slot a second load attempt.
+                if (anyStuck && !slotReloadAttempted)
+                {
+                    slotReloadAttempted = true;
+                    DiagnosticLog.Warn($"[SimEnemy] {DisplayName} (goid {GameObjectId}) has a model slot stuck unloaded after 3.5s -- forcing one ReloadModel retry.");
+                    ReloadModel();
+                    slotCheckFrames = 0;
+                }
+                else
+                {
+                    slotCheckDone = true;
+                }
+            }
+        }
+    }
+
+    // Returns true if any slot is still unloaded.
+    private unsafe bool LogModelSlotState(string label)
+    {
+        var chara = BattleCharaPtr;
+        if (chara == null) return false;
+        var draw = (CharacterBase*)chara->DrawObject;
+        if (draw == null)
+        {
+            DiagnosticLog.Info($"[SimEnemy.LogModelSlotState] {DisplayName} (goid {GameObjectId}) {label}: DrawObject null.");
+            return false;
+        }
+        var slotLoaded = Enumerable.Range(0, draw->SlotCount).Select(i => draw->ModelsSpan[i].Value != null).ToList();
+        var slots = string.Join(",", slotLoaded.Select((loaded, i) => loaded ? $"{i}:loaded" : $"{i}:null"));
+        DiagnosticLog.Info($"[SimEnemy.LogModelSlotState] {DisplayName} (goid {GameObjectId}) {label}: SlotCount={draw->SlotCount} HasModelInSlotLoaded=0x{draw->HasModelInSlotLoaded:X} HasModelFilesInSlotLoaded=0x{draw->HasModelFilesInSlotLoaded:X} slots=[{slots}].");
+
+        // Deeper than Models[]/HasModelInSlotLoaded: PerSlotStagingArea is the actual
+        // in-progress load record (staging.Flags/ModelResourceHandle), and the resource
+        // handle it points at carries the real file path being loaded plus the native
+        // engine's own LoadState/ReadState/LastIOResult -- this is what actually tells us
+        // WHERE in the pipeline a stuck slot stopped (never requested vs. requested but the
+        // read/IO never finished vs. read finished but never committed to Models[]), rather
+        // than just that it's stuck. ResolveMdlPath gives the path the engine intends to use
+        // for the slot, independent of whether a load was ever kicked off for it.
+        for (var i = 0; i < draw->SlotCount; i++)
+        {
+            string resolvedPath;
+            try { resolvedPath = draw->ResolveMdlPath((uint)i); }
+            catch (Exception ex) { resolvedPath = $"<ResolveMdlPath threw: {ex.Message}>"; }
+
+            if (draw->PerSlotStagingArea == null)
+            {
+                DiagnosticLog.Info($"[SimEnemy.LogModelSlotState] {DisplayName} slot {i} {label}: PerSlotStagingArea=null, ResolveMdlPath={resolvedPath}.");
+                continue;
+            }
+            var staging = draw->PerSlotStagingArea[i];
+            if (staging.ModelResourceHandle == null)
+            {
+                DiagnosticLog.Info($"[SimEnemy.LogModelSlotState] {DisplayName} slot {i} {label}: staging.Flags={staging.Flags}, ModelResourceHandle=null, ResolveMdlPath={resolvedPath}.");
+                continue;
+            }
+            var rh = (ResourceHandle*)staging.ModelResourceHandle;
+            DiagnosticLog.Info($"[SimEnemy.LogModelSlotState] {DisplayName} slot {i} {label}: staging.Flags={staging.Flags}, handle.FileName=\"{rh->FileName}\", LoadState={rh->LoadState}, ReadState={rh->ReadState}, OtherState={rh->OtherState}, LastIOResult={rh->LastIOResult}, RefCount={rh->RefCount}, ResolveMdlPath={resolvedPath}.");
+        }
+
+        return slotLoaded.Any(loaded => !loaded);
     }
 
     public CharacterFind<T> Find<T>(List<T> targets) where T : IPositioned

@@ -36,7 +36,15 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
 
         ai.Move(7f, StackCentreTanksHoldBossesCentred);
         ai.Move(11f, StackCentre);
-        ai.Move(18f, () => DodgeSlap(slapIndex: 0, kefkaIndex: 0), arrivalTime: 24.81f);
+        // No arrivalTime here, unlike the wave-2 DodgeSlap/DodgeImplosion sequence below --
+        // that pattern only works when each of a wave's staggered resolves gets its own
+        // Move call with a matching arrivalTime (see the wave-2 comment). RunSlapAttack's
+        // first wave has FOUR staggered resolves (rows at 22.14/22.79/23.44, then
+        // SlapHappy_FinalSlap ~24.75) funneled through this single Move call; giving it only
+        // the last one as arrivalTime made AiManager defer the walk past the first two rows,
+        // wiping the party on them. Moving immediately, like before arrivalTime was added
+        // here, is safe for all four since DodgeSlap's target holds through the whole wave.
+        ai.Move(18f, () => DodgeSlap(slapIndex: 0, kefkaIndex: 0));
         ai.Move(26f, StackCentre);
         world.Events.Add(26.2f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
         world.Events.Add(28.2f, () => PullTether(playerIndex: 4));
@@ -47,7 +55,11 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         ai.GiveInvuln(38f, PartyRole.OffTank);
         ai.Move(40.5f, ResolveFirstThunder);
         ai.Move(46.5f, DodgeEdict);
-        ai.Move(50.6f, () => DodgeSlap(slapIndex: 1, kefkaIndex: 1), arrivalTime: 55.26f);
+        // Same reasoning as the wave-1 DodgeSlap above -- RunSlapAttack's second wave also
+        // has four staggered resolves (rows at 52.59/53.24/53.89, FinalSlap ~55.21) behind
+        // this one Move call, so arrivalTime matching only the last of them deferred the
+        // walk past the first two rows the same way.
+        ai.Move(50.6f, () => DodgeSlap(slapIndex: 1, kefkaIndex: 1));
         ai.Move(56f, StackCentre);
         world.Events.Add(58.1f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
         world.Events.Add(58.1f, () => GrabTether(tetherIndex: 1, playerIndex: 0));

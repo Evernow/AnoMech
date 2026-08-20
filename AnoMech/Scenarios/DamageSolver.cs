@@ -42,6 +42,27 @@ public class DamageSolver
         DiagnosticLog.Info(
             $"[DamageSolver] Resolve: {ActionLookup.Name(actionId)} from ({placement.Position.X:F1},{placement.Position.Z:F1}) rot={placement.Rotation:F3} -- {targets.Count} target(s): "
             + string.Join(", ", targets.Select(t => (t as ISimPartyMember)?.Role.ToString() ?? "?")));
+        // Cone-shaped resolves (e.g. AllThingsEndHalfCone) only tell you who got hit --
+        // for a mostly-stacked group where a few survive and a few don't, that's not
+        // enough to tell whether a near-miss was a positioning bug or just an unlucky
+        // cone edge. Mirrors InsideCone's own cos-vs-cosHalf check so this is directly
+        // comparable to what actually decided each member's fate, not a separate guess.
+        if (size is { } halfAngle)
+        {
+            var forwardX = MathF.Sin(placement.Rotation);
+            var forwardZ = MathF.Cos(placement.Rotation);
+            var cosHalf = MathF.Cos(halfAngle);
+            var detail = string.Join(", ", party.ActiveMembers().Select(m =>
+            {
+                var dx = m.Position.X - placement.Position.X;
+                var dz = m.Position.Z - placement.Position.Z;
+                var dist = MathF.Sqrt(dx * dx + dz * dz);
+                var cos = dist < 0.01f ? 1f : (dx * forwardX + dz * forwardZ) / dist;
+                var role = (m as ISimPartyMember)?.Role.ToString() ?? "?";
+                return $"{role}@({m.Position.X:F1},{m.Position.Z:F1}) dist={dist:F1} cos={cos:F2}{(cos >= cosHalf ? " IN" : "")}";
+            }));
+            DiagnosticLog.Info($"[DamageSolver] Cone geometry (halfAngle={halfAngle:F2} cosHalf={cosHalf:F2}): {detail}");
+        }
         List<SimCharacter> deadTargets = [];
         if (excludeTargets is { Length: > 0 })
             targets = targets.Where(t => !excludeTargets.Contains(t)).ToList();

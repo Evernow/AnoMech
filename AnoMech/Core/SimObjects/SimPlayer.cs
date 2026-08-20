@@ -32,10 +32,13 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
 
     // Player activity for stillness/movement mechanics (e.g. Pyretic, Acceleration Bomb).
     // IsMoving = locomotion input (the engine's own RMIWalk movement sample, the same signal
-    // bossmod keys off) OR jumping OR using any action — all three "break" a don't-move mechanic
-    // in real FFXIV, so all three count here. IsActing = IsMoving OR auto-attacking, i.e. the
-    // strictly-broader "is the player doing something" trigger. Both are re-sampled each tick and
-    // forced false while KO'd. Scenarios read these on Party.Player at the mechanic's resolve time.
+    // bossmod keys off) OR jumping OR using any action OR an in-flight debug-bot MoveTo
+    // (Movement.IsMoving, set by PlayerMovement.MoveTo only while DebugBotControl.Enabled --
+    // a no-op otherwise, so this is inert for real play) -- these "break" a don't-move mechanic
+    // in real FFXIV (or its bot-driven stand-in), so all count here. IsActing = IsMoving OR
+    // auto-attacking, i.e. the strictly-broader "is the player doing something" trigger. Both
+    // are re-sampled each tick and forced false while KO'd. Scenarios read these on
+    // Party.Player at the mechanic's resolve time.
     public bool IsMoving { get; private set; }
     public bool IsActing { get; private set; }
 
@@ -67,7 +70,7 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
             IsActing = false;
             return;
         }
-        IsMoving = hooks.MovementInputActive || actedThisFrame || hooks.IsJumping;
+        IsMoving = hooks.MovementInputActive || actedThisFrame || hooks.IsJumping || Movement.IsMoving;
         IsActing = IsMoving || hooks.IsAutoAttacking;
     }
 
