@@ -1223,7 +1223,7 @@ public sealed class MultiplayerManager : IDisposable
             enemies.Add(new EnemyState(
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, cfg.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
-                statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList(),
+                statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList(),
                 enemy.AnimationTimelineId, newLockonVfxIds,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
                 enemy.IsCasting, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
@@ -1274,7 +1274,7 @@ public sealed class MultiplayerManager : IDisposable
                 newLockonVfxIds = member.DrainPendingLockonVfxIds();
                 if (newLockonVfxIds.Count > 0)
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
-                statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks)).ToList();
+                statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList();
             }
             else
             {
@@ -1479,7 +1479,7 @@ public sealed class MultiplayerManager : IDisposable
             foreach (var target in e.Statuses)
             {
                 if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
-                enemy.AddStatus(target.StatusId, stacks: target.Stacks, overrideStacks: true);
+                enemy.AddStatus(target.StatusId, duration: target.RemainingTime, stacks: target.Stacks, overrideStacks: true);
             }
             foreach (var current in currentStatuses)
             {
@@ -1666,7 +1666,7 @@ public sealed class MultiplayerManager : IDisposable
                 // on a snapshot where nothing changed.
                 reconciledIds.Add(target.StatusId);
                 if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
-                member.AddStatus(target.StatusId, stacks: target.Stacks, overrideStacks: true);
+                member.AddStatus(target.StatusId, duration: target.RemainingTime, stacks: target.Stacks, overrideStacks: true);
             }
             // Only ever removes a statusId THIS reconciliation previously added --
             // never diffs against the character's full ActiveStatusSnapshot the way

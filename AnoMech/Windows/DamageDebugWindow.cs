@@ -286,6 +286,17 @@ internal sealed class DamageDebugWindow : Window, IDisposable
                 foreach (var line in diag)
                     sb.AppendLine($"  {line}");
 
+            // Earlier runs this session (see DiagnosticLog.ArchivedHistory) -- appended
+            // after the live section above so the file keeps every run instead of a
+            // scenario switch silently discarding whatever the previous one logged.
+            var archived = AnoMech.Core.DiagnosticLog.ArchivedHistory();
+            if (archived.Length > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("=== Earlier runs this session ===");
+                sb.Append(archived);
+            }
+
             var dir = Plugin.PluginInterface.AssemblyLocation.DirectoryName;
             if (dir == null) return;
             var path = Path.Combine(dir, "AnoMech-DamageDebug.txt");

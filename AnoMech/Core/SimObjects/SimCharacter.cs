@@ -230,8 +230,8 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     // Without this, statuses set via AddStatus are entirely local: the host's own
     // doppel renders correctly but a peer's independently-spawned doppel never
     // gets them at all.
-    public IReadOnlyList<(ushort StatusId, ushort Stacks)> ActiveStatusSnapshot =>
-        statusList.Where(s => s.IsActive).Select(s => (s.StatusId, s.Stacks)).ToList();
+    public IReadOnlyList<(ushort StatusId, ushort Stacks, float RemainingTime)> ActiveStatusSnapshot =>
+        statusList.Where(s => s.IsActive).Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList();
 
 
     // -------------------------

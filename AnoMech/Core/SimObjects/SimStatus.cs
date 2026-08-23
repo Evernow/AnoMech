@@ -14,6 +14,11 @@ public sealed unsafe class SimStatus : ISimObject
     public bool IsActive { get; private set; }
     public ushort Stacks { get; private set; }
 
+    // 0 means "no duration" (permanent until removed), matching Tick/Reapply's own
+    // duration > 0f convention below -- so a peer replicating this via AddStatus's
+    // matching default gets the same "never expires" behavior, not a bogus 0s timer.
+    public float RemainingTime => duration > 0f ? Math.Max(0f, duration - elapsed) : 0f;
+
     internal SimStatus(SimCharacter target, ushort statusId, float duration, ushort stacks)
     {
         this.target = target;

@@ -119,7 +119,12 @@ public sealed record SelfPoseMessage(Guid PeerId, float X, float Y, float Z, flo
 // "Max" status (506 stacks, applied purely to drive Kefka's VFX grow effect)
 // reaches a peer -- without it Kefka renders on the peer at its un-grown base
 // size despite Position/Visible/ModelState all matching the host correctly.
-public sealed record EnemyStatusState(ushort StatusId, ushort Stacks);
+// RemainingTime: 0 means "no duration" (permanent until removed), matching
+// SimStatus.RemainingTime's own convention -- carried so a peer's AddStatus call
+// can replicate the host's actual countdown instead of defaulting to 0s (which
+// AddStatus's own default parameter would otherwise silently produce, leaving a
+// peer-visible debuff with a duration that never counts down).
+public sealed record EnemyStatusState(ushort StatusId, ushort Stacks, float RemainingTime);
 
 // AnimationTimelineId mirrors SimEnemy.PlayAnimationTimeline -- a scenario's
 // discrete one-shot animation cues (Kefka's WarpOut/Spawn teleport, Neo Exdeath's
