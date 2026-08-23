@@ -958,6 +958,40 @@ public sealed class MultiplayerManager : IDisposable
         Session.Started = false;
     }
 
+    // Host-only: finalize the local run and tell every peer it ended. Shared by
+    // Tick()'s own ActiveScenario-null edge detection and the explicit callers
+    // below -- factored out because that edge only fires ONCE per run ending
+    // (hostScenarioStarted), so a Reset followed by a separate Leave click
+    // previously left the second transition (still-in-zone -> left-the-zone)
+    // completely unobserved: nothing ever told peers the host had actually left,
+    // stranding them in-instance with a Leave button whose LeaveRequestMessage
+    // the host would then also silently drop (see the handler below, gated on
+    // IsInInstance which was by then already false).
+    private void BroadcastRunEnded()
+    {
+        EndHostRunLocally();
+        _ = relay?.SendAsync(Session.ToMessage());
+        // Reset() leaves World.Map.IsInInstance true (deliberately stays
+        // in-zone); only Leave()/a natural finish clears it. Read here, now,
+        // before anything else can change it.
+        var returnedToInn = !Plugin.GameInstance.World.Map.IsInInstance;
+        DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
+        _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
+        LobbyChanged?.Invoke();
+    }
+
+    // Called from the host's own "Leave" button (MainWindow) right after
+    // Plugin.GameInstance.Leave() -- see BroadcastRunEnded's doc comment for why
+    // the Tick()-driven edge trigger can't be relied on here: if the host
+    // Reset() first, that edge already fired and consumed itself, so this
+    // explicit call is the only thing that will ever tell peers about the
+    // Leave() that follows it.
+    public void NotifyLeftInstance()
+    {
+        if (!IsHost || relay is not { IsConnected: true }) return;
+        BroadcastRunEnded();
+    }
+
     // Subscribed lazily on first Tick rather than in the field initializer that
     // constructs this class (Plugin.GameInstance isn't set yet at that point) --
     // one-shot, since Plugin.GameInstance.World (and so World.Map) is a single
@@ -1093,15 +1127,7 @@ public sealed class MultiplayerManager : IDisposable
                 // Reset/Leave clears ActiveScenario -- stop broadcasting once the local
                 // run has ended rather than spamming empty snapshots (or, worse, a
                 // later unrelated solo run) to peers who are still connected.
-                EndHostRunLocally();
-                _ = relay?.SendAsync(Session.ToMessage());
-                // Reset() leaves World.Map.IsInInstance true (deliberately stays
-                // in-zone); only Leave()/a natural finish clears it. Read here,
-                // now, before anything else can change it.
-                var returnedToInn = !Plugin.GameInstance.World.Map.IsInInstance;
-                DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
-                _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
-                LobbyChanged?.Invoke();
+                BroadcastRunEnded();
                 return;
             }
             if (!aiReplayStateSent) TrySendAiReplayState();
@@ -2185,6 +2211,12 @@ public sealed class MultiplayerManager : IDisposable
                 DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested to leave the instance.");
                 if (Plugin.GameInstance.World.Map.IsInInstance)
                     Plugin.GameInstance.Leave();
+                // Unconditional, even when IsInInstance was already false above (e.g.
+                // the host left via their own Leave button, possibly after an earlier
+                // Reset, before this request arrived) -- the old code silently dropped
+                // the request in exactly that case, leaving the requesting peer's own
+                // Leave button waiting forever for a response the host never sent.
+                BroadcastRunEnded();
                 break;
             case AiReplayStateMessage state when !IsHost:
                 pendingAiReplayState = state;

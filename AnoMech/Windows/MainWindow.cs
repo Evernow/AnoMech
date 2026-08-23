@@ -335,7 +335,14 @@ public unsafe class MainWindow : Window, IDisposable
                 if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
                     plugin.Multiplayer.RequestLeaveInstance();
                 else
+                {
                     game.Leave();
+                    // A prior Reset already consumed the one-shot Tick() edge trigger
+                    // that would normally broadcast this -- without an explicit call
+                    // here, peers never learn the host left and get stuck in-instance.
+                    // See MultiplayerManager.NotifyLeftInstance's doc comment.
+                    plugin.Multiplayer.NotifyLeftInstance();
+                }
             }
         }
 
