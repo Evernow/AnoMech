@@ -304,13 +304,35 @@ public sealed class UmadP3BlackHoleScenario : IScenario
         {
             var target = party.Find.Closest(exdeath!.Position);
             helper?.Cast(ActionId.ThunderIII_Resolve, targetId: target?.GameObjectId);
-            damage.Resolve(target, ActionId.ThunderIII_Resolve, [DamageType.TankBuster, DamageType.Lightning], [(StatusId.LightningResistanceDownII, 3.96f)]);
+            // TankBuster-only, deliberately not DamageType.Lightning too: this fight
+            // registers LightningResistanceDownII as a lethal vuln-up status (see
+            // SetStatuses above), and the two Thunder III hits land only 3s apart
+            // while that debuff lasts 3.96s -- a tank who takes both hits without a
+            // swap would still be carrying the first hit's debuff into the second,
+            // and DamageSolver.CheckLethal's vuln-up branch runs before its
+            // TankBuster-role branch, so it killed them regardless of role. Tank
+            // buster survival should be a pure role gate (any tank lives, anyone
+            // else dies), not incidentally gated on this debuff's timing -- the
+            // status itself is still applied below for the visual/vuln-up cue, it
+            // just no longer feeds this hit's own lethality check.
+            damage.Resolve(target, ActionId.ThunderIII_Resolve, [DamageType.TankBuster], [(StatusId.LightningResistanceDownII, 3.96f)]);
         });
         world.Events.Add(time + 3f, () =>
         {
             var target = party.Find.Closest(exdeath!.Position);
             helper?.Cast(ActionId.ThunderIII_Resolve, targetId: target?.GameObjectId);
-            damage.Resolve(target, ActionId.ThunderIII_Resolve, [DamageType.TankBuster, DamageType.Lightning], [(StatusId.LightningResistanceDownII, 3.96f)]);
+            // TankBuster-only, deliberately not DamageType.Lightning too: this fight
+            // registers LightningResistanceDownII as a lethal vuln-up status (see
+            // SetStatuses above), and the two Thunder III hits land only 3s apart
+            // while that debuff lasts 3.96s -- a tank who takes both hits without a
+            // swap would still be carrying the first hit's debuff into the second,
+            // and DamageSolver.CheckLethal's vuln-up branch runs before its
+            // TankBuster-role branch, so it killed them regardless of role. Tank
+            // buster survival should be a pure role gate (any tank lives, anyone
+            // else dies), not incidentally gated on this debuff's timing -- the
+            // status itself is still applied below for the visual/vuln-up cue, it
+            // just no longer feeds this hit's own lethality check.
+            damage.Resolve(target, ActionId.ThunderIII_Resolve, [DamageType.TankBuster], [(StatusId.LightningResistanceDownII, 3.96f)]);
         });
         world.Events.Add(time + 3.5f, () => exdeath?.Follow(party.Get(PartyRole.OffTank)));
     }
