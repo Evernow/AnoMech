@@ -1471,6 +1471,26 @@ public sealed class MultiplayerManager : IDisposable
     private void OnWorldSnapshotReceived(WorldSnapshotMessage snap)
     {
         if (IsHost) return;
+        // Gated on peerEnteredInstance for the same reason TryStartDebugBotReplay
+        // already is: RunScenarioAsPeer's real zone entry (MapController.TryLoad)
+        // is deferred, so a snapshot can arrive and spawn enemies into
+        // Plugin.GameInstance.World before that load has actually happened -- and
+        // the load that follows moments later tears the zone down and rebuilds it,
+        // destroying those doppels out from under peerEnemies without clearing its
+        // bookkeeping. Every NetId is now considered "already spawned" (it's a key
+        // in peerEnemies), so the "first snapshot -- spawning local doppel" branch
+        // below never fires for them again for the rest of the run: the enemies
+        // are gone from the peer's world permanently. Confirmed via an
+        // AnoMech-DamageDebug dump (UMAD P4 Kefka Says, three-person session): the
+        // three bosses spawned once from a snapshot that arrived 16ms before
+        // "TryLoad: freshLoad=True", then the peer's dump over a minute later
+        // showed "Enemies currently in world: (none)" for the entire rest of the
+        // fight. Snapshots arrive continuously (multiple times a second), so
+        // dropping the ones that land in this narrow pre-load window costs nothing
+        // -- the very next one after zone entry completes finds peerEnemies still
+        // empty and spawns everything fresh, into the world that's actually going
+        // to stick around.
+        if (!peerEnteredInstance) return;
         var world = Plugin.GameInstance.World;
 
         var seenEnemyIds = new HashSet<int>();
