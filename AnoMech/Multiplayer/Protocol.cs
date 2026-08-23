@@ -141,6 +141,13 @@ public sealed record EnemyStatusState(ushort StatusId, ushort Stacks, float Rema
 // `position ?? parent.Position` fallback anchors the AOE telegraph at that
 // invisible helper's spawn point instead of the intended ground spot -- the
 // omen would render nowhere near where it actually needs dodging.
+// CastSeq mirrors SimCast.CastSeq -- see its own doc comment for why a peer
+// dedupes a telegraphed cast's replay off this counter actually changing,
+// instead of off the IsCasting rising edge alone (that compares the host's
+// real cast timer against the peer's own independently-running replay timer,
+// which can legitimately disagree by however long the snapshot took to
+// arrive). Same zero-means-never-fired/increments-only convention as
+// LastInstantCastSeq below, for the same first-connect reason.
 // CastSeconds mirrors SimCast.Total -- the actual cast duration this cast
 // resolved to, whether that's the scenario's explicit override or a Lumina
 // sheet lookup. Same category of bug as CastTargetX/Y/Z: without it, a peer's
@@ -176,7 +183,7 @@ public sealed record EnemyState(
     byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
     IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, IReadOnlyList<uint> NewLockonVfxIds,
     float X, float Y, float Z, float Rotation,
-    bool IsCasting, uint CastActionId, float CastSeconds, float CastOmenDelay,
+    bool IsCasting, int CastSeq, uint CastActionId, float CastSeconds, float CastOmenDelay,
     float? CastTargetX, float? CastTargetY, float? CastTargetZ,
     int? CastTargetEnemyNetId, PartyRole? CastTargetRole,
     int LastInstantCastSeq, uint LastInstantCastActionId,

@@ -85,6 +85,22 @@ public sealed unsafe class SimCast : ISimObject
     // fades in and nothing else about the cast conveys that.
     public float OmenDelay => omenDelay;
 
+    // Monotonically-incrementing counter bumped every time a real (non-instant)
+    // cast starts -- the telegraphed-cast counterpart to LastInstantCastSeq below.
+    // A peer's replay used to dedupe a telegraphed cast purely off IsCasting's
+    // rising edge (host says casting, my own doppel doesn't think it is), but that
+    // compares two independently-running clocks: the host's real cast timer and
+    // the peer's own replayed one, which starts however many hundred ms of network
+    // latency later and then runs the SAME fixed duration from there. Confirmed via
+    // AnoMech-DamageDebug dumps (UMAD P3's Look upon Me and Despair): the peer's own
+    // replay timer ran out slightly after the host's real one already had, and the
+    // next snapshot -- still reporting the host's now-stale IsCasting=true from
+    // just before it too finished -- read as a fresh rising edge and replayed the
+    // exact same cast a second time, 5.000s after the first (the cast's own
+    // duration to the millisecond). CastSeq sidesteps the whole comparison: a peer
+    // dedupes on this value actually changing instead of on two clocks agreeing.
+    public int CastSeq { get; private set; }
+
     // Instant casts (castTimeValue <= 0, see Start() below) fire and reset ActionId/
     // TargetLocation back to their empty state within the same tick they ran in --
     // CastInfo.IsCasting (what IsCasting reads) never goes true for them either, since
@@ -161,6 +177,7 @@ public sealed unsafe class SimCast : ISimObject
             var target = targetId ?? chara->GetGameObjectId();
             NativeCast(actionId, ActionType.Action, omenDelay, castTimeValue, false, parent.Rotation + omenRotate, localTargetLocation, target);
             total = chara->CastInfo.TotalCastTime;
+            CastSeq++;
         }
         else
         {

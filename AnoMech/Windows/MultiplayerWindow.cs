@@ -43,6 +43,27 @@ public class MultiplayerWindow : Window, IDisposable
 
     public void Dispose() { }
 
+    // Hidden while the fake-zone instance is loaded -- see MainWindow's own
+    // PreOpenCheck for the full reasoning (including why it reopens itself
+    // afterward rather than staying closed); this window's lobby/roster UI is
+    // just as irrelevant mid-fight, and RunningSimWindow's Start/Leave-session
+    // buttons cover what's still needed.
+    private bool hiddenByUs;
+
+    public override void PreOpenCheck()
+    {
+        if (plugin.Game.World.Map.IsInInstance)
+        {
+            if (IsOpen) hiddenByUs = true;
+            IsOpen = false;
+        }
+        else if (hiddenByUs)
+        {
+            hiddenByUs = false;
+            IsOpen = true;
+        }
+    }
+
     // Before Start, Session.ScenarioIndex is only meaningful once the host has
     // actually clicked Start (StartScenario populates it) -- showing it any
     // earlier would display whatever scenario happens to sit at index 0 in
@@ -312,47 +333,75 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.Separator();
         if (!mp.Session.Started)
         {
-            if (mp.IsHost)
-            {
-                if (mp.IsStartCheckPending)
-                    ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), "Checking everyone's ready...");
-                else if (mp.StartCheckFailureReason is { } startFail)
-                    ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), startFail);
-
-                var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
-                var hasSupportedScenario = Plugin.MainWindow.SelectedScenario is { } sel2
-                    && MultiplayerManager.SupportedScenarios.Contains(sel2.GetType());
-                // A grouped scenario (e.g. P2 Forsaken's NA/EU strats) can leave
-                // SelectedStrat at -1 when the selected region has no strats --
-                // mirrors MainWindow's own solo-Start gate (HasStartableStrat),
-                // and matches the same check StartScenario itself enforces.
-                var hasStrat = hasSupportedScenario && Plugin.MainWindow.HasStartableStrat();
-                var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending && hasStrat;
-                ImGui.BeginDisabled(!canStart);
-                if (ImGui.Button("Start")) mp.StartScenario();
-                ImGui.EndDisabled();
-                if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                    ImGui.SetTooltip(!stable
-                        ? "Not connected to the relay."
-                        : !hasSupportedScenario
-                            ? "Select a multiplayer-supported scenario in the main window first."
-                            : !hasStrat
-                                ? "No strat available for the selected scenario/region."
-                                : anyMismatch
-                                ? "One or more players are on a different plugin build -- everyone needs to match before starting."
-                                : mp.IsStartCheckPending
-                                    ? "Waiting for players to confirm they're ready..."
-                                    : "Claim a role for yourself first.");
-            }
-            else
-            {
-                ImGui.BeginDisabled();
-                ImGui.Button("Start (controlled by host)");
-                ImGui.EndDisabled();
-            }
+            DrawStartButton();
             ImGui.SameLine();
         }
 
+        DrawLeaveSessionButton();
+    }
+
+    // Host/peer Start button. Draws nothing once mp.Session.Started -- caller
+    // decides whether to show it at all (see the !Started guard in
+    // DrawConnectedPanel above). Self-contained (no params) so RunningSimWindow
+    // can call this directly while a sim is running.
+    internal void DrawStartButton()
+    {
+        var stable = mp.IsConnected;
+        if (mp.IsHost)
+        {
+            if (mp.IsStartCheckPending)
+                ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), "Checking everyone's ready...");
+            else if (mp.StartCheckFailureReason is { } startFail)
+                ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), startFail);
+
+            var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
+            var hasSupportedScenario = Plugin.MainWindow.SelectedScenario is { } sel2
+                && MultiplayerManager.SupportedScenarios.Contains(sel2.GetType());
+            // A grouped scenario (e.g. P2 Forsaken's NA/EU strats) can leave
+            // SelectedStrat at -1 when the selected region has no strats --
+            // mirrors MainWindow's own solo-Start gate (HasStartableStrat),
+            // and matches the same check StartScenario itself enforces.
+            var hasStrat = hasSupportedScenario && Plugin.MainWindow.HasStartableStrat();
+            // Unclaimed roles are fine -- they fall back to an AI bot (see this
+            // file's own top comment) -- but an actual connected person who hasn't
+            // picked a role yet isn't a bot standing in for anyone, they're a
+            // spectator about to get left behind the instant Start loads everyone
+            // else into the zone. Session.Names is every connected person
+            // (including us, added alongside our own Hello -- see MultiplayerManager
+            // line ~409), so anyone in there missing from ClaimedBy's values hasn't
+            // claimed a role.
+            var claimedPeerIds = mp.Session.ClaimedBy.Values.ToHashSet();
+            var everyoneHasClaimed = mp.Session.Names.Keys.All(claimedPeerIds.Contains);
+            var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending && hasStrat && everyoneHasClaimed;
+            ImGui.BeginDisabled(!canStart);
+            if (ImGui.Button("Start")) mp.StartScenario();
+            ImGui.EndDisabled();
+            if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(!stable
+                    ? "Not connected to the relay."
+                    : !hasSupportedScenario
+                        ? "Select a multiplayer-supported scenario in the main window first."
+                        : !hasStrat
+                            ? "No strat available for the selected scenario/region."
+                            : anyMismatch
+                            ? "One or more players are on a different plugin build -- everyone needs to match before starting."
+                            : mp.IsStartCheckPending
+                                ? "Waiting for players to confirm they're ready..."
+                                : mp.MyClaimedRole == null
+                                    ? "Claim a role for yourself first."
+                                    : "Everyone connected needs to claim a role first.");
+        }
+        else
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("Start (controlled by host)");
+            ImGui.EndDisabled();
+        }
+    }
+
+    // Self-contained like DrawStartButton above, for the same reason.
+    internal void DrawLeaveSessionButton()
+    {
         if (ImGui.Button("Leave session"))
         {
             mp.LeaveSession();

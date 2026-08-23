@@ -222,6 +222,7 @@ public sealed unsafe class SimEnemy : SimNpc
     };
 
     public bool IsCasting => cast.IsCasting;
+    public int CastSeq => cast.CastSeq;
     public uint CastActionId => cast.ActionId;
     public float CastProgress => cast.Progress;
     public Vector3? CastTargetLocation => cast.TargetLocation;

@@ -61,6 +61,7 @@ public sealed class Plugin : IDalamudPlugin
     // static-accessor pattern just above.
     internal static MainWindow MainWindow { get; private set; } = null!;
     internal MultiplayerWindow MultiplayerWindow { get; init; }
+    internal RunningSimWindow RunningSimWindow { get; init; }
 #if DEBUG
     private DamageDebugWindow DamageDebugWindow { get; init; }
 #endif
@@ -79,10 +80,12 @@ public sealed class Plugin : IDalamudPlugin
         ConfigWindow = new ConfigWindow(this);
         MainWindow = new MainWindow(this);
         MultiplayerWindow = new MultiplayerWindow(this);
+        RunningSimWindow = new RunningSimWindow(this);
 
         WindowSystem.AddWindow(ConfigWindow);
         WindowSystem.AddWindow(MainWindow);
         WindowSystem.AddWindow(MultiplayerWindow);
+        WindowSystem.AddWindow(RunningSimWindow);
 #if DEBUG
         DamageDebugWindow = new DamageDebugWindow(this);
         WindowSystem.AddWindow(DamageDebugWindow);

@@ -157,6 +157,10 @@ public sealed class MultiplayerManager : IDisposable
     // same way -- see EnemyState.LastInstantCastSeq's doc comment for why instant
     // casts need this separate counter instead of the IsCasting rising edge.
     private readonly Dictionary<int, int> peerEnemyLastInstantCastSeq = new();
+    // Peer-only: last-seen CastSeq per enemy NetId -- see EnemyState.CastSeq's doc
+    // comment for why a telegraphed cast's replay dedupes off this instead of the
+    // IsCasting rising edge alone.
+    private readonly Dictionary<int, int> peerEnemyLastCastSeq = new();
     // Peer-only: last-applied CurrentState per event-object NetId, edge-triggered
     // the same way -- SetState is a plain field write with no native rebuild to
     // worry about, but re-issuing it unconditionally every snapshot is still
@@ -502,6 +506,7 @@ public sealed class MultiplayerManager : IDisposable
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
         peerEnemyLastInstantCastSeq.Clear();
+        peerEnemyLastCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
         peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
@@ -923,6 +928,7 @@ public sealed class MultiplayerManager : IDisposable
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
         peerEnemyLastInstantCastSeq.Clear();
+        peerEnemyLastCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
         peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
@@ -967,14 +973,24 @@ public sealed class MultiplayerManager : IDisposable
     // stranding them in-instance with a Leave button whose LeaveRequestMessage
     // the host would then also silently drop (see the handler below, gated on
     // IsInInstance which was by then already false).
-    private void BroadcastRunEnded()
+    // returnedToInn is a caller-supplied fact, not something re-derived from
+    // World.Map.IsInInstance here -- Game.Leave()/Reset() both do their actual
+    // work inside a Plugin.Framework.Run(...) callback, which runs on a later
+    // frame, not synchronously. A caller invoking this method right after
+    // Leave() (NotifyLeftInstance, the LeaveRequestMessage handler) would
+    // observe IsInInstance still true -- the pre-Leave state -- and wrongly
+    // broadcast ReturnedToInn=False, telling every peer to Reset() instead of
+    // Leave(). This exact race was why guests stayed stuck in-instance after
+    // the host clicked Leave: the host's own Leave() eventually ran a few
+    // frames later, but the broadcast describing it had already gone out
+    // tagged as a Reset. The Tick() edge-trigger call site below is the one
+    // exception where reading IsInInstance is safe -- it only fires once
+    // ActiveScenario has already gone null on some later tick, by which point
+    // any deferred Leave()/Reset() from earlier has genuinely finished.
+    private void BroadcastRunEnded(bool returnedToInn)
     {
         EndHostRunLocally();
         _ = relay?.SendAsync(Session.ToMessage());
-        // Reset() leaves World.Map.IsInInstance true (deliberately stays
-        // in-zone); only Leave()/a natural finish clears it. Read here, now,
-        // before anything else can change it.
-        var returnedToInn = !Plugin.GameInstance.World.Map.IsInInstance;
         DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
         _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
         LobbyChanged?.Invoke();
@@ -989,7 +1005,7 @@ public sealed class MultiplayerManager : IDisposable
     public void NotifyLeftInstance()
     {
         if (!IsHost || relay is not { IsConnected: true }) return;
-        BroadcastRunEnded();
+        BroadcastRunEnded(returnedToInn: true);
     }
 
     // Subscribed lazily on first Tick rather than in the field initializer that
@@ -1127,7 +1143,10 @@ public sealed class MultiplayerManager : IDisposable
                 // Reset/Leave clears ActiveScenario -- stop broadcasting once the local
                 // run has ended rather than spamming empty snapshots (or, worse, a
                 // later unrelated solo run) to peers who are still connected.
-                BroadcastRunEnded();
+                // Safe to read IsInInstance here (unlike the explicit call sites) --
+                // this only fires once ActiveScenario has gone null on some later
+                // tick, by which point Reset()/Leave()'s deferred work has finished.
+                BroadcastRunEnded(!Plugin.GameInstance.World.Map.IsInInstance);
                 return;
             }
             if (!aiReplayStateSent) TrySendAiReplayState();
@@ -1252,7 +1271,7 @@ public sealed class MultiplayerManager : IDisposable
                 statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList(),
                 enemy.AnimationTimelineId, newLockonVfxIds,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
-                enemy.IsCasting, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
+                enemy.IsCasting, enemy.CastSeq, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
                 enemy.CastTargetLocation?.X, enemy.CastTargetLocation?.Y, enemy.CastTargetLocation?.Z,
                 castTargetEnemyNetId, castTargetRole,
                 enemy.LastInstantCastSeq, enemy.LastInstantCastActionId,
@@ -1543,8 +1562,29 @@ public sealed class MultiplayerManager : IDisposable
             // UMAD P3's Thunder III tankbuster with no target at all on a peer, so
             // NativeActionEffect's NumTargets went to 0 and the hit-react animation
             // that's supposed to play on the tank being hit never showed up there.
-            if (e.IsCasting && !enemy.IsCasting)
+            // Dedupes off CastSeq actually changing rather than off IsCasting's rising
+            // edge (host casting && my own doppel isn't) -- see EnemyState.CastSeq's
+            // doc comment for why comparing the host's real cast timer against the
+            // peer's own independently-running replayed one let the exact same cast
+            // replay twice. Guarded on seq > 0 for the same first-connect reason as
+            // LastInstantCastSeq below (don't replay the zero-value default).
+            if (e.CastSeq > 0
+                && (!peerEnemyLastCastSeq.TryGetValue(e.NetId, out var lastCastSeq) || lastCastSeq != e.CastSeq))
             {
+                peerEnemyLastCastSeq[e.NetId] = e.CastSeq;
+                // Cast()'s omen/telegraph placement (and its own log line) both read
+                // Position/Rotation directly, but ApplyNetworkPosition above only
+                // recorded this snapshot's pose as an interpolation target -- the
+                // fields themselves only catch up gradually, once per frame, in
+                // TickNetworkPosition. A boss that repositions/reorients and casts in
+                // the same host tick (e.g. UMAD P3's Black Hole Face()-then-Cast) would
+                // otherwise have its replayed telegraph drawn from wherever the peer's
+                // doppel was still interpolating from -- see the LastInstantCastSeq
+                // branch below for the observed symptom. Snap to the snapshot's
+                // authoritative pose right before replaying so the telegraph always
+                // matches what the host actually cast, at the cost of skipping one
+                // frame of smoothing exactly when a cast fires.
+                enemy.SetPosition(new Placement(new Vector3(e.X, e.Y, e.Z), e.Rotation));
                 var targetLocation = e.CastTargetX is { } tx && e.CastTargetY is { } ty && e.CastTargetZ is { } tz
                     ? new Vector3(tx, ty, tz)
                     : (Vector3?)null;
@@ -1561,6 +1601,15 @@ public sealed class MultiplayerManager : IDisposable
                 && (!peerEnemyLastInstantCastSeq.TryGetValue(e.NetId, out var lastInstantSeq) || lastInstantSeq != e.LastInstantCastSeq))
             {
                 peerEnemyLastInstantCastSeq[e.NetId] = e.LastInstantCastSeq;
+                // Same stale-pose race as the rising-edge branch above, but far more
+                // visible here: this is exactly the path UMAD P3's Black Hole uses
+                // (Face(tether) 0.1s before an instant Cast(Nothingness), a rect 125x6
+                // line AOE) -- a guest's doppel hadn't finished rotating to the new
+                // tether target yet when the cast replayed, so Nothingness fired along
+                // the doppel's old facing instead, observed as a line AOE seemingly
+                // cutting through the arena center that the host never actually cast
+                // that way.
+                enemy.SetPosition(new Placement(new Vector3(e.X, e.Y, e.Z), e.Rotation));
                 var instantTargetLocation = e.LastInstantCastTargetX is { } itx && e.LastInstantCastTargetY is { } ity && e.LastInstantCastTargetZ is { } itz
                     ? new Vector3(itx, ity, itz)
                     : (Vector3?)null;
@@ -1593,6 +1642,7 @@ public sealed class MultiplayerManager : IDisposable
             peerEnemyLastLoggedStatuses.Remove(staleId);
             peerEnemyAnimationTimeline.Remove(staleId);
             peerEnemyLastInstantCastSeq.Remove(staleId);
+            peerEnemyLastCastSeq.Remove(staleId);
         }
 
         // UMAD P3 only (harmless no-op elsewhere -- no enemy will ever match
@@ -2216,7 +2266,11 @@ public sealed class MultiplayerManager : IDisposable
                 // Reset, before this request arrived) -- the old code silently dropped
                 // the request in exactly that case, leaving the requesting peer's own
                 // Leave button waiting forever for a response the host never sent.
-                BroadcastRunEnded();
+                // Always returnedToInn: true -- this handler's whole purpose is
+                // granting a leave request, regardless of whether Leave() above was
+                // just queued (its deferred World.Map.Unload() hasn't run yet, so
+                // reading IsInInstance here would still see the pre-Leave state).
+                BroadcastRunEnded(returnedToInn: true);
                 break;
             case AiReplayStateMessage state when !IsHost:
                 pendingAiReplayState = state;

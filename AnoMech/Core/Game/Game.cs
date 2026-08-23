@@ -72,12 +72,11 @@ public sealed class Game : IDisposable
 #if DEBUG
     // Keeps AnoMech-DamageDebug.txt reflecting near-live state through Tick, not
     // just the one auto-freeze on first death -- a run where nobody dies but
-    // something still visibly went wrong needs the same trace available. Tracked
-    // independently of activeScenario since peers never get one (see isPeer guard
-    // in RunScenarioInternal) but still need their own local dump kept fresh.
+    // something still visibly went wrong needs the same trace available. Ticks
+    // unconditionally (see the Tick() call site) so it also covers everything
+    // downstream of a run ending, not just while one is active.
     private const float PeriodicDumpInterval = 3f;
     private float periodicDumpTimer;
-    private bool peerScenarioRunning;
 #endif
 
     public Game()
@@ -241,15 +240,6 @@ public sealed class Game : IDisposable
             activeScenario = scenario;
             scenarioElapsed = 0f;
         }
-#if DEBUG
-        else
-        {
-            // Peers never get activeScenario (Tick must not call scenario.Tick locally
-            // for them -- see the isPeer guard above), but the periodic dump still
-            // needs to know a run is in progress; this tracks that independently.
-            peerScenarioRunning = true;
-        }
-#endif
 
         // Reconcile BGM to the new scenario. Bgm.Play is idempotent, so switching
         // between same-track scenarios (e.g. the P5 phases) keeps playing without
@@ -293,17 +283,21 @@ public sealed class Game : IDisposable
             activeScenario.Tick(deltaSeconds, scenarioElapsed);
         }
 #if DEBUG
-        // Runs for host (activeScenario) and peer (peerScenarioRunning) alike, so
-        // both sides of a multiplayer test keep their own local dump file fresh --
-        // see RunScenarioInternal for why peers never get an activeScenario.
-        if (activeScenario != null || peerScenarioRunning)
+        // Unconditional -- previously gated on (activeScenario != null ||
+        // peerScenarioRunning), which stops dumping the instant Reset/a natural
+        // finish clears either flag. That silently froze the file at whatever it
+        // last looked like mid-fight: a Reset+Leave repro's own Leave, the
+        // resulting EndMessage broadcast, and a peer's reaction to it all landed
+        // safely in DiagnosticLog's buffer (see its own doc comment) but never
+        // once reached disk, because nothing was left to trigger a write after
+        // the run ended. Ticking always means a dump is at most PeriodicDumpInterval
+        // stale no matter what just happened, including everything downstream of
+        // a run ending.
+        periodicDumpTimer += deltaSeconds;
+        if (periodicDumpTimer >= PeriodicDumpInterval)
         {
-            periodicDumpTimer += deltaSeconds;
-            if (periodicDumpTimer >= PeriodicDumpInterval)
-            {
-                periodicDumpTimer = 0f;
-                AnoMech.Windows.DamageDebugWindow.Instance?.DumpToFile();
-            }
+            periodicDumpTimer = 0f;
+            AnoMech.Windows.DamageDebugWindow.Instance?.DumpToFile();
         }
 #endif
     }
@@ -453,7 +447,6 @@ public sealed class Game : IDisposable
         firstFreezeScheduled = false;
 #if DEBUG
         periodicDumpTimer = 0f;
-        peerScenarioRunning = false;
         AnoMech.Windows.DamageDebugWindow.Instance?.ResetFreeze();
 #endif
         // Input-lock flags are owned by SimPlayer (reconciled each tick, cleared on

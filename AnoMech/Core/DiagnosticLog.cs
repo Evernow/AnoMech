@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 
 namespace AnoMech.Core;
 
@@ -23,16 +22,23 @@ internal static class DiagnosticLog
     private static readonly Queue<string> lines = new();
     private static readonly object gate = new();
 
-    // Every completed run's lines this session, oldest-first, so
-    // AnoMech-DamageDebug.txt keeps a history across scenario switches instead of
-    // Clear() silently discarding whatever the previous run logged the moment a
-    // different scenario starts -- previously the only way to catch an
-    // intermittent bug was to dump before ever starting anything else. Trimmed
-    // from the oldest end (whole runs at a time, via the "=== Run ended" markers)
-    // once it exceeds ArchiveCapacityBytes, so the file still favors the most
-    // recent history over unbounded growth.
+    // Every line that's ever fallen out of the live ring buffer above -- either
+    // evicted one at a time as Add() keeps it at Capacity, or moved over wholesale
+    // by Clear() at the start of a new run -- oldest-first, byte-capped at
+    // ArchiveCapacityBytes. Without routing ring-buffer eviction through here too
+    // (not just Clear()), a run that logs heavily enough to blow through Capacity
+    // on its own (P3 Black Hole's native MapEffect tracing alone can do this)
+    // would silently lose its own early lines before Clear() ever got a chance to
+    // preserve them -- which is exactly what happened to a Reset+Leave repro that
+    // scrolled out of the live buffer under later combat logging, long before the
+    // next scenario start ever triggered an archive.
+    // Stored as a queue of already-formatted lines rather than one big string, so
+    // trimming is O(lines dropped) -- an O(archive size) rebuild on every single
+    // Add() call once the ring buffer is in steady eviction would make this a
+    // real cost on the hot logging path.
     private const int ArchiveCapacityBytes = 10 * 1024 * 1024;
-    private static readonly StringBuilder archive = new();
+    private static readonly Queue<string> archiveLines = new();
+    private static long archiveBytes;
 
     public static void Info(string message)
     {
@@ -57,8 +63,18 @@ internal static class DiagnosticLog
         lock (gate)
         {
             lines.Enqueue($"{DateTime.Now:HH:mm:ss.fff} {message}");
-            while (lines.Count > Capacity) lines.Dequeue();
+            while (lines.Count > Capacity)
+                ArchiveLine(lines.Dequeue());
         }
+    }
+
+    // Not its own lock -- both call sites (Add and Clear) already hold `gate`.
+    private static void ArchiveLine(string line)
+    {
+        archiveLines.Enqueue(line);
+        archiveBytes += line.Length + 1;
+        while (archiveBytes > ArchiveCapacityBytes && archiveLines.Count > 0)
+            archiveBytes -= archiveLines.Dequeue().Length + 1;
     }
 
     // Cleared at the start of each scenario run -- the outgoing run's lines are
@@ -70,25 +86,11 @@ internal static class DiagnosticLog
         {
             if (lines.Count > 0)
             {
-                archive.Append("=== Run ended ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append(" ===\n");
-                foreach (var line in lines)
-                    archive.Append(line).Append('\n');
-                TrimArchive();
+                ArchiveLine($"=== Run ended {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+                while (lines.Count > 0)
+                    ArchiveLine(lines.Dequeue());
             }
-            lines.Clear();
         }
-    }
-
-    // Drops whole runs from the oldest end (never mid-run) until back under the
-    // cap, so the archive text always starts cleanly at a "=== Run ended" marker.
-    private static void TrimArchive()
-    {
-        if (archive.Length <= ArchiveCapacityBytes) return;
-        var text = archive.ToString();
-        var cutAt = text.IndexOf("=== Run ended ", text.Length - ArchiveCapacityBytes, StringComparison.Ordinal);
-        if (cutAt < 0) cutAt = text.IndexOf("=== Run ended ", StringComparison.Ordinal);
-        archive.Clear();
-        if (cutAt > 0) archive.Append(text, cutAt, text.Length - cutAt);
     }
 
     public static IReadOnlyList<string> Snapshot()
@@ -96,10 +98,13 @@ internal static class DiagnosticLog
         lock (gate) return lines.ToArray();
     }
 
-    // Every completed run's lines this session (see Clear()), oldest-first.
-    // Empty until the first scenario switch.
+    // Everything that's fallen out of the live buffer this session (see
+    // ArchiveLine), oldest-first. May start mid-run rather than at a clean
+    // "=== Run ended" marker if trimming cut through one -- byte-accurate
+    // trimming (never silently dropping more than necessary) matters more here
+    // than always starting on a run boundary.
     public static string ArchivedHistory()
     {
-        lock (gate) return archive.ToString();
+        lock (gate) return archiveLines.Count == 0 ? "" : string.Join('\n', archiveLines) + '\n';
     }
 }

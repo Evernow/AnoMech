@@ -93,34 +93,27 @@ public unsafe class MainWindow : Window, IDisposable
 
     public void Dispose() { }
 
-    private bool _wasInInstance;
+    // Hidden while the fake-zone instance is loaded -- this is a full scenario
+    // picker with no reason to stay on screen mid-fight, and RunningSimWindow's
+    // compact Start/Reset/Leave/Leave-session substitute (see its own doc
+    // comment) covers everything this window's controls would otherwise be
+    // needed for. Reopened automatically once back out of the instance, but
+    // only if we're the one who closed it (hiddenByUs) -- a user who closed
+    // it themselves mid-fight shouldn't have it pop back open on them.
+    private bool hiddenByUs;
 
-    // While the fake-zone instance is loaded, pin the window open and uncollapsible
-    // so the user can always reach Reset/Leave/God-mode without re-opening it.
     public override void PreOpenCheck()
     {
-        var inInstance = plugin.Game.World.Map.IsInInstance;
-        if (inInstance)
+        if (plugin.Game.World.Map.IsInInstance)
         {
+            if (IsOpen) hiddenByUs = true;
+            IsOpen = false;
+        }
+        else if (hiddenByUs)
+        {
+            hiddenByUs = false;
             IsOpen = true;
-            ShowCloseButton = false;
-            RespectCloseHotkey = false;
-            Flags |= ImGuiWindowFlags.NoCollapse;
-            if (!_wasInInstance)
-            {
-                Collapsed = false;
-                CollapsedCondition = ImGuiCond.Always;
-            }
         }
-        else
-        {
-            ShowCloseButton = true;
-            RespectCloseHotkey = true;
-            Flags &= ~ImGuiWindowFlags.NoCollapse;
-            if (_wasInInstance)
-                CollapsedCondition = ImGuiCond.FirstUseEver;
-        }
-        _wasInInstance = inInstance;
     }
 
     public override void Draw()
@@ -282,70 +275,13 @@ public unsafe class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Only the host's selection is used in multiplayer. " + MpDisabledReason(false, true));
         DrawWaymarkSelector();
 
-        var inInn = ZoneSession.IsInInn();
-        var busy = ZoneSession.IsPlayerBusy();
-        var envReady = inInn && !busy;
-        var hasStrat = HasStartableStrat();
-        // These buttons call game.RunScenario directly -- the plain solo/AI path,
-        // entirely bypassing MultiplayerManager. While connected to a multiplayer
-        // session for this scenario, that path must be blocked: the host clicking
-        // this instead of the Multiplayer window's own Start button would run a
-        // real fight locally without ever sending a StartMessage, leaving every
-        // guest stuck on "waiting for the host to start" forever; a peer clicking
-        // it would start a second, fully independent local simulation instead of
-        // waiting for the host's broadcast.
-        var mpBlocked = MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()) && plugin.Multiplayer.IsConnected;
-        var canStart = envReady && hasStrat && !mpBlocked;
-        ImGui.BeginDisabled(!canStart);
-        if (ImGui.Button("Start")) game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
-        ImGui.EndDisabled();
-        if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-        {
-            ImGui.SetTooltip(mpBlocked
-                ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                : !inInn
-                    ? "Scenarios can only be started from an inn."
-                    : busy
-                        ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
-                        : "No strat available for this region yet.");
-        }
+        DrawSoloStartButton();
         ImGui.SameLine();
-        // A peer's own Game.Reset() would only clear their own local view --
-        // route through the host instead so a reset reaches the whole group.
-        // The host's own click needs no such redirect: it's already
-        // authoritative and already propagates via Tick()/EndMessage.
-        if (ImGui.Button("Reset"))
-        {
-            if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
-                plugin.Multiplayer.RequestReset();
-            else
-                game.Reset();
-        }
-        if (game.World.Map.IsInInstance)
-        {
-            ImGui.SameLine();
-            // Same redirect reasoning as Reset above: a peer's own Game.Leave()
-            // would only unload their own local zone, leaving the host still
-            // simulating/broadcasting to a puppet-driven world they've since
-            // torn down. Routing through the host ends the run for the whole
-            // group (see MultiplayerManager.RequestLeaveInstance) while
-            // leaving the session itself intact.
-            if (ImGui.Button("Leave"))
-            {
-                if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
-                    plugin.Multiplayer.RequestLeaveInstance();
-                else
-                {
-                    game.Leave();
-                    // A prior Reset already consumed the one-shot Tick() edge trigger
-                    // that would normally broadcast this -- without an explicit call
-                    // here, peers never learn the host left and get stuck in-instance.
-                    // See MultiplayerManager.NotifyLeftInstance's doc comment.
-                    plugin.Multiplayer.NotifyLeftInstance();
-                }
-            }
-        }
+        DrawResetLeaveButtons();
 
+        var inInn = ZoneSession.IsInInn();
+        var envReady = inInn && !ZoneSession.IsPlayerBusy();
+        var mpBlocked = MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()) && plugin.Multiplayer.IsConnected;
         if (_selectedScenario.SupportsSolo)
         {
             ImGui.BeginDisabled(!envReady || mpBlocked);
@@ -412,6 +348,84 @@ public unsafe class MainWindow : Window, IDisposable
             debugMenu.DrawDebugContent();
         }
 #endif
+    }
+
+    // Solo/AI Start button. Self-contained (recomputes its own env/strat checks
+    // rather than taking them as parameters) so RunningSimWindow can call this
+    // directly while a sim is running, not just DrawMainContent above.
+    internal void DrawSoloStartButton()
+    {
+        if (_selectedScenario == null) return;
+        var inInn = ZoneSession.IsInInn();
+        var busy = ZoneSession.IsPlayerBusy();
+        var envReady = inInn && !busy;
+        var hasStrat = HasStartableStrat();
+        // This calls game.RunScenario directly -- the plain solo/AI path, entirely
+        // bypassing MultiplayerManager. While connected to a multiplayer session for
+        // this scenario, that path must be blocked: the host clicking this instead
+        // of the Multiplayer window's own Start button would run a real fight
+        // locally without ever sending a StartMessage, leaving every guest stuck on
+        // "waiting for the host to start" forever; a peer clicking it would start a
+        // second, fully independent local simulation instead of waiting for the
+        // host's broadcast.
+        var mpBlocked = MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()) && plugin.Multiplayer.IsConnected;
+        var canStart = envReady && hasStrat && !mpBlocked;
+        ImGui.BeginDisabled(!canStart);
+        if (ImGui.Button("Start")) plugin.Game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
+        ImGui.EndDisabled();
+        if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(mpBlocked
+                ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
+                : !inInn
+                    ? "Scenarios can only be started from an inn."
+                    : busy
+                        ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
+                        : "No strat available for this region yet.");
+        }
+    }
+
+    // Reset, plus (while in-instance) Leave -- redirecting through the host for a
+    // connected peer exactly like MultiplayerWindow's own Leave-session button
+    // does. Self-contained like DrawSoloStartButton above, for the same reason.
+    internal void DrawResetLeaveButtons()
+    {
+        var game = plugin.Game;
+        // A peer's own Game.Reset() would only clear their own local view --
+        // route through the host instead so a reset reaches the whole group.
+        // The host's own click needs no such redirect: it's already
+        // authoritative and already propagates via Tick()/EndMessage.
+        if (ImGui.Button("Reset"))
+        {
+            if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
+                plugin.Multiplayer.RequestReset();
+            else
+                game.Reset();
+        }
+        if (game.World.Map.IsInInstance)
+        {
+            ImGui.SameLine();
+            // Same redirect reasoning as Reset above: a peer's own Game.Leave()
+            // would only unload their own local zone, leaving the host still
+            // simulating/broadcasting to a puppet-driven world they've since
+            // torn down. Routing through the host ends the run for the whole
+            // group (see MultiplayerManager.RequestLeaveInstance) while
+            // leaving the session itself intact.
+            if (ImGui.Button("Leave"))
+            {
+                if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
+                    plugin.Multiplayer.RequestLeaveInstance();
+                else
+                {
+                    game.Leave();
+                    // A prior Reset already consumed the one-shot Tick() edge trigger
+                    // that would normally broadcast this -- without an explicit call
+                    // here, peers never learn the host left and get stuck in-instance.
+                    // See MultiplayerManager.NotifyLeftInstance's doc comment.
+                    plugin.Multiplayer.NotifyLeftInstance();
+                }
+            }
+        }
     }
 
     // Drawn below the strat picker for scenarios that declare WaymarkPresets. _selectedWaymark
