@@ -49,7 +49,7 @@ public sealed class UmadP5ExaflaresAi : IScenarioAi<UmadP5ExaflaresState>
     private static readonly float StripInset = FireClearU + 1.5f; // keep bots clear of a fired locus
     private const float OuterReach = 19f;                         // outer-lane reach in X±Z space (arena-bounded)
     private const float DistFill = 0.8f;                          // keep bots off a lane's edges (extra fire margin)
-    private const float DodgeSpeed = 7f;                          // sprint-ish, so the back-solve makes the snapshot
+    private const float DodgeSpeed = 8.3f;                        // sprint-ish, so the back-solve makes the snapshot
 
     // --- dodge placement ---
     private const float MeleeComfort = 2.5f;                      // melee happily stack this close
@@ -60,7 +60,7 @@ public sealed class UmadP5ExaflaresAi : IScenarioAi<UmadP5ExaflaresState>
 
     // --- opening fan-out ---
     private const float FanOutAt = 0.1f;                          // after SpawnKefka (t=0), so the boss radius reads
-    private const float FanSpeed = 6f;                            // settle well before wave 0's dodge at t=2.0
+    private const float FanSpeed = 6.5f;                          // settle well before wave 0's dodge at t=2.0
     private const float FanInnerMargin = 0.75f;                   // inner fan radius = NoGoRadius + this
     private const float FanAngleJitter = 0.5f;                    // rad, so the wheel isn't rigid (< ring spacing)
 
@@ -71,7 +71,7 @@ public sealed class UmadP5ExaflaresAi : IScenarioAi<UmadP5ExaflaresState>
     private const float InnerFallback = 6.5f;                     // max-melee (inner annulus outer edge) if the boss can't be read
     private const float NoGoRadius = 3.5f;                        // 7y-diameter hard no-go at the boss
     private const float ArenaMax = 19f;
-    private const float RelaxSpeed = 6f;
+    private const float RelaxSpeed = 6.5f;
     private const float DeadZone = 0.25f;                         // below this desired step, leave the bot be
     private const float WRepel = 1.0f, WArena = 1.5f;
     // Radial spring weights: inner roles pull harder so the wider spacing doesn't shove tanks/melee

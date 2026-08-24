@@ -59,7 +59,7 @@ public sealed class UmadP2ForsakenRinonAiHelper
         ai.Move(59.26f, TowerPositions(4), jitter: .0f, arrivalTime: 63.86f, leaveImmediately: true);
         ai.Move(65.27f, TowerPositions(5), jitter: .0f, arrivalTime: 73.27f, leaveImmediately: true);
         ai.Move(75f, AllThingsEndsBait(2, 6), arrivalTime: 78f, leaveImmediately: true);
-        ai.Move(79.31f, TowerPositions(6), jitter: .0f, arrivalTime: 83.8f, leaveImmediately: true);
+        ai.Move(81.31f, TowerPositions(6), jitter: .0f, arrivalTime: 85.8f, leaveImmediately: true);
         ai.Move(90.32f, TowerPositions(7), jitter: .0f, arrivalTime: 94.32f, leaveImmediately: true);
         // Occurrence 3 (t~88.36 castbar) has no "upcoming" tower to bisect against --
         // Tower(7) is the last one, already resolved by 95.82. Unlike 0/1/2, there's no

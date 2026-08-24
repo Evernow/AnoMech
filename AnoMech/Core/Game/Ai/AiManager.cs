@@ -13,12 +13,9 @@ namespace AnoMech.Core.Game.Ai;
 // reordering are handled inside the AiMove before it reaches here.
 public sealed class AiManager
 {
-    private const float RunSpeed = 6f;
-    // Real Sprint gives +25% (6 * 1.25 = 7.5y/s), but this mirrors the ~9y/s figure
-    // already used elsewhere in this codebase as the reference sprint speed (see
-    // SimEnemy/SimNetworkPuppet's NetworkCatchUpSpeed doc comments) rather than
-    // introducing a second, inconsistent number.
-    private const float SprintSpeed = 9f;
+    // Measured in-game.
+    private const float RunSpeed = 6.5f;
+    private const float SprintSpeed = 8.3f;
     // Mirrors LocalPlayerInputHooks' real-Sprint values so a bot's simulated
     // sprint status looks identical to a real player pressing the real button --
     // that class can't be reused directly (it's scoped to hooking the local
@@ -44,11 +41,6 @@ public sealed class AiManager
     // which case they pop Sprint (status, for the party-list icon, replicated to
     // every host/peer the same way any other AddStatus call already is) and
     // leave immediately at SprintSpeed instead of waiting to see if they're late.
-    // Confirmed via AnoMech-DamageDebug dumps: UMAD P3's wave-2 DodgeSlap can
-    // require ~9y/s to make a role's target in the ~2s window after DodgeImplosion
-    // -- comfortably above RunSpeed, comfortably within reach of a sprint. If even
-    // sprinting isn't enough, sprinting wouldn't help and just adds visual noise,
-    // so that case still falls through to the plain "leave now, arrive late" path.
     //
     // `leaveImmediately` opts a caller out of the defer-until-the-last-moment
     // part of that: the member still walks/sprints at whatever speed makes
