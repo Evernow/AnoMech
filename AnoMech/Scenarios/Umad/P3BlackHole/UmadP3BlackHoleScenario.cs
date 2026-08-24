@@ -173,14 +173,7 @@ public sealed class UmadP3BlackHoleScenario : IScenario
        if (CleanseCooldown == 0f && PrimodialCrustsToResolve > 0)
        {
            PrimodialCrustsToResolve--;
-           // Must stay longer than EarthResistanceDownDuration. This cleanse is a
-           // raid-wide r=100 circle (everyone is always in range, see CastType 2's
-           // InsideCircle), and DamageSolver.IsLethal instakills anyone who already
-           // carries the vuln status it applies. A cooldown shorter than that
-           // status's own duration (the old 0.5s vs. a 1.96s status) let a second
-           // queued cleanse fire while the first tick's status was still up on
-           // everyone, wiping the whole party instead of just cleansing them.
-           CleanseCooldown = EarthResistanceDownDuration + 0.1f;
+           CleanseCooldown = .5f;
            CleanseHelper?.Cast(ActionId.Earthquake_Cleanse);
            damage.Resolve(CleanseHelper, ActionId.Earthquake_Cleanse, [DamageType.Earth], [(StatusId.EarthResistanceDownII, EarthResistanceDownDuration)]);
        }
