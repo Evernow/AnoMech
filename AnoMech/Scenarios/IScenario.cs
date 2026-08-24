@@ -15,6 +15,12 @@ public interface IScenario
 
     bool SupportsSolo => false;
 
+    // True once a scenario has the matching multiplayer plumbing in
+    // MultiplayerManager/Protocol.cs (per-scenario *AiReplayStateMessage,
+    // shadow-state field, dispatch case) -- core replication works for any
+    // IScenario automatically, but debug-bot AI replay doesn't.
+    bool SupportsMultiplayer => false;
+
     // Selectable strats. Run's selectedAi indexes this (null = solo); region buttons derive
     // from each strat's IScenarioAi.Group.
     IReadOnlyList<IScenarioAi> AiStrats { get; }

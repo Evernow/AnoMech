@@ -11,7 +11,7 @@ using static AnoMech.Core.Game.Game;
 namespace AnoMech.Windows;
 
 // Vertical-slice multiplayer lobby. Which scenario is hosted is whatever's
-// currently selected in MainWindow (see MultiplayerManager.SupportedScenarios /
+// currently selected in MainWindow (see IScenario.SupportsMultiplayer /
 // StartScenario) -- this window has no scenario picker of its own, it only
 // shows the name. Host picks a role, shares the session code + relay URL out
 // of band, up to 7 others join and claim the remaining roles; anything left
@@ -94,7 +94,7 @@ public class MultiplayerWindow : Window, IDisposable
             $"Vertical-slice multiplayer for {CurrentScenarioLabel()}. One host runs the real " +
             "simulation; up to 7 others join and take over bot slots.");
         if (mp.SessionCode == null
-            && (Plugin.MainWindow.SelectedScenario is not { } sel || !MultiplayerManager.SupportedScenarios.Contains(sel.GetType())))
+            && (Plugin.MainWindow.SelectedScenario is not { } sel || !sel.SupportsMultiplayer))
         {
             // Not gated on mp.IsHost: that flag defaults to false and is never
             // reset back to false on leaving a session (see LeaveSessionInternal),
@@ -356,7 +356,7 @@ public class MultiplayerWindow : Window, IDisposable
 
             var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
             var hasSupportedScenario = Plugin.MainWindow.SelectedScenario is { } sel2
-                && MultiplayerManager.SupportedScenarios.Contains(sel2.GetType());
+                && sel2.SupportsMultiplayer;
             // A grouped scenario (e.g. P2 Forsaken's NA/EU strats) can leave
             // SelectedStrat at -1 when the selected region has no strats --
             // mirrors MainWindow's own solo-Start gate (HasStartableStrat),

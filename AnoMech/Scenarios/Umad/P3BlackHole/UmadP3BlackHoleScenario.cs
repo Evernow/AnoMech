@@ -22,6 +22,7 @@ public sealed class UmadP3BlackHoleScenario : IScenario
 {
     public string Name => "Black Hole";
     public IPhase Phase => UmadZone.P3;
+    public bool SupportsMultiplayer => true;
 
     public void DrawSettings() => settingsWindow.Draw();
     private readonly UmadP3BlackHoleSettingsWindow settingsWindow = new();

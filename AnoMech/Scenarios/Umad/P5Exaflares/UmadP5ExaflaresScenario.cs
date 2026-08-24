@@ -26,6 +26,7 @@ public sealed class UmadP5ExaflaresScenario : IScenario
     public string Name => "Exaflares";
     public IPhase Phase => UmadZone.P5;
     public bool SupportsSolo => true;
+    public bool SupportsMultiplayer => true;
 
     // Enemy spawn level.
     private const byte Level = 100;

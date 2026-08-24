@@ -47,28 +47,6 @@ namespace AnoMech.Multiplayer;
 // marshalled onto it via Plugin.Framework.Run before touching any game state.
 public sealed class MultiplayerManager : IDisposable
 {
-    // No throttle here (was a fixed interval, 12Hz then 24Hz): Tick only runs once
-    // per Framework update in the first place, so any interval smaller than the
-    // actual frame time (typically ~4-17ms depending on the host's FPS) can never
-    // fire more than once per frame anyway -- there's no fresher data to send in
-    // between. A timer value only matters once it's *larger* than a frame, at
-    // which point it's a deliberate throttle, not a floor. For a tank reading
-    // boss facing/position in real time, every millisecond of artificial delay
-    // stacks on top of whatever the relay's real transit time already costs, so
-    // just broadcast every Tick and let the host's own frame rate be the ceiling.
-    // Tradeoff is outbound snapshot bandwidth/CPU scaling with the host's FPS
-    // instead of being capped -- fine for a handful of peers.
-    // No throttle here either (was 1/15, 15Hz) -- same reasoning as the enemy
-    // snapshot rate above: a peer's own Tick only runs once per their own frame,
-    // so this can't fire more than once per frame regardless of the timer value,
-    // and every millisecond of added staleness here is the host's belief about
-    // where a real player currently is, which feeds directly into host-side
-    // mechanic checks (e.g. UMAD P3's DamageDown-for-standing-on-a-black-hole
-    // check) as well as what other peers see. SelfPoseMessage is a single small
-    // message (one GUID + 4 floats) rather than a full WorldSnapshotMessage, so
-    // the absolute bandwidth cost per peer is much smaller than the enemy-side
-    // change -- it just scales with the number of connected peers instead of
-    // being capped at a fixed rate.
     private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
     // Mirrors UmadP5ExaflaresScenario.FrameGapCapSeconds -- a peer's P5 debug-bot
     // replay ticks debugShadowStateP5.Timeline off this Tick's own deltaSeconds
@@ -77,22 +55,6 @@ public sealed class MultiplayerManager : IDisposable
     // still queued on that timeline at once instead of skipping the frame like
     // the real scenario's wall-clock Stopwatch does.
     private const float P5ReplayFrameGapCapSeconds = 0.25f;
-
-
-    // Scenarios a multiplayer session can host/join/start -- gates MainWindow's
-    // "Multiplayer..." button and StartScenario's own validation. Core
-    // replication (enemies/tethers/roles/statuses/ModelState) works for any
-    // IScenario automatically; this list exists only because debug-bot AI
-    // replay (TrySendAiReplayState/TryStartDebugBotReplay) needs a hand-written
-    // per-scenario wire message and shadow-state factory, so a scenario has to
-    // be deliberately added here once that's been done for it.
-    public static readonly Type[] SupportedScenarios =
-    [
-        typeof(UmadP2ForsakenScenario),
-        typeof(UmadP3BlackHoleScenario),
-        typeof(UmadP4KefkaSaysScenario),
-        typeof(UmadP5ExaflaresScenario),
-    ];
 
     private RelayClient? relay;
     private bool running;
@@ -303,9 +265,7 @@ public sealed class MultiplayerManager : IDisposable
     // Per-scenario siblings of the two fields above (see TryStartDebugBotReplay) --
     // only one is ever non-null in a given run, matching whichever scenario is
     // actually active; kept separate rather than a shared base type since each
-    // scenario's shadow-state shape/fields differ (same reasoning as
-    // MultiplayerManager.SupportedScenarios' comment on why this isn't a
-    // generic/opaque-payload abstraction).
+    // scenario's shadow-state shape/fields differ.
     private P2AiReplayStateMessage? pendingP2AiReplayState;
     private UmadP2ForsakenState? debugShadowStateP2;
     private P4AiReplayStateMessage? pendingP4AiReplayState;
@@ -776,7 +736,7 @@ public sealed class MultiplayerManager : IDisposable
         // every peer's OnStartReceived resolve the identical scenario/strat
         // instead of each independently guessing.
         if (Plugin.MainWindow.SelectedScenario is not { } selectedScenario
-            || !SupportedScenarios.Contains(selectedScenario.GetType()))
+            || !selectedScenario.SupportsMultiplayer)
         {
             DiagnosticLog.Warn("[Multiplayer] Cannot start: no multiplayer-supported scenario is selected in the main window.");
             return;
@@ -1199,6 +1159,11 @@ public sealed class MultiplayerManager : IDisposable
 
     // ---- Host: sampling the live simulation --------------------------------
 
+    // No throttle: Tick already runs at most once per Framework update, so any
+    // interval below the actual frame time is a no-op, and every peer benefits
+    // from a boss position/facing that's as fresh as the host's own frame rate
+    // allows. Bandwidth/CPU scales with host FPS instead of being capped --
+    // fine for a handful of peers.
     private void SampleAndBroadcastSnapshot()
     {
         var world = Plugin.GameInstance.World;
@@ -1443,6 +1408,10 @@ public sealed class MultiplayerManager : IDisposable
 
     // ---- Peer: reporting our own pose --------------------------------------
 
+    // No throttle, same reasoning as SampleAndBroadcastSnapshot: this feeds
+    // the host's belief about where a real player is (mechanic checks, other
+    // peers' view of them), and it's one GUID + 4 floats, cheap enough to send
+    // every Tick regardless of peer count.
     private void SendSelfPose()
     {
         var player = Plugin.GameInstance.World.Party.Player;
@@ -1892,9 +1861,9 @@ public sealed class MultiplayerManager : IDisposable
     // Plugin.Framework.Run, same reasoning as peerEnteredInstance below -- so
     // this polls instead of reading it synchronously right after the call.
     // Sent unconditionally: the host never knows or cares which peers, if any,
-    // are using it locally. One case per multiplayer-supported scenario (see
-    // SupportedScenarios) -- add a new one here alongside a new *AiReplayStateMessage
-    // and *State.FromNetworkReplay when porting another scenario.
+    // are using it locally. One case per IScenario.SupportsMultiplayer scenario --
+    // add a new one here alongside a new *AiReplayStateMessage and
+    // *State.FromNetworkReplay when porting another scenario.
     private void TrySendAiReplayState()
     {
         switch (Plugin.GameInstance.Scenarios[Session.ScenarioIndex])

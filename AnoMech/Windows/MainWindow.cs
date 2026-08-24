@@ -169,7 +169,7 @@ public unsafe class MainWindow : Window, IDisposable
                     {
                         var selected = _selectedScenario == scenario;
                         var mpUnsupported = (mpWindowOpen || mpConnected)
-                            && !MultiplayerManager.SupportedScenarios.Contains(scenario.GetType());
+                            && !scenario.SupportsMultiplayer;
                         if (selected) ImGui.PushStyleColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive));
                         ImGui.PushID(scenario.Name);
                         ImGui.BeginDisabled(mpUnsupported);
@@ -231,7 +231,7 @@ public unsafe class MainWindow : Window, IDisposable
         var game = plugin.Game;
 
         ImGui.TextUnformatted(FullName(_selectedScenario));
-        if (MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()))
+        if (_selectedScenario.SupportsMultiplayer)
         {
             ImGui.SameLine();
             if (ImGui.SmallButton("Multiplayer...")) plugin.MultiplayerWindow.Toggle();
@@ -281,7 +281,7 @@ public unsafe class MainWindow : Window, IDisposable
 
         var inInn = ZoneSession.IsInInn();
         var envReady = inInn && !ZoneSession.IsPlayerBusy();
-        var mpBlocked = MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()) && plugin.Multiplayer.IsConnected;
+        var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
         if (_selectedScenario.SupportsSolo)
         {
             ImGui.BeginDisabled(!envReady || mpBlocked);
@@ -368,7 +368,7 @@ public unsafe class MainWindow : Window, IDisposable
         // "waiting for the host to start" forever; a peer clicking it would start a
         // second, fully independent local simulation instead of waiting for the
         // host's broadcast.
-        var mpBlocked = MultiplayerManager.SupportedScenarios.Contains(_selectedScenario.GetType()) && plugin.Multiplayer.IsConnected;
+        var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
         var canStart = envReady && hasStrat && !mpBlocked;
         ImGui.BeginDisabled(!canStart);
         if (ImGui.Button("Start")) plugin.Game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
