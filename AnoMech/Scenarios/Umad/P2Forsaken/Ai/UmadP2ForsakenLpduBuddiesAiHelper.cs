@@ -43,17 +43,17 @@ public sealed class UmadP2ForsakenLpduBuddiesAiHelper
         Init();
 
         ai.Move(1f, InitialLineup);
-        ai.Move(10.16f, TowerPositions(0), jitter: .0f, arrivalTime: 22.16f, leaveImmediately: true);
-        ai.Move(25.17f, TowerPositions(1), jitter: .0f, arrivalTime: 32.16f, leaveImmediately: true);
-        ai.Move(33f, AllThingsEndsBait(0, 2), arrivalTime: 37f, leaveImmediately: true);
-        ai.Move(39.21f, TowerPositions(2), jitter: .0f, arrivalTime: 43.21f, leaveImmediately: true);
-        ai.Move(47.22f, TowerPositions(3), jitter: .0f, arrivalTime: 53.22f, leaveImmediately: true);
-        ai.Move(54f, AllThingsEndsBait(1, 4), arrivalTime: 57f, leaveImmediately: true);
-        ai.Move(59.26f, TowerPositions(4), jitter: .0f, arrivalTime: 63.86f, leaveImmediately: true);
-        ai.Move(65.27f, TowerPositions(5), jitter: .0f, arrivalTime: 73.27f, leaveImmediately: true);
-        ai.Move(75f, AllThingsEndsBait(2, 6), arrivalTime: 78f, leaveImmediately: true);
-        ai.Move(81.31f, TowerPositions(6), jitter: .0f, arrivalTime: 85.8f, leaveImmediately: true);
-        ai.Move(90.32f, TowerPositions(7), jitter: .0f, arrivalTime: 94.32f, leaveImmediately: true);
+        ai.Move(10.16f, TowerPositions(0), jitter: .0f, sprint: true);
+        ai.Move(25.17f, TowerPositions(1), jitter: .0f, sprint: true);
+        ai.Move(33f, AllThingsEndsBait(0, 2), sprint: true);
+        ai.Move(39.21f, TowerPositions(2), jitter: .0f, sprint: true);
+        ai.Move(47.22f, TowerPositions(3), jitter: .0f, sprint: true);
+        ai.Move(54f, AllThingsEndsBait(1, 4), sprint: true);
+        ai.Move(59.26f, TowerPositions(4), jitter: .0f, sprint: true);
+        ai.Move(65.27f, TowerPositions(5), jitter: .0f, sprint: true);
+        ai.Move(75f, AllThingsEndsBait(2, 6), sprint: true);
+        ai.Move(81.31f, TowerPositions(6), jitter: .0f, sprint: true);
+        ai.Move(90.32f, TowerPositions(7), jitter: .0f, sprint: true);
         // Occurrence 3 (t~88.36 castbar) has no "upcoming" tower to bisect against --
         // Tower(7) is the last one, already resolved by 95.82. Unlike 0/1/2, there's no
         // subsequent tower move to collide with (nothing else moves the party again),
@@ -72,8 +72,8 @@ public sealed class UmadP2ForsakenLpduBuddiesAiHelper
         // there's no rush before the castbar; second leg's worst case (~26.7y,
         // PastMeleeFromCenter+FutureMeleeFromCenter apart on opposite sides of center)
         // still fits comfortably inside the 5s cast window even with sprint.
-        ai.Move(95.83f, BetweenLastTowers(), arrivalTime: 98f, leaveImmediately: true);
-        ai.Move(101.16f, AllThingsEndsBait(3, 7), arrivalTime: 105f, leaveImmediately: true);
+        ai.Move(95.83f, BetweenLastTowers(), sprint: true);
+        ai.Move(101.16f, AllThingsEndsBait(3, 7), sprint: true);
     }
 
     // Base point is "opposite the upcoming towers" for Future's End, "between the

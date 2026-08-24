@@ -33,35 +33,21 @@ public sealed class AiManager
         this.world = world;
     }
 
-    // Schedule a slot-move at `time`. `positions` is evaluated at fire-time;
-    // null entries in the returned AiMove are skipped (no movement that slot).
-    // When `arrivalTime` > 0, each member's MoveTo is deferred so they arrive at
-    // the destination at scenario-time `arrivalTime` (running at RunSpeed) --
-    // unless a plain walk can't close the gap in time but sprinting could, in
-    // which case they pop Sprint (status, for the party-list icon, replicated to
-    // every host/peer the same way any other AddStatus call already is) and
-    // leave immediately at SprintSpeed instead of waiting to see if they're late.
+    // Schedule a slot-move at `time`; null AiMove entries are skipped.
+    // `arrivalTime` set: freeze until the last safe moment, then walk/sprint to
+    // land exactly on it. Unset: go now, no sprint consideration. `sprint`
+    // (only meaningful without `arrivalTime`) forces SprintSpeed and sizes the
+    // Sprint status off distance instead of a deadline.
     //
-    // `leaveImmediately` opts a caller out of the defer-until-the-last-moment
-    // part of that: the member still walks/sprints at whatever speed makes
-    // `arrivalTime`, but departs after LeaveImmediatelyDelay instead of standing
-    // frozen at the old spot until the last possible moment then dashing.
-    // Confirmed via dump: UMAD P2 Forsaken's tower reassignments have enough
-    // slack that the old default made bots visibly freeze for 5-6s then snap
-    // to the next spot in under a second. Off by default -- this only flips for
-    // P2 Forsaken's own Move calls so P3/P4/TOP's already-verified timing (where
-    // the deferred wait is presumably intentional/tuned) is untouched.
-    //
-    // The departure itself is delayed by LeaveImmediatelyDelay rather than fired
-    // in the same tick the event scheduler wakes: a peer-controlled role's
-    // Position (used by the host's own damage.Resolve, e.g. UmadP2Forsaken's
-    // AllThingsEnding cone check) comes from that peer's last broadcast pose
-    // snapshot, not a host-local simulation -- moving in the exact same frame an
-    // event fires risks the host resolving a cone/hitbox check against a stale
-    // pre-move snapshot for that role before its next pose broadcast lands.
-    private const float LeaveImmediatelyDelay = 0.3f;
+    // Every MoveTo except the deferred freeze-then-walk path fires via
+    // PromptMoveDelay instead of the same EventScheduler.Tick() pass that
+    // scheduled it: Add() computes a new entry's time as elapsed + offset, so
+    // a 0-delay entry added while that same Tick() is still iterating gets
+    // swept into its own while loop and runs immediately, same frame. A
+    // positive delay guarantees it lands on a later tick instead.
+    private const float PromptMoveDelay = 0.3f;
 
-    public void Move(float time, Func<IAiMove> positions, float jitter = DefaultJitter, float arrivalTime = 0f, bool leaveImmediately = false)
+    public void Move(float time, Func<IAiMove> positions, float jitter = DefaultJitter, float? arrivalTime = null, bool sprint = false)
     {
         world.Events.Add(time, () =>
         {
@@ -73,40 +59,47 @@ public sealed class AiManager
                 if (member == null || !member.IsAlive()) continue;
                 var target = Jitter(new Vector3(local.X, 0f, local.Y), jitter);
                 var role = (member as ISimPartyMember)?.Role.ToString() ?? $"slot{i}";
+                var dx = target.X - member.Position.X;
+                var dz = target.Z - member.Position.Z;
+                var dist = MathF.Sqrt(dx * dx + dz * dz);
 
-                if (arrivalTime > 0f)
+                if (arrivalTime is not { } deadline)
                 {
-                    var dx = target.X - member.Position.X;
-                    var dz = target.Z - member.Position.Z;
-                    var dist = MathF.Sqrt(dx * dx + dz * dz);
-                    var available = arrivalTime - time;
-                    var neededSpeed = available > 0f ? dist / available : float.PositiveInfinity;
-
-                    if (neededSpeed > RunSpeed && neededSpeed <= SprintSpeed)
+                    if (sprint)
                     {
-                        member.AddStatus(SprintStatusId, available, SprintStatusParam);
-                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) sprinting -- {dist:F1}y in {available:F2}s needs {neededSpeed:F2}y/s.");
-                        member.MoveTo(target, speed: SprintSpeed);
-                        continue;
+                        member.AddStatus(SprintStatusId, dist / SprintSpeed, SprintStatusParam);
+                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) sprinting -- {dist:F1}y.");
+                        world.Events.Add(PromptMoveDelay, () => member.MoveTo(target, speed: SprintSpeed));
                     }
-
-                    if (leaveImmediately)
+                    else
                     {
-                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) leaving in {LeaveImmediatelyDelay:F2}s (arrive {arrivalTime:F1}).");
-                        world.Events.Add(LeaveImmediatelyDelay, () => member.MoveTo(target));
-                        continue;
+                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}).");
+                        world.Events.Add(PromptMoveDelay, () => member.MoveTo(target, speed: RunSpeed));
                     }
-
-                    var delay = available - dist / RunSpeed;
-                    if (delay > 0f)
-                    {
-                        AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) deferred {delay:F2}s (arrive {arrivalTime:F1}).");
-                        world.Events.Add(delay, () => member.MoveTo(target));
-                        continue;
-                    }
+                    continue;
                 }
-                AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}).");
-                member.MoveTo(target);
+
+                var available = deadline - time;
+                var neededSpeed = available > 0f ? dist / available : float.PositiveInfinity;
+
+                if (neededSpeed > RunSpeed && neededSpeed <= SprintSpeed)
+                {
+                    member.AddStatus(SprintStatusId, available, SprintStatusParam);
+                    AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) sprinting -- {dist:F1}y in {available:F2}s needs {neededSpeed:F2}y/s.");
+                    world.Events.Add(PromptMoveDelay, () => member.MoveTo(target, speed: SprintSpeed));
+                    continue;
+                }
+
+                var delay = available - dist / RunSpeed;
+                if (delay > 0f)
+                {
+                    AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) deferred {delay:F2}s (arrive {deadline:F1}).");
+                    world.Events.Add(delay, () => member.MoveTo(target, speed: RunSpeed));
+                    continue;
+                }
+
+                AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) can't make deadline {deadline:F1}, leaving now.");
+                world.Events.Add(PromptMoveDelay, () => member.MoveTo(target, speed: RunSpeed));
             }
         });
     }
