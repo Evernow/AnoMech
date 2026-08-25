@@ -502,15 +502,7 @@ public sealed class UmadP3BlackHoleScenario : IScenario
             var size = MathF.PI / 6;      // half cone 30 degrees, estimated based on animation
             world.Events.Add(time - 0.2f, () => enemy?.Face(LiveConeTarget(target)));
             world.Events.Add(time, () => enemy?.Cast(actionId, targetId: LiveConeTarget(target)?.GameObjectId));
-            // stackMinTargets is evaluated at resolve time, not capture time: this stack wants
-            // "everyone currently alive", not a fixed 8. With a hardcoded 8, anyone who'd already
-            // died to an earlier, unrelated mechanic this fight permanently dropped the live
-            // headcount below 8, so every later 8-man stack wave would find targets.Count < 8 and
-            // wipe the rest of the party regardless of how well they executed it (confirmed via
-            // AnoMech-DamageDebug dumps: a single earlier Implosion death cascaded into a
-            // "7/8 players in stack" kill of everyone else). The real fight scales a stack's
-            // damage split by who's actually alive to share it, not by a fixed roster size.
-            world.Events.Add(time, () => damage.Resolve(enemy, actionId, [DamageType.Magic], [(StatusId.MagicVulnerabilityUp, 1.96f)], stackMinTargets: isFullStack ? party.ActiveMembers().Count() : 0, size: size));
+            world.Events.Add(time, () => damage.Resolve(enemy, actionId, [DamageType.Magic], [(StatusId.MagicVulnerabilityUp, 1.96f)], stackMinTargets: isFullStack ? 8 : 0, size: size));
         }
     }
 
