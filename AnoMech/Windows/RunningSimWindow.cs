@@ -1,3 +1,4 @@
+using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 
@@ -33,6 +34,15 @@ public sealed class RunningSimWindow : Window
     {
         var mp = plugin.Multiplayer;
         var inSession = mp.SessionCode != null;
+
+        // ActiveScenario is never set for a peer, so IsRunning is the only signal
+        // that works for every seat; Paused (a post-wipe freeze) is checked
+        // separately since it doesn't clear either one.
+        var scenarioActive = inSession ? mp.IsRunning : plugin.Game.ActiveScenario != null;
+        var running = scenarioActive && !plugin.Game.Paused;
+        ImGui.TextColored(
+            running ? new Vector4(0.4f, 0.9f, 0.4f, 1f) : new Vector4(1f, 0.4f, 0.4f, 1f),
+            running ? "Running sim" : "Sim paused, wiped, reset, or leave");
 
         if (inSession)
         {
