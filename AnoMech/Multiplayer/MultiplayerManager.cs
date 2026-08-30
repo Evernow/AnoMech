@@ -242,6 +242,15 @@ public sealed partial class MultiplayerManager : IDisposable
     // deferred via Plugin.Framework.Run.
     private bool aiReplayStateSent;
 
+    // Host-only: BroadcastRunEnded's EndMessage is fire-and-forget over a possibly-bad
+    // connection -- if it's lost, a peer has no way to find out the run ended short
+    // of PeerStaleTimeoutMs, or ever. Non-null while resends are still owed; see Tick().
+    private const int EndMessageResendCount = 4;
+    private const float EndMessageResendIntervalSeconds = 1f;
+    private bool? pendingEndResendReturnedToInn;
+    private int endResendsRemaining;
+    private float endResendTimer;
+
     // Host-only: same deferred-Framework.Run race as peerEnteredInstance below,
     // but on the host's own "has my run actually started" check -- running is
     // set true synchronously in ActuallyStartScenario, but RunScenarioAsHost's
@@ -483,6 +492,7 @@ public sealed partial class MultiplayerManager : IDisposable
         startCheckTimer = 0f;
         debugBotControlled = false;
         aiReplayStateSent = false;
+        pendingEndResendReturnedToInn = null;
         StopDebugBotReplay();
     }
 
@@ -833,6 +843,7 @@ public sealed partial class MultiplayerManager : IDisposable
         nextEventObjectNetId = 0;
         warnedStalePeers.Clear();
         aiReplayStateSent = false;
+        pendingEndResendReturnedToInn = null;
         hostScenarioStarted = false;
         var nowMs = Environment.TickCount64;
         foreach (var peerId in Session.ClaimedBy.Values)

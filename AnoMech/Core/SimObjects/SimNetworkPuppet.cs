@@ -34,6 +34,17 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
     // doc comment (same reasoning, same value) for why rotation needs stepping too,
     // and why this was raised from a half-turn-in-1/8s.
     private const float AngularCatchUpSpeed = MathF.PI * 20f;
+    // See SimEnemy.NetworkIntervalSmoothingFactor -- same reasoning: CatchUpSpeed is
+    // a floor once the real pose interval is known, not the pacing itself.
+    private const float IntervalSmoothingFactor = 0.3f;
+    private const float MinPacingWindowSeconds = 0.05f;
+    private float timeSinceLastPose;
+    private float estimatedPoseInterval = 0.05f;
+    // See SimEnemy.MaxNetworkExtrapolationSeconds -- same reasoning. Only feeds the
+    // Tick() glide target below; targetPosition/Position (mechanic resolution) is
+    // never touched by it.
+    private const float MaxPoseExtrapolationSeconds = 1f;
+    private Vector3 poseVelocity;
     // Mirrors Game.Movement.RunTimelineId -- can't reference it by type name here
     // since the Movement property below shadows the Movement type in this scope.
     private const ushort RunTimelineId = 22;
@@ -85,23 +96,31 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
     public void ApplyNetworkPose(Vector3 position, float rotation)
     {
         if (targetPosition is { } previous)
+        {
             poseMoving = Vector3.DistanceSquared(previous, position) > PoseMovementEpsilon * PoseMovementEpsilon;
+            estimatedPoseInterval += (timeSinceLastPose - estimatedPoseInterval) * IntervalSmoothingFactor;
+            poseVelocity = timeSinceLastPose > MinPacingWindowSeconds ? (position - previous) / timeSinceLastPose : Vector3.Zero;
+        }
         targetPosition = position;
         targetRotation = rotation;
+        timeSinceLastPose = 0f;
     }
 
     public override void Tick(float deltaSeconds)
     {
         base.Tick(deltaSeconds);
-        if (Dead || targetPosition is not { } target) return;
+        if (Dead || targetPosition is not { } rawTarget) return;
+        timeSinceLastPose += deltaSeconds;
 
         // Interpolate the visual/native transform, not the overridden Position
-        // (which already reports `target` directly) -- basePos is where the
-        // rendered model currently sits.
+        // (which reports targetPosition directly, untouched by the extrapolation
+        // below) -- basePos is where the rendered model currently sits.
+        var target = rawTarget + poseVelocity * MathF.Min(timeSinceLastPose, MaxPoseExtrapolationSeconds);
         var basePos = base.Position;
         var delta = target - basePos;
         var dist = delta.Length();
-        var step = CatchUpSpeed * deltaSeconds;
+        var remainingWindow = MathF.Max(estimatedPoseInterval - timeSinceLastPose, MinPacingWindowSeconds);
+        var step = MathF.Max(dist / remainingWindow, CatchUpSpeed) * deltaSeconds;
         var nextRotation = MathUtil.StepRotation(Rotation, targetRotation, AngularCatchUpSpeed * deltaSeconds);
         if (dist > SnapThreshold || dist <= step)
             SetPosition(new Placement(target, nextRotation));

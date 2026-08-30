@@ -26,12 +26,14 @@ public sealed partial class MultiplayerManager
 {
     // ---- Host: sampling the live simulation --------------------------------
 
-    // No throttle: Tick already runs at most once per Framework update, so any
-    // interval below the actual frame time is a no-op, and every peer benefits
-    // from a boss position/facing that's as fresh as the host's own frame rate
-    // allows. Bandwidth/CPU scales with host FPS instead of being capped --
-    // fine for a handful of peers.
-    private void SampleAndBroadcastSnapshot()
+    // Backpressure-gated rather than fired every Tick unconditionally: a connection
+    // that can't keep up otherwise queues sends behind each other on RelayClient's
+    // unbounded FIFO, growing an ever-larger backlog of stale state. Never starting a
+    // new send while the last is in flight self-adjusts the rate to what the
+    // connection can sustain.
+    private Task? pendingSnapshotSend;
+
+    private Task SampleAndBroadcastSnapshot()
     {
         var world = Plugin.GameInstance.World;
 
@@ -132,6 +134,37 @@ public sealed partial class MultiplayerManager
             tethers.Add(new TetherState(netId, tether.TetherId, aEnemy, aRole, bEnemy, bRole));
         }
 
+        var liveEventObjects = world.Children.OfType<SimEventObject>().Where(o => o.IsActive).ToList();
+        foreach (var stale in hostEventObjectNetIds.Keys.Where(o => !liveEventObjects.Contains(o)).ToList())
+        {
+            DiagnosticLog.Debug($"[Multiplayer] Host: event object NetId {hostEventObjectNetIds[stale]} (EObj 0x{stale.EObjRowId:X}) no longer active -- dropping from broadcast.");
+            hostEventObjectNetIds.Remove(stale);
+        }
+
+        var eventObjects = new List<EventObjectState>(liveEventObjects.Count);
+        foreach (var eo in liveEventObjects)
+        {
+            if (!hostEventObjectNetIds.TryGetValue(eo, out var netId))
+            {
+                netId = nextEventObjectNetId++;
+                hostEventObjectNetIds[eo] = netId;
+                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new event object NetId {netId} -- EObj 0x{eo.EObjRowId:X}, pos {eo.Position}, state {eo.CurrentState}.");
+            }
+            eventObjects.Add(new EventObjectState(
+                netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
+                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation));
+        }
+
+        return relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, eventObjects));
+    }
+
+    // Paced independently of SampleAndBroadcastSnapshot -- see RolesSnapshotMessage's
+    // doc comment.
+    private Task? pendingRolesSend;
+
+    private Task SampleAndBroadcastRoles()
+    {
+        var world = Plugin.GameInstance.World;
         var roles = new List<RoleState>(8);
         foreach (var role in Enum.GetValues<PartyRole>())
         {
@@ -161,29 +194,7 @@ public sealed partial class MultiplayerManager
                 member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f,
                 statuses, newLockonVfxIds));
         }
-
-        var liveEventObjects = world.Children.OfType<SimEventObject>().Where(o => o.IsActive).ToList();
-        foreach (var stale in hostEventObjectNetIds.Keys.Where(o => !liveEventObjects.Contains(o)).ToList())
-        {
-            DiagnosticLog.Debug($"[Multiplayer] Host: event object NetId {hostEventObjectNetIds[stale]} (EObj 0x{stale.EObjRowId:X}) no longer active -- dropping from broadcast.");
-            hostEventObjectNetIds.Remove(stale);
-        }
-
-        var eventObjects = new List<EventObjectState>(liveEventObjects.Count);
-        foreach (var eo in liveEventObjects)
-        {
-            if (!hostEventObjectNetIds.TryGetValue(eo, out var netId))
-            {
-                netId = nextEventObjectNetId++;
-                hostEventObjectNetIds[eo] = netId;
-                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new event object NetId {netId} -- EObj 0x{eo.EObjRowId:X}, pos {eo.Position}, state {eo.CurrentState}.");
-            }
-            eventObjects.Add(new EventObjectState(
-                netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
-                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation));
-        }
-
-        _ = relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, roles, eventObjects));
+        return relay!.SendAsync(new RolesSnapshotMessage(roles));
     }
 
     private (int? enemyNetId, PartyRole? role) ResolveEnd(SimWorld world, SimCharacter? c)

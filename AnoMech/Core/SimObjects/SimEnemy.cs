@@ -71,6 +71,21 @@ public sealed unsafe class SimEnemy : SimNpc
     private const float NetworkSnapThreshold = 15f;
     private const ushort NetworkRunTimelineId = 22; // mirrors Game.Movement.RunTimelineId
 
+    // NetworkCatchUpSpeed is a floor, not the pacing itself, once the real snapshot
+    // interval is known -- a fixed speed catches up to a stale target early and then
+    // idles, jumping or snapping once the next update lands. estimatedNetworkUpdateInterval
+    // (an EMA of the real gap) lets the step below pace across the whole remaining window.
+    private const float NetworkIntervalSmoothingFactor = 0.3f;
+    private const float MinNetworkPacingWindowSeconds = 0.05f;
+    private float timeSinceLastNetworkUpdate;
+    private float estimatedNetworkUpdateInterval = 0.05f;
+
+    // Pacing still leaves the doppel frozen between updates; extrapolating from the
+    // last observed velocity keeps the visual glide advancing instead of idling.
+    // Capped short so a stale/bad velocity sample stops influencing the guess quickly.
+    private const float MaxNetworkExtrapolationSeconds = 1f;
+    private Vector3 networkVelocity;
+
     // Angular counterpart to NetworkCatchUpSpeed -- previously missing entirely,
     // which meant Rotation was written raw from whatever the latest snapshot said
     // rather than stepped toward it: an enemy tracking a moving target (Follow(),
@@ -106,9 +121,16 @@ public sealed unsafe class SimEnemy : SimNpc
     public void ApplyNetworkPosition(Vector3 position, float rotation)
     {
         if (networkTargetPosition is { } previous)
+        {
             networkMoving = Vector3.DistanceSquared(previous, position) > NetworkMovementEpsilon * NetworkMovementEpsilon;
+            estimatedNetworkUpdateInterval += (timeSinceLastNetworkUpdate - estimatedNetworkUpdateInterval) * NetworkIntervalSmoothingFactor;
+            networkVelocity = timeSinceLastNetworkUpdate > MinNetworkPacingWindowSeconds
+                ? (position - previous) / timeSinceLastNetworkUpdate
+                : Vector3.Zero;
+        }
         networkTargetPosition = position;
         networkTargetRotation = rotation;
+        timeSinceLastNetworkUpdate = 0f;
     }
 
     // Driving the run animation off networkInterpAnimActive alone (matched against
@@ -137,12 +159,15 @@ public sealed unsafe class SimEnemy : SimNpc
     // AnimationLock check here at all.
     private void TickNetworkPosition(float deltaSeconds)
     {
-        if (networkTargetPosition is not { } target) return;
+        if (networkTargetPosition is not { } rawTarget) return;
+        timeSinceLastNetworkUpdate += deltaSeconds;
 
+        var target = rawTarget + networkVelocity * MathF.Min(timeSinceLastNetworkUpdate, MaxNetworkExtrapolationSeconds);
         var basePos = Position;
         var delta = target - basePos;
         var dist = delta.Length();
-        var step = NetworkCatchUpSpeed * deltaSeconds;
+        var remainingWindow = MathF.Max(estimatedNetworkUpdateInterval - timeSinceLastNetworkUpdate, MinNetworkPacingWindowSeconds);
+        var step = MathF.Max(dist / remainingWindow, NetworkCatchUpSpeed) * deltaSeconds;
         var nextRotation = MathUtil.StepRotation(Rotation, networkTargetRotation, NetworkAngularCatchUpSpeed * deltaSeconds);
         if (dist > NetworkSnapThreshold || dist <= step)
             SetPosition(new Placement(target, nextRotation));

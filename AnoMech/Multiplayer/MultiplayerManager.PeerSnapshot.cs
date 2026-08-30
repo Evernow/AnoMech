@@ -26,15 +26,16 @@ public sealed partial class MultiplayerManager
 {
     // ---- Peer: reporting our own pose --------------------------------------
 
-    // No throttle, same reasoning as SampleAndBroadcastSnapshot: this feeds
-    // the host's belief about where a real player is (mechanic checks, other
-    // peers' view of them), and it's one GUID + 4 floats, cheap enough to send
-    // every Tick regardless of peer count.
+    // Same backpressure gating as SampleAndBroadcastSnapshot -- a peer's own upload
+    // can be just as bad as the host's connection.
+    private Task? pendingSelfPoseSend;
+
     private void SendSelfPose()
     {
+        if (pendingSelfPoseSend is not (null or { IsCompleted: true })) return;
         var player = Plugin.GameInstance.World.Party.Player;
         if (player == null) return;
-        _ = relay!.SendAsync(new SelfPoseMessage(MyPeerId, player.Position.X, player.Position.Y, player.Position.Z, player.Rotation));
+        pendingSelfPoseSend = relay!.SendAsync(new SelfPoseMessage(MyPeerId, player.Position.X, player.Position.Y, player.Position.Z, player.Rotation));
     }
 
     // ---- Host: applying a peer's reported pose to their puppet -------------
@@ -326,6 +327,55 @@ public sealed partial class MultiplayerManager
             peerTethers.Remove(staleId);
         }
 
+        var seenEventObjectIds = new HashSet<int>();
+        foreach (var o in snap.EventObjects)
+        {
+            seenEventObjectIds.Add(o.NetId);
+            if (!peerEventObjects.TryGetValue(o.NetId, out var eo))
+            {
+                var config = new EventObjectSpawnConfig
+                {
+                    EObjId = o.EObjId,
+                    Placement = new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation),
+                    TimelineState = o.TimelineState,
+                    SpawnVisible = true,
+                };
+                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
+                eo = world.SpawnEventObject(config);
+                if (eo == null)
+                {
+                    DiagnosticLog.Warn($"[Multiplayer] Peer: SpawnEventObject returned null for NetId {o.NetId} (EObj 0x{o.EObjId:X}) -- skipping.");
+                    continue;
+                }
+                peerEventObjects[o.NetId] = eo;
+            }
+            eo.SetPosition(new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation));
+            // Edge-triggered like ModelState -- SetState is a plain field write with
+            // no rebuild to worry about, but re-issuing it every snapshot even
+            // when unchanged is pointless churn.
+            if (!peerEventObjectState.TryGetValue(o.NetId, out var lastState) || lastState != o.CurrentState)
+            {
+                peerEventObjectState[o.NetId] = o.CurrentState;
+                DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) CurrentState -> {o.CurrentState}.");
+                eo.SetState(o.CurrentState);
+            }
+        }
+        foreach (var staleId in peerEventObjects.Keys.Where(id => !seenEventObjectIds.Contains(id)).ToList())
+        {
+            DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {staleId} no longer in snapshot -- despawning local copy.");
+            peerEventObjects[staleId].Despawn();
+            peerEventObjects.Remove(staleId);
+            peerEventObjectState.Remove(staleId);
+        }
+    }
+
+    // Same peerEnteredInstance guard/reasoning as OnWorldSnapshotReceived below.
+    private void OnRolesSnapshotReceived(RolesSnapshotMessage snap)
+    {
+        if (IsHost) return;
+        if (!peerEnteredInstance) return;
+        var world = Plugin.GameInstance.World;
+
         var myRole = MyClaimedRole;
         foreach (var r in snap.Roles)
         {
@@ -373,47 +423,6 @@ public sealed partial class MultiplayerManager
                 foreach (var lockonId in r.NewLockonVfxIds)
                     member.AttachLockonVfx(lockonId, persistent: false);
             }
-        }
-
-        var seenEventObjectIds = new HashSet<int>();
-        foreach (var o in snap.EventObjects)
-        {
-            seenEventObjectIds.Add(o.NetId);
-            if (!peerEventObjects.TryGetValue(o.NetId, out var eo))
-            {
-                var config = new EventObjectSpawnConfig
-                {
-                    EObjId = o.EObjId,
-                    Placement = new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation),
-                    TimelineState = o.TimelineState,
-                    SpawnVisible = true,
-                };
-                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
-                eo = world.SpawnEventObject(config);
-                if (eo == null)
-                {
-                    DiagnosticLog.Warn($"[Multiplayer] Peer: SpawnEventObject returned null for NetId {o.NetId} (EObj 0x{o.EObjId:X}) -- skipping.");
-                    continue;
-                }
-                peerEventObjects[o.NetId] = eo;
-            }
-            eo.SetPosition(new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation));
-            // Edge-triggered like ModelState -- SetState is a plain field write with
-            // no rebuild to worry about, but re-issuing it every snapshot even
-            // when unchanged is pointless churn.
-            if (!peerEventObjectState.TryGetValue(o.NetId, out var lastState) || lastState != o.CurrentState)
-            {
-                peerEventObjectState[o.NetId] = o.CurrentState;
-                DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) CurrentState -> {o.CurrentState}.");
-                eo.SetState(o.CurrentState);
-            }
-        }
-        foreach (var staleId in peerEventObjects.Keys.Where(id => !seenEventObjectIds.Contains(id)).ToList())
-        {
-            DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {staleId} no longer in snapshot -- despawning local copy.");
-            peerEventObjects[staleId].Despawn();
-            peerEventObjects.Remove(staleId);
-            peerEventObjectState.Remove(staleId);
         }
     }
 

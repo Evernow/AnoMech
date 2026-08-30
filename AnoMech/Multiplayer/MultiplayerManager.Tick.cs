@@ -78,6 +78,13 @@ public sealed partial class MultiplayerManager
         DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
         _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
         LobbyChanged?.Invoke();
+
+        // Arms Tick()'s resend loop below -- this send is fire-and-forget over a
+        // possibly-bad connection, so back it with a few redundant re-sends instead
+        // of trusting the one shot.
+        pendingEndResendReturnedToInn = returnedToInn;
+        endResendsRemaining = EndMessageResendCount;
+        endResendTimer = 0f;
     }
 
     // Called from the host's own "Leave" button (MainWindow) right after
@@ -168,6 +175,20 @@ public sealed partial class MultiplayerManager
                     FinishStartCheck();
                 }
             }
+
+            if (pendingEndResendReturnedToInn is { } returnedToInn)
+            {
+                endResendTimer += deltaSeconds;
+                if (endResendTimer >= EndMessageResendIntervalSeconds)
+                {
+                    endResendTimer = 0f;
+                    endResendsRemaining--;
+                    DiagnosticLog.Info($"[Multiplayer] Re-broadcasting EndMessage (ReturnedToInn={returnedToInn}), {endResendsRemaining} retries left.");
+                    _ = relay?.SendAsync(Session.ToMessage());
+                    _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
+                    if (endResendsRemaining <= 0) pendingEndResendReturnedToInn = null;
+                }
+            }
         }
         else if (IsSessionNotFound)
         {
@@ -234,7 +255,10 @@ public sealed partial class MultiplayerManager
                 return;
             }
             if (!aiReplayStateSent) TrySendAiReplayState();
-            SampleAndBroadcastSnapshot();
+            if (pendingSnapshotSend is null or { IsCompleted: true })
+                pendingSnapshotSend = SampleAndBroadcastSnapshot();
+            if (pendingRolesSend is null or { IsCompleted: true })
+                pendingRolesSend = SampleAndBroadcastRoles();
         }
         else
         {

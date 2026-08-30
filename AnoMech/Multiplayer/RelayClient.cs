@@ -33,6 +33,11 @@ public sealed class RelayClient : IDisposable
     // get a deterministic wire order regardless of how many race to enqueue.
     private readonly Channel<(byte[] Bytes, TaskCompletionSource Completion)> sendQueue =
         Channel.CreateUnbounded<(byte[], TaskCompletionSource)>();
+    // WorldSnapshotMessage alone can be large enough to noticeably hog the socket's
+    // one-at-a-time send slot; a separate queue, drained only once sendQueue is
+    // empty, keeps small/urgent messages from queuing behind it.
+    private readonly Channel<(byte[] Bytes, TaskCompletionSource Completion)> bulkSendQueue =
+        Channel.CreateUnbounded<(byte[], TaskCompletionSource)>();
     private bool disposed;
 
     public event Action<MpMessage>? MessageReceived;
@@ -70,36 +75,66 @@ public sealed class RelayClient : IDisposable
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions));
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // TryWrite on an unbounded channel is synchronous and never fails while the
-        // channel is open -- the enqueue itself happens before this method's first
-        // await, so sequential callers land in the queue in the exact order they called
-        // SendAsync, however many of them race to get here.
-        if (!sendQueue.Writer.TryWrite((bytes, completion))) return;
+        // channel is open, so sequential callers land in order. Ordering only holds
+        // within a queue, not across the two -- see bulkSendQueue's comment.
+        var queue = message is WorldSnapshotMessage ? bulkSendQueue : sendQueue;
+        if (!queue.Writer.TryWrite((bytes, completion))) return;
         await completion.Task.ConfigureAwait(false);
     }
 
-    // Single consumer draining sendQueue strictly in enqueue order -- this is what
-    // actually makes SendAsync's ordering guarantee hold, not just the enqueue step.
+    // A stuck send otherwise has no upper bound (ClientWebSocket allows only one
+    // outstanding at a time, with no built-in timeout). Aborting on timeout faults
+    // ReceiveLoopAsync's pending read too, which is what fires Disconnected and
+    // triggers reconnect. Longer than PeerStaleTimeoutMs since one send's duration
+    // depends on that message's own size, not overall connection health.
+    private const int SendTimeoutMs = 10_000;
+
+    // Always checks the priority queue before bulkSendQueue -- see its comment.
     private async Task SendLoopAsync()
     {
         try
         {
-            await foreach (var (bytes, completion) in sendQueue.Reader.ReadAllAsync(cts.Token).ConfigureAwait(false))
+            while (true)
             {
-                try
+                if (sendQueue.Reader.TryRead(out var entry) || bulkSendQueue.Reader.TryRead(out entry))
                 {
-                    await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cts.Token).ConfigureAwait(false);
-                    completion.SetResult();
+                    await SendOneAsync(entry.Bytes, entry.Completion).ConfigureAwait(false);
+                    continue;
                 }
-                catch (Exception e)
-                {
-                    DiagnosticLog.Warn($"[RelayClient] Send failed: {e.Message}");
-                    completion.SetException(e);
-                }
+                // Nothing ready -- wait for whichever queue fills first, then loop
+                // back around so the priority check above runs again.
+                var prioritySignal = sendQueue.Reader.WaitToReadAsync(cts.Token).AsTask();
+                var bulkSignal = bulkSendQueue.Reader.WaitToReadAsync(cts.Token).AsTask();
+                await Task.WhenAny(prioritySignal, bulkSignal).ConfigureAwait(false);
+                // Both readers complete once Dispose() finishes both queues.
+                if (sendQueue.Reader.Completion.IsCompleted && bulkSendQueue.Reader.Completion.IsCompleted) return;
             }
         }
         catch (OperationCanceledException)
         {
             // Dispose() cancelled us -- not a failure.
+        }
+    }
+
+    private async Task SendOneAsync(byte[] bytes, TaskCompletionSource completion)
+    {
+        try
+        {
+            var sendTask = socket.SendAsync(bytes, WebSocketMessageType.Text, true, cts.Token);
+            if (await Task.WhenAny(sendTask, Task.Delay(SendTimeoutMs, cts.Token)).ConfigureAwait(false) != sendTask)
+            {
+                DiagnosticLog.Warn($"[RelayClient] Send stuck for over {SendTimeoutMs / 1000}s -- treating the connection as dead.");
+                try { socket.Abort(); } catch { /* best-effort; ReceiveLoopAsync's fault is what actually matters */ }
+                completion.SetException(new TimeoutException($"Send timed out after {SendTimeoutMs}ms."));
+                return;
+            }
+            await sendTask.ConfigureAwait(false);
+            completion.SetResult();
+        }
+        catch (Exception e)
+        {
+            DiagnosticLog.Warn($"[RelayClient] Send failed: {e.Message}");
+            completion.SetException(e);
         }
     }
 
@@ -170,7 +205,10 @@ public sealed class RelayClient : IDisposable
         // never gets set -- hanging them forever instead of letting them observe the
         // disconnect like a normal failed send.
         sendQueue.Writer.TryComplete();
+        bulkSendQueue.Writer.TryComplete();
         while (sendQueue.Reader.TryRead(out var pending))
+            pending.Completion.TrySetException(new ObjectDisposedException(nameof(RelayClient)));
+        while (bulkSendQueue.Reader.TryRead(out var pending))
             pending.Completion.TrySetException(new ObjectDisposedException(nameof(RelayClient)));
         cts.Cancel();
         try { socket.Abort(); } catch { /* best-effort teardown */ }

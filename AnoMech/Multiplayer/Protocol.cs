@@ -23,6 +23,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(StartCheckResponseMessage), "startCheckResponse")]
 [JsonDerivedType(typeof(SelfPoseMessage), "pose")]
 [JsonDerivedType(typeof(WorldSnapshotMessage), "snapshot")]
+[JsonDerivedType(typeof(RolesSnapshotMessage), "rolesSnapshot")]
 [JsonDerivedType(typeof(RoleKilledMessage), "killed")]
 [JsonDerivedType(typeof(EndMessage), "end")]
 [JsonDerivedType(typeof(PingMessage), "ping")]
@@ -229,8 +230,14 @@ public sealed record EventObjectState(
 // LobbyStateMessage) -- a dropped frame just means one tick of staleness, not
 // a permanently wrong reconstruction.
 public sealed record WorldSnapshotMessage(
-    List<EnemyState> Enemies, List<TetherState> Tethers, List<RoleState> Roles,
+    List<EnemyState> Enemies, List<TetherState> Tethers,
     List<EventObjectState> EventObjects) : MpMessage;
+
+// Host -> everyone, paced independently of WorldSnapshotMessage (see
+// MultiplayerManager.SampleAndBroadcastSnapshot/RelayClient's priority queue).
+// Split out since role positions are small and urgent -- movement a player
+// notices immediately -- while enemy data can be large on a busy mechanic wave.
+public sealed record RolesSnapshotMessage(List<RoleState> Roles) : MpMessage;
 
 // Host -> everyone, one per Game.PartyMemberKilled. A receiving client calls
 // Game.Kill on whatever currently occupies that role locally -- their own real

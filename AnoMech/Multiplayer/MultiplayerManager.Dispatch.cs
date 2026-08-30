@@ -45,10 +45,21 @@ public sealed partial class MultiplayerManager
 
     private void OnMessageReceivedOffThread(MpMessage message) => pendingMessages.Enqueue(message);
 
+    // Skips a WorldSnapshotMessage/RolesSnapshotMessage when the next queued item is
+    // another of the same type -- under a bad connection this can back up several
+    // deep and then replay in a burst, firing every cast/position edge at once. Only
+    // drops an earlier same-type entry for a newer one right behind it, so cross-type
+    // wire order is untouched. Safe: CastSeq edges compare against this client's own
+    // last-seen value regardless of skips, and damage resolution is host-authoritative.
     private void DrainPendingMessages()
     {
         while (pendingMessages.TryDequeue(out var message))
+        {
+            if ((message is WorldSnapshotMessage && pendingMessages.TryPeek(out var nextSnap) && nextSnap is WorldSnapshotMessage)
+                || (message is RolesSnapshotMessage && pendingMessages.TryPeek(out var nextRoles) && nextRoles is RolesSnapshotMessage))
+                continue;
             Dispatch(message);
+        }
     }
 
     // `source` is the specific RelayClient instance this event came from --
@@ -111,7 +122,7 @@ public sealed partial class MultiplayerManager
         // receiving it tears the whole session down a few lines later
         // regardless; when it's a departing peer instead, it plainly isn't a
         // host message at all and must not be mistaken for one.
-        if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage
+        if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage or RolesSnapshotMessage
             or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage
             or AiReplayStateMessage or P2AiReplayStateMessage or P4AiReplayStateMessage or P5AiReplayStateMessage)
         {
@@ -181,6 +192,9 @@ public sealed partial class MultiplayerManager
                 break;
             case WorldSnapshotMessage snap when !IsHost:
                 OnWorldSnapshotReceived(snap);
+                break;
+            case RolesSnapshotMessage rolesSnap when !IsHost:
+                OnRolesSnapshotReceived(rolesSnap);
                 break;
             case RoleKilledMessage killed when !IsHost:
                 OnRoleKilledReceived(killed);
