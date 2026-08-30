@@ -5,9 +5,12 @@ using System.Text;
 namespace AnoMech.Relay;
 
 // Dumb session-scoped broadcast relay. Knows nothing about AnoMech's message
-// protocol -- it just forwards whatever text frame one socket sends to every
-// other socket connected under the same session code. All app-level meaning
-// (host/peer, role claims, world snapshots) lives entirely in the plugin.
+// protocol -- it just forwards whatever frame (Text or Binary; the plugin uses
+// Binary for Brotli-compressed messages, see RelayClient.cs) one socket sends,
+// verbatim and with its original type, to every other socket connected under
+// the same session code. All app-level meaning (host/peer, role claims, world
+// snapshots, whether a given frame happens to be compressed) lives entirely in
+// the plugin.
 //
 // Exists because a Dalamud client is firewalled off from FFXIV's own server
 // traffic while a scenario runs (see ZoneSession), and most players sit behind
@@ -18,7 +21,53 @@ internal static class Program
     // Hard cap per session so one room can't be griefed into an unbounded fan-out.
     private const int MaxPeersPerSession = 8;
 
-    private static readonly Dictionary<string, List<WebSocket>> Sessions = new();
+    // Sent once to every socket right after it joins, letting a connecting client
+    // detect an old relay (which never sends this at all, or an older one with a
+    // narrower feature list) before it ever risks relying on a behavior that
+    // relay doesn't have -- see RelayClient.cs's own read of this. Deliberately
+    // not shaped as an MpMessage: the relay stays fully protocol-agnostic (see the
+    // class doc comment), so this is its own tiny, independent greeting, not a
+    // fake application message.
+    //
+    // A named capability set rather than a single version int deliberately: a
+    // bare "protocol >= 2" check ties a client's every feature check to one
+    // shared number, so adding *any* new relay-side behavior forces bumping it
+    // for everyone even if a given client only cares about one specific thing.
+    // Each entry here is a self-contained yes/no a client can check for whatever
+    // it actually needs -- add a new one alongside any future relay-side
+    // behavior a client needs to detect ahead of time, never remove/rename an
+    // existing one once shipped (an older client may still be checking for it).
+    private const int RelayVersion = 2;
+    private static readonly string[] RelayCapabilities = ["binaryCompression"];
+    private static readonly string RelayCapabilitiesJson = string.Join(",", RelayCapabilities.Select(c => $"\"{c}\""));
+
+    // Codes were previously rolled client-side (a local Random.Shared pick in
+    // MultiplayerManager) -- fine odds, but the relay is what actually owns the
+    // room namespace below, so it's the only party that can actually GUARANTEE no
+    // collision rather than just hope for one. Hosting now goes through /host (no
+    // code in the URL at all); the relay picks a free one itself and hands it back
+    // in the greeting -- see CreateSession.
+    private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+    private const int CodeLength = 6;
+    private static readonly Random CodeRng = new();
+
+    // A room with no broadcast traffic for this long is considered abandoned -- a
+    // host who requested a code via /host but crashed/closed before ever sending a
+    // single message (not even their own periodic ping), or a session whose
+    // sockets all went half-dead without a clean close. Comfortably above
+    // MultiplayerManager's own 2s ping interval, so any actually-connected host
+    // keeps their room alive for free just by existing; this only reaps rooms
+    // where literally nothing has moved through in 5x that interval.
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ReapInterval = TimeSpan.FromSeconds(2);
+
+    private sealed class Room
+    {
+        public readonly List<WebSocket> Peers = new();
+        public DateTime LastActivityUtc = DateTime.UtcNow;
+    }
+
+    private static readonly Dictionary<string, Room> Sessions = new();
     private static readonly object SessionsLock = new();
 
     private static async Task Main(string[] args)
@@ -43,7 +92,8 @@ internal static class Program
             return;
         }
 
-        Console.WriteLine($"[AnoMech.Relay] Listening on port {port}. Sessions are addressed as /session/<code>.");
+        Console.WriteLine($"[AnoMech.Relay] Listening on port {port}. Host a session at /host, join one at /session/<code>.");
+        _ = ReapIdleSessionsLoop();
 
         while (true)
         {
@@ -62,8 +112,10 @@ internal static class Program
 
     private static async Task HandleConnectionAsync(HttpListenerContext ctx)
     {
-        var sessionCode = ExtractSessionCode(ctx.Request.Url?.AbsolutePath);
-        if (sessionCode is null || !ctx.Request.IsWebSocketRequest)
+        var path = ctx.Request.Url?.AbsolutePath.Trim('/') ?? "";
+        var isHostRequest = path == "host";
+        var joinCode = isHostRequest ? null : ExtractSessionCode(path);
+        if ((!isHostRequest && joinCode is null) || !ctx.Request.IsWebSocketRequest)
         {
             ctx.Response.StatusCode = 400;
             ctx.Response.Close();
@@ -82,13 +134,23 @@ internal static class Program
             return;
         }
 
-        if (!TryJoin(sessionCode, socket, out var reason))
+        string sessionCode;
+        if (isHostRequest)
         {
-            await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, reason, CancellationToken.None);
-            return;
+            sessionCode = CreateSession(socket);
+        }
+        else
+        {
+            sessionCode = joinCode!;
+            if (!TryJoin(sessionCode, socket, out var reason))
+            {
+                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, reason, CancellationToken.None);
+                return;
+            }
         }
 
-        Console.WriteLine($"[{sessionCode}] peer joined ({CountPeers(sessionCode)} connected)");
+        Console.WriteLine($"[{sessionCode}] {(isHostRequest ? "session created" : "peer joined")} ({CountPeers(sessionCode)} connected)");
+        await SendGreetingAsync(socket, isHostRequest ? sessionCode : null);
 
         // A single logical WebSocket message (e.g. a large WorldSnapshotMessage,
         // which grows with live enemy/tether count) can arrive split across many
@@ -119,10 +181,7 @@ internal static class Program
                     messageBuffer.Write(readBuffer, 0, result.Count);
                 } while (!result.EndOfMessage);
 
-                if (result.MessageType != WebSocketMessageType.Text) continue;
-
-                var text = Encoding.UTF8.GetString(messageBuffer.GetBuffer(), 0, (int)messageBuffer.Length);
-                await BroadcastAsync(sessionCode, socket, text);
+                await BroadcastAsync(sessionCode, socket, messageBuffer.ToArray(), result.MessageType);
             }
             closed: ;
         }
@@ -137,49 +196,123 @@ internal static class Program
         }
     }
 
-    private static string? ExtractSessionCode(string? path)
+    // Path is already trimmed of leading/trailing slashes -- see HandleConnectionAsync.
+    private static string? ExtractSessionCode(string path)
     {
-        if (string.IsNullOrEmpty(path)) return null;
-        var parts = path.Trim('/').Split('/');
+        var parts = path.Split('/');
         return parts.Length == 2 && parts[0] == "session" && parts[1].Length is > 0 and <= 32
             ? parts[1]
             : null;
     }
 
+    // Peer-join only -- hosting no longer creates a room implicitly (see
+    // CreateSession), so a code nobody actually hosted is now rejected immediately
+    // instead of silently vivifying an empty room a peer would otherwise sit in
+    // until their own client-side "no host responded" timeout gave up on it.
     private static bool TryJoin(string sessionCode, WebSocket socket, out string reason)
     {
         lock (SessionsLock)
         {
-            if (!Sessions.TryGetValue(sessionCode, out var peers))
+            if (!Sessions.TryGetValue(sessionCode, out var room))
             {
-                peers = new List<WebSocket>();
-                Sessions[sessionCode] = peers;
+                reason = "session not found";
+                return false;
             }
-            if (peers.Count >= MaxPeersPerSession)
+            if (room.Peers.Count >= MaxPeersPerSession)
             {
                 reason = "session full";
                 return false;
             }
-            peers.Add(socket);
+            room.Peers.Add(socket);
+            room.LastActivityUtc = DateTime.UtcNow;
             reason = "";
             return true;
         }
+    }
+
+    private static string CreateSession(WebSocket hostSocket)
+    {
+        lock (SessionsLock)
+        {
+            string code;
+            do { code = GenerateCode(); } while (Sessions.ContainsKey(code));
+            var room = new Room();
+            room.Peers.Add(hostSocket);
+            Sessions[code] = room;
+            return code;
+        }
+    }
+
+    private static string GenerateCode()
+    {
+        var chars = new char[CodeLength];
+        for (var i = 0; i < CodeLength; i++)
+            chars[i] = CodeAlphabet[CodeRng.Next(CodeAlphabet.Length)];
+        return new string(chars);
     }
 
     private static void Leave(string sessionCode, WebSocket socket)
     {
         lock (SessionsLock)
         {
-            if (!Sessions.TryGetValue(sessionCode, out var peers)) return;
-            peers.Remove(socket);
-            if (peers.Count == 0) Sessions.Remove(sessionCode);
+            if (!Sessions.TryGetValue(sessionCode, out var room)) return;
+            room.Peers.Remove(socket);
+            if (room.Peers.Count == 0) Sessions.Remove(sessionCode);
         }
     }
 
     private static int CountPeers(string sessionCode)
     {
         lock (SessionsLock)
-            return Sessions.TryGetValue(sessionCode, out var peers) ? peers.Count : 0;
+            return Sessions.TryGetValue(sessionCode, out var room) ? room.Peers.Count : 0;
+    }
+
+    private static async Task SendGreetingAsync(WebSocket socket, string? assignedSessionCode)
+    {
+        var json = assignedSessionCode is null
+            ? $$"""{"relayVersion":{{RelayVersion}},"capabilities":[{{RelayCapabilitiesJson}}]}"""
+            : $$"""{"relayVersion":{{RelayVersion}},"capabilities":[{{RelayCapabilitiesJson}}],"sessionCode":"{{assignedSessionCode}}"}""";
+        try
+        {
+            await socket.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
+        }
+        catch (WebSocketException)
+        {
+            // Socket died before we could greet it -- its own receive loop will
+            // fault and clean up via Leave() the normal way.
+        }
+    }
+
+    // Runs for the process's whole lifetime, alongside the accept loop in Main.
+    private static async Task ReapIdleSessionsLoop()
+    {
+        while (true)
+        {
+            await Task.Delay(ReapInterval);
+            List<(string Code, List<WebSocket> Peers)> dead = new();
+            lock (SessionsLock)
+            {
+                var cutoff = DateTime.UtcNow - IdleTimeout;
+                foreach (var (code, room) in Sessions.Where(kv => kv.Value.LastActivityUtc < cutoff).ToList())
+                {
+                    dead.Add((code, new List<WebSocket>(room.Peers)));
+                    Sessions.Remove(code);
+                }
+            }
+            foreach (var (code, peers) in dead)
+            {
+                Console.WriteLine($"[{code}] idle for over {IdleTimeout.TotalSeconds:F0}s -- disbanding ({peers.Count} connected).");
+                foreach (var peer in peers)
+                {
+                    try { await peer.CloseAsync(WebSocketCloseStatus.EndpointUnavailable, "session idle timeout", CancellationToken.None); }
+                    catch (WebSocketException)
+                    {
+                        // Already dead -- its own HandleConnectionAsync will notice
+                        // and clean up via Leave() once its ReceiveAsync faults.
+                    }
+                }
+            }
+        }
     }
 
     // How long a single peer's send may take before we give up on it. Broad
@@ -187,22 +320,22 @@ internal static class Program
     // connection can't noticeably delay the rest of the party for long.
     private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(5);
 
-    private static async Task BroadcastAsync(string sessionCode, WebSocket sender, string text)
+    private static async Task BroadcastAsync(string sessionCode, WebSocket sender, byte[] bytes, WebSocketMessageType type)
     {
         List<WebSocket> targets;
         lock (SessionsLock)
         {
-            if (!Sessions.TryGetValue(sessionCode, out var peers)) return;
-            targets = peers.Where(p => !ReferenceEquals(p, sender) && p.State == WebSocketState.Open).ToList();
+            if (!Sessions.TryGetValue(sessionCode, out var room)) return;
+            room.LastActivityUtc = DateTime.UtcNow;
+            targets = room.Peers.Where(p => !ReferenceEquals(p, sender) && p.State == WebSocketState.Open).ToList();
         }
 
-        var bytes = Encoding.UTF8.GetBytes(text);
         // Parallel, not sequential: with a party's worth of peers in one session,
         // a single slow/stalled connection must not delay delivery to everyone
         // else -- the old sequential foreach blocked the whole broadcast (every
         // message type, not just world snapshots) behind whichever peer happened
         // to be unresponsive.
-        await Task.WhenAll(targets.Select(target => SendOneAsync(target, bytes)));
+        await Task.WhenAll(targets.Select(target => SendOneAsync(target, bytes, type)));
     }
 
     // Sends to one target with a hard timeout. A timeout is treated as fatal
@@ -216,12 +349,12 @@ internal static class Program
     // per-connection loop (HandleConnectionAsync) sees its ReceiveAsync fail
     // and calls Leave(); the client's RelayClient sees its ReceiveAsync fail
     // and fires Disconnected, which starts its own reconnect-with-backoff loop.
-    private static async Task SendOneAsync(WebSocket target, byte[] bytes)
+    private static async Task SendOneAsync(WebSocket target, byte[] bytes, WebSocketMessageType type)
     {
         using var cts = new CancellationTokenSource(SendTimeout);
         try
         {
-            await target.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, cts.Token);
+            await target.SendAsync(bytes, type, endOfMessage: true, cts.Token);
         }
         catch (OperationCanceledException)
         {

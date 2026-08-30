@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -11,11 +13,19 @@ using AnoMech.Core;
 namespace AnoMech.Multiplayer;
 
 // Thin ClientWebSocket wrapper talking to AnoMech.Relay (see Relay/README.md).
-// The relay only forwards opaque text frames within a session code -- every
-// message's meaning lives in MpMessage/Protocol.cs, not here.
+// The relay only forwards opaque frames within a session code -- every message's
+// meaning lives in MpMessage/Protocol.cs, not here. The frame's own WebSocket
+// message type doubles as the compression flag: Text = raw UTF-8 JSON (small
+// messages, where Brotli's own framing overhead would cost more than it saves --
+// confirmed via measurement: a 108-byte SelfPoseMessage came out *larger* after
+// gzip), Binary = Brotli-compressed JSON (everything at or above
+// CompressionThresholdBytes, where a verbose/repetitive payload like a multi-enemy
+// WorldSnapshotMessage compresses 5-15x). No new field on MpMessage needed -- the
+// relay is a byte-and-type-preserving pipe either way, see Program.cs.
 public sealed class RelayClient : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private const int CompressionThresholdBytes = 256;
 
     private readonly ClientWebSocket socket = new();
     private readonly CancellationTokenSource cts = new();
@@ -31,13 +41,13 @@ public sealed class RelayClient : IDisposable
     // FIFO: the enqueue in SendAsync below is synchronous, so callers invoking it
     // sequentially (as the MapEffect hook does, once per native call in the same frame)
     // get a deterministic wire order regardless of how many race to enqueue.
-    private readonly Channel<(byte[] Bytes, TaskCompletionSource Completion)> sendQueue =
-        Channel.CreateUnbounded<(byte[], TaskCompletionSource)>();
+    private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, TaskCompletionSource Completion)> sendQueue =
+        Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
     // WorldSnapshotMessage alone can be large enough to noticeably hog the socket's
     // one-at-a-time send slot; a separate queue, drained only once sendQueue is
     // empty, keeps small/urgent messages from queuing behind it.
-    private readonly Channel<(byte[] Bytes, TaskCompletionSource Completion)> bulkSendQueue =
-        Channel.CreateUnbounded<(byte[], TaskCompletionSource)>();
+    private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, TaskCompletionSource Completion)> bulkSendQueue =
+        Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
     private bool disposed;
 
     public event Action<MpMessage>? MessageReceived;
@@ -45,9 +55,44 @@ public sealed class RelayClient : IDisposable
 
     public bool IsConnected => socket.State == WebSocketState.Open;
 
-    public async Task ConnectAsync(string baseUrl, string sessionCode)
+    // Known purely from which scheme this connection actually dialed -- the relay
+    // itself has no way to confirm this (see Program.cs: a wss:// setup terminates
+    // TLS in a reverse proxy sitting in front of the relay process, invisible to
+    // it), so this is the client's own knowledge, not something the relay attests to.
+    public bool IsEncrypted { get; private set; }
+
+    // Learned from the relay's own greeting (see ReadGreetingAsync). A named set
+    // rather than a single "protocol version" number: any feature check a client
+    // needs can ask for the one capability it actually cares about, rather than
+    // every feature sharing one number that has to be bumped for all of them
+    // together. An old relay (or one that just lacks a given feature) never
+    // advertises it, so a missing entry always means "assume not supported" --
+    // see SupportsCompression below for the one concrete check built on this today.
+    public IReadOnlySet<string> RelayCapabilities { get; private set; } = new HashSet<string>();
+    public bool HasRelayCapability(string name) => RelayCapabilities.Contains(name);
+    public bool SupportsCompression => HasRelayCapability("binaryCompression");
+
+    // Peer join, and every reconnect (host's own included -- see
+    // MultiplayerManager.ReconnectLoopAsync, which always rejoins a known code
+    // regardless of whether the original connection was made here or via
+    // ConnectAndHostAsync below).
+    public Task ConnectAsync(string baseUrl, string sessionCode) =>
+        ConnectCoreAsync(BuildUri(baseUrl, $"session/{Uri.EscapeDataString(sessionCode)}"));
+
+    // Requests a brand-new, relay-assigned session code instead of supplying one --
+    // see Program.cs's /host endpoint. The relay owns the room namespace (Sessions),
+    // so it's the only party that can actually guarantee no collision with an
+    // existing session, unlike picking one locally at random and hoping. Returns
+    // the assigned code, or null if the connect or greeting failed -- Disconnected
+    // already fires in that case exactly like ConnectAsync, so callers only need to
+    // treat a null return as "didn't work," not handle the failure separately.
+    public Task<string?> ConnectAndHostAsync(string baseUrl) => ConnectCoreAsync(BuildUri(baseUrl, "host"));
+
+    private static Uri BuildUri(string baseUrl, string path) => new($"{baseUrl.TrimEnd('/')}/{path}");
+
+    private async Task<string?> ConnectCoreAsync(Uri uri)
     {
-        var uri = new Uri($"{baseUrl.TrimEnd('/')}/session/{Uri.EscapeDataString(sessionCode)}");
+        IsEncrypted = uri.Scheme == "wss";
         try
         {
             await socket.ConnectAsync(uri, cts.Token).ConfigureAwait(false);
@@ -63,23 +108,81 @@ public sealed class RelayClient : IDisposable
             // so MultiplayerManager/UI can show it like any other drop.
             DiagnosticLog.Warn($"[RelayClient] Connect to {uri} failed: {e.Message}");
             Disconnected?.Invoke(e);
-            return;
+            return null;
         }
+        var assignedCode = await ReadGreetingAsync().ConfigureAwait(false);
         _ = Task.Run(ReceiveLoopAsync);
         _ = Task.Run(SendLoopAsync);
+        return assignedCode;
+    }
+
+    private sealed record RelayGreeting(int RelayVersion, string[]? Capabilities, string? SessionCode);
+
+    private const int GreetingTimeoutMs = 5000;
+
+    // Reads the relay's one-shot greeting (see Program.cs), sent immediately after
+    // any successful join/host -- deliberately not an MpMessage (the relay stays
+    // fully protocol-agnostic), so this is read and consumed here, once, before
+    // ReceiveLoopAsync ever starts; that loop never sees this frame. An old relay
+    // that predates the greeting never sends one at all -- timing out just means
+    // "assume no advertised capabilities" (the oldest, safest assumption for
+    // every feature check) rather than blocking a connect indefinitely.
+    private async Task<string?> ReadGreetingAsync()
+    {
+        var buffer = new byte[1024];
+        try
+        {
+            var receiveTask = socket.ReceiveAsync(buffer, cts.Token);
+            if (await Task.WhenAny(receiveTask, Task.Delay(GreetingTimeoutMs, cts.Token)).ConfigureAwait(false) != receiveTask)
+            {
+                DiagnosticLog.Warn("[RelayClient] No greeting from the relay within timeout -- assuming an old relay with no advertised capabilities.");
+                return null;
+            }
+            var result = await receiveTask.ConfigureAwait(false);
+            var greeting = JsonSerializer.Deserialize<RelayGreeting>(buffer.AsSpan(0, result.Count), JsonOptions);
+            if (greeting is null) return null;
+            RelayCapabilities = greeting.Capabilities is { } caps ? new HashSet<string>(caps) : new HashSet<string>();
+            DiagnosticLog.Info($"[RelayClient] Relay version {greeting.RelayVersion}, capabilities: [{string.Join(", ", RelayCapabilities)}].");
+            return greeting.SessionCode;
+        }
+        catch (Exception e)
+        {
+            DiagnosticLog.Warn($"[RelayClient] Failed to read the relay's greeting: {e.Message} -- assuming an old relay with no advertised capabilities.");
+            return null;
+        }
     }
 
     public async Task SendAsync(MpMessage message)
     {
         if (!IsConnected) return;
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions));
+        var jsonBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions));
+        var (bytes, type) = SupportsCompression && jsonBytes.Length >= CompressionThresholdBytes
+            ? (Compress(jsonBytes), WebSocketMessageType.Binary)
+            : (jsonBytes, WebSocketMessageType.Text);
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // TryWrite on an unbounded channel is synchronous and never fails while the
         // channel is open, so sequential callers land in order. Ordering only holds
         // within a queue, not across the two -- see bulkSendQueue's comment.
         var queue = message is WorldSnapshotMessage ? bulkSendQueue : sendQueue;
-        if (!queue.Writer.TryWrite((bytes, completion))) return;
+        if (!queue.Writer.TryWrite((bytes, type, completion))) return;
         await completion.Task.ConfigureAwait(false);
+    }
+
+    private static byte[] Compress(byte[] data)
+    {
+        using var output = new MemoryStream();
+        using (var brotli = new BrotliStream(output, CompressionLevel.Fastest))
+            brotli.Write(data, 0, data.Length);
+        return output.ToArray();
+    }
+
+    private static byte[] Decompress(byte[] data)
+    {
+        using var input = new MemoryStream(data);
+        using var brotli = new BrotliStream(input, CompressionMode.Decompress);
+        using var output = new MemoryStream();
+        brotli.CopyTo(output);
+        return output.ToArray();
     }
 
     // A stuck send otherwise has no upper bound (ClientWebSocket allows only one
@@ -98,7 +201,7 @@ public sealed class RelayClient : IDisposable
             {
                 if (sendQueue.Reader.TryRead(out var entry) || bulkSendQueue.Reader.TryRead(out entry))
                 {
-                    await SendOneAsync(entry.Bytes, entry.Completion).ConfigureAwait(false);
+                    await SendOneAsync(entry.Bytes, entry.Type, entry.Completion).ConfigureAwait(false);
                     continue;
                 }
                 // Nothing ready -- wait for whichever queue fills first, then loop
@@ -116,11 +219,11 @@ public sealed class RelayClient : IDisposable
         }
     }
 
-    private async Task SendOneAsync(byte[] bytes, TaskCompletionSource completion)
+    private async Task SendOneAsync(byte[] bytes, WebSocketMessageType type, TaskCompletionSource completion)
     {
         try
         {
-            var sendTask = socket.SendAsync(bytes, WebSocketMessageType.Text, true, cts.Token);
+            var sendTask = socket.SendAsync(bytes, type, true, cts.Token);
             if (await Task.WhenAny(sendTask, Task.Delay(SendTimeoutMs, cts.Token)).ConfigureAwait(false) != sendTask)
             {
                 DiagnosticLog.Warn($"[RelayClient] Send stuck for over {SendTimeoutMs / 1000}s -- treating the connection as dead.");
@@ -162,7 +265,9 @@ public sealed class RelayClient : IDisposable
                 MpMessage? message;
                 try
                 {
-                    message = JsonSerializer.Deserialize<MpMessage>(ms.ToArray(), JsonOptions);
+                    var raw = ms.ToArray();
+                    if (result.MessageType == WebSocketMessageType.Binary) raw = Decompress(raw);
+                    message = JsonSerializer.Deserialize<MpMessage>(raw, JsonOptions);
                 }
                 // Broader than just JsonException: a relay-side bug, a mid-stream
                 // protocol version mismatch, or plain bit-rot on a bad connection

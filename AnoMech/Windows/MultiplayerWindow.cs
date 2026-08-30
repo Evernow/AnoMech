@@ -216,7 +216,25 @@ public class MultiplayerWindow : Window, IDisposable
         if (!stable && mp.ConnectionError is { } connErr)
             ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), $"Last error: {connErr}");
 
-        if (mp.IsHost && mp.SessionCode != null)
+        // Purely a client-side fact about which scheme was dialed -- the relay
+        // itself has no way to attest to this (a wss:// setup terminates TLS in a
+        // reverse proxy sitting in front of it), so this is never "the relay says
+        // it's encrypted," only "this connection is."
+        if (stable)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(mp.IsEncrypted ? new Vector4(0.4f, 0.9f, 0.4f, 1f) : new Vector4(1f, 0.7f, 0.3f, 1f),
+                mp.IsEncrypted ? "(encrypted)" : "(NOT encrypted)");
+        }
+        // See RelayClient.SupportsCompression -- an old relay silently drops the
+        // world/role snapshots this now sends compressed, which otherwise looks
+        // like "connects fine, nobody ever moves" with no obvious cause.
+        if (stable && !mp.SupportsCompression)
+            ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "⚠ This relay is out of date -- update it or multiplayer won't work correctly.");
+
+        if (mp.IsHost && mp.SessionCode == null)
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "Requesting a session code from the relay...");
+        else if (mp.IsHost && mp.SessionCode != null)
         {
             ImGui.TextUnformatted("Session code:");
             ImGui.SetWindowFontScale(2f);

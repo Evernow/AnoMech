@@ -47,7 +47,6 @@ namespace AnoMech.Multiplayer;
 // marshalled onto it via Plugin.Framework.Run before touching any game state.
 public sealed partial class MultiplayerManager : IDisposable
 {
-    private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
     // Mirrors UmadP5ExaflaresScenario.FrameGapCapSeconds -- a peer's P5 debug-bot
     // replay ticks debugShadowStateP5.Timeline off this Tick's own deltaSeconds
     // (see Tick()'s peer branch), which has no equivalent hitch guard of its own;
@@ -324,6 +323,14 @@ public sealed partial class MultiplayerManager : IDisposable
     public Guid MyPeerId { get; private set; }
     public bool IsHost { get; private set; }
     public bool IsConnected => relay?.IsConnected ?? false;
+    // See RelayClient.IsEncrypted's own doc comment -- purely the scheme this
+    // connection dialed with, not something the relay itself can attest to.
+    public bool IsEncrypted => relay?.IsEncrypted ?? false;
+    // Learned from the relay's own greeting -- false for an old relay that
+    // predates it, which is exactly the case worth surfacing to the user (see
+    // MultiplayerWindow): their world/role snapshots are being silently dropped,
+    // not just running a bit behind.
+    public bool SupportsCompression => relay?.SupportsCompression ?? false;
     public bool IsRunning => running;
     public string? SessionCode { get; private set; }
     public string? RelayUrl { get; private set; }
@@ -373,15 +380,32 @@ public sealed partial class MultiplayerManager : IDisposable
         MyPeerId = Plugin.Config.LocalPeerId;
         IsHost = true;
         RelayUrl = relayUrl;
-        SessionCode = GenerateCode();
         Session = new MultiplayerSession { HostId = MyPeerId };
         Session.Names[MyPeerId] = DisplayName;
         Session.Builds[MyPeerId] = new PeerBuildInfo(PluginBuildInfo.Version, PluginBuildInfo.Checksum);
 
-        DiagnosticLog.Info($"[Multiplayer] Hosting session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
-        relay = new RelayClient();
-        WireRelay(relay);
-        _ = relay.ConnectAsync(relayUrl, SessionCode);
+        DiagnosticLog.Info($"[Multiplayer] Hosting a new session at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
+        var client = new RelayClient();
+        WireRelay(client);
+        relay = client;
+        _ = FinishHostConnectAsync(client);
+        LobbyChanged?.Invoke();
+    }
+
+    // SessionCode is null (not client-generated -- see AnoMech.Relay.Program's
+    // CreateSession) until the relay actually assigns one; only it can guarantee
+    // no collision with an already-active session. `client` is captured rather
+    // than reading the `relay` field after the await, so a LeaveSession/fresh
+    // Host/Join that replaces `relay` while this is still in flight can't have an
+    // assigned code arrive late and resurrect a session that's already been
+    // abandoned -- same reasoning as OnDisconnectedOffThread's own source check.
+    private async Task FinishHostConnectAsync(RelayClient client)
+    {
+        var code = await client.ConnectAndHostAsync(RelayUrl!);
+        if (!ReferenceEquals(relay, client)) return;
+        if (code is null) return; // Disconnected already fired from inside ConnectAndHostAsync
+        SessionCode = code;
+        DiagnosticLog.Info($"[Multiplayer] Relay assigned session code {code}.");
         LobbyChanged?.Invoke();
     }
 
@@ -562,12 +586,6 @@ public sealed partial class MultiplayerManager : IDisposable
         // scenario on Started=true, exactly like a first-time late join.
         if (!IsHost) _ = relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
         LobbyChanged?.Invoke();
-    }
-
-    private static string GenerateCode()
-    {
-        var rng = Random.Shared;
-        return new string(Enumerable.Range(0, 6).Select(_ => CodeAlphabet[rng.Next(CodeAlphabet.Length)]).ToArray());
     }
 
     // ---- Role claiming ----------------------------------------------------

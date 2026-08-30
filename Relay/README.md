@@ -246,9 +246,12 @@ service, so both have to be communicated manually:
 
 1. **The relay URL** (`ws://...` or `wss://...`) — same for everyone, doesn't
    change between sessions unless you tear down/move the relay.
-2. **The session code** — generated fresh by the host each time they open the
-   Multiplayer window and click "Host new session"; shown in-window with a
-   Copy button.
+2. **The session code** — assigned by the relay (not chosen locally) each time
+   the host clicks "Host new session," guaranteeing it's not already in use by
+   another active session on that relay; shown in-window with a Copy button
+   once the relay responds. A session with no traffic at all for 10 seconds
+   (e.g. a host who requested a code but never actually connected/started) is
+   disbanded automatically, freeing the code back up.
 
 ---
 
