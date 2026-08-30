@@ -226,11 +226,11 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.TextColored(mp.IsEncrypted ? new Vector4(0.4f, 0.9f, 0.4f, 1f) : new Vector4(1f, 0.7f, 0.3f, 1f),
                 mp.IsEncrypted ? "(encrypted)" : "(NOT encrypted)");
         }
-        // See RelayClient.SupportsCompression -- an old relay silently drops the
-        // world/role snapshots this now sends compressed, which otherwise looks
-        // like "connects fine, nobody ever moves" with no obvious cause.
+        // See RelayClient.SupportsCompression -- purely informational: an old
+        // relay just means every message goes uncompressed (RelayClient falls
+        // back automatically), not that anything's actually broken.
         if (stable && !mp.SupportsCompression)
-            ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "⚠ This relay is out of date -- update it or multiplayer won't work correctly.");
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "This relay is out of date -- update it for lower bandwidth use.");
 
         if (mp.IsHost && mp.SessionCode == null)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "Requesting a session code from the relay...");
