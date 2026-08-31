@@ -10,12 +10,9 @@ using static AnoMech.Core.Game.Game;
 
 namespace AnoMech.Windows;
 
-// Vertical-slice multiplayer lobby. Which scenario is hosted is whatever's
-// currently selected in MainWindow (see IScenario.SupportsMultiplayer /
-// StartScenario) -- this window has no scenario picker of its own, it only
-// shows the name. Host picks a role, shares the session code + relay URL out
-// of band, up to 7 others join and claim the remaining roles; anything left
-// unclaimed stays an AI bot exactly like solo play.
+// Multiplayer lobby. Which scenario is hosted is whatever's currently selected in
+// MainWindow -- this window has no scenario picker of its own, only shows the name. Host
+// picks a role, shares the session code + relay URL out of band; unclaimed roles stay AI bots.
 public class MultiplayerWindow : Window, IDisposable
 {
     private static readonly string[] RoleLabels = ["MT", "OT", "H1", "H2", "M1", "M2", "R1", "R2"];
@@ -35,19 +32,13 @@ public class MultiplayerWindow : Window, IDisposable
         SizeCondition = ImGuiCond.FirstUseEver;
         IsOpen = false;
         relayUrl = plugin.Configuration.RelayServerUrl;
-        // ObjectTable.LocalPlayer is main-thread-only, and Dalamud constructs
-        // plugins off-thread -- reading it here throws "Not on main thread!"
-        // and kills the whole plugin load. Draw() always runs on the main
-        // thread, so prefill lazily there instead, once.
+        // ObjectTable.LocalPlayer is main-thread-only, but Dalamud constructs plugins
+        // off-thread -- prefill lazily in Draw() instead, once.
     }
 
     public void Dispose() { }
 
-    // Hidden while the fake-zone instance is loaded -- see MainWindow's own
-    // PreOpenCheck for the full reasoning (including why it reopens itself
-    // afterward rather than staying closed); this window's lobby/roster UI is
-    // just as irrelevant mid-fight, and RunningSimWindow's Start/Leave-session
-    // buttons cover what's still needed.
+    // Hidden while the fake-zone instance is loaded -- see MainWindow's PreOpenCheck.
     private bool hiddenByUs;
 
     public override void PreOpenCheck()
@@ -64,14 +55,8 @@ public class MultiplayerWindow : Window, IDisposable
         }
     }
 
-    // Before Start, Session.ScenarioIndex is only meaningful once the host has
-    // actually clicked Start (StartScenario populates it) -- showing it any
-    // earlier would display whatever scenario happens to sit at index 0 in
-    // Game.Scenarios, not what's actually about to be hosted. So: once
-    // Started, the session's own (broadcast, authoritative for everyone
-    // including peers) scenario is shown; before that, only the host's own
-    // live MainWindow selection is meaningful, and a peer just sees "not
-    // chosen yet" since they have no visibility into what the host intends.
+    // Session.ScenarioIndex is only meaningful once Started (StartScenario populates it) --
+    // before that, showing it would just display whatever sits at index 0.
     private string CurrentScenarioLabel()
     {
         if (mp.Session.Started) return DisplayName(Plugin.GameInstance.Scenarios[mp.Session.ScenarioIndex]);
@@ -96,29 +81,21 @@ public class MultiplayerWindow : Window, IDisposable
         if (mp.SessionCode == null
             && (Plugin.MainWindow.SelectedScenario is not { } sel || !sel.SupportsMultiplayer))
         {
-            // Not gated on mp.IsHost: that flag defaults to false and is never
-            // reset back to false on leaving a session (see LeaveSessionInternal),
-            // so gating on it meant this warning only ever showed for a *returning*
-            // host, never a first-time one. Harmless to show before joining too --
-            // it's specifically about hosting, and a would-be joiner can just
-            // ignore it.
+            // Not gated on mp.IsHost: that flag is never reset on leaving a session, so
+            // gating on it would only show this to a returning host. Harmless before
+            // joining too -- a would-be joiner can just ignore it.
             ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f),
                 "Select a multiplayer-supported scenario in the main window before hosting.");
         }
         ImGui.Separator();
 
-        // Gated on SessionCode (cleared only by LeaveSession), not IsConnected --
-        // a brief relay drop mid-session must keep showing the roster (with a
-        // Reconnecting indicator) rather than yanking the user back to the
-        // connect form, which would look like they'd been kicked out entirely.
+        // Gated on SessionCode, not IsConnected -- a brief relay drop must keep showing the
+        // roster (with a Reconnecting indicator), not yank the user back to the connect form.
         if (mp.SessionCode == null)
             DrawConnectPanel();
-        // SessionCode alone doesn't mean a host actually exists on the other end --
-        // it's set synchronously on JoinSession, before any real confirmation. Without
-        // this, a joiner briefly sees the full role-list lobby for a mistyped/dead
-        // session code before MultiplayerManager's IsSessionNotFound timeout (several
-        // seconds later) kicks them back out -- looking, for that window, like a real
-        // session they're free to interact with.
+        // SessionCode alone doesn't mean a host actually exists -- it's set synchronously on
+        // JoinSession, before any confirmation. Without this, a joiner briefly sees the full
+        // lobby for a mistyped/dead code before IsSessionNotFound kicks them back out.
         else if (!mp.IsHost && !mp.EverHeardFromHost)
             DrawJoiningPanel();
         else
@@ -134,14 +111,19 @@ public class MultiplayerWindow : Window, IDisposable
             mp.LeaveSession();
     }
 
-    // No relay is baked into the plugin -- every group runs its own (see
-    // Relay/README.md), so nothing here proceeds until the user has typed a
-    // URL that at least looks like one. This isn't reachability validation
-    // (only an actual connect attempt proves that), just "did you paste an
-    // actual ws(s):// URL" so a blank/garbled field fails fast with an
-    // in-window hint instead of a silent, confusing connect failure.
-    private static bool IsPlausibleRelayUrl(string url) =>
-        Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) && uri.Scheme is "ws" or "wss";
+    // Just enough validation to fail fast on a blank/garbled field, not reachability.
+    // "://" is checked directly rather than handed straight to Uri.TryCreate -- a bare
+    // "host:port" like sim.example.com:8443 otherwise parses as an absolute URI on its
+    // own (scheme "sim.example.com", opaque part "8443"), since it has no "//".
+    private static bool IsPlausibleRelayUrl(string url)
+    {
+        var trimmed = url.Trim();
+        if (trimmed.Length == 0) return false;
+        if (trimmed.Contains("://", StringComparison.Ordinal))
+            return Uri.TryCreate(trimmed, UriKind.Absolute, out var explicitUri)
+                && explicitUri.Scheme is "ws" or "wss" or "http" or "https";
+        return Uri.TryCreate($"ws://{trimmed}", UriKind.Absolute, out var probe) && !string.IsNullOrEmpty(probe.Host);
+    }
 
     private void DrawConnectPanel()
     {
@@ -160,8 +142,8 @@ public class MultiplayerWindow : Window, IDisposable
         {
             ImGui.TextColored(new Vector4(1f, 0.5f, 0.4f, 1f),
                 string.IsNullOrWhiteSpace(relayUrl)
-                    ? "Enter your relay's address, e.g. ws://203.0.113.5:7890 or wss://relay.example.com"
-                    : "Doesn't look like a ws:// or wss:// URL.");
+                    ? "Enter your relay's address, e.g. relay.example.com or 203.0.113.5:7890"
+                    : "Doesn't look like a valid relay address.");
         }
 
         ImGui.SetNextItemWidth(200);
@@ -202,10 +184,7 @@ public class MultiplayerWindow : Window, IDisposable
 
     private void DrawConnectedPanel()
     {
-        // IsConnected here is a live socket-state check (RelayClient.IsConnected),
-        // re-read every frame -- if the relay drops between opening this window
-        // and clicking Start, this goes red before the host can start a run
-        // peers can't actually receive.
+        // Live socket-state check, re-read every frame, so a relay drop goes red immediately.
         var stable = mp.IsConnected;
         if (stable)
             ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.4f, 1f), "● Connected to relay");
@@ -216,19 +195,14 @@ public class MultiplayerWindow : Window, IDisposable
         if (!stable && mp.ConnectionError is { } connErr)
             ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), $"Last error: {connErr}");
 
-        // Purely a client-side fact about which scheme was dialed -- the relay
-        // itself has no way to attest to this (a wss:// setup terminates TLS in a
-        // reverse proxy sitting in front of it), so this is never "the relay says
-        // it's encrypted," only "this connection is."
         if (stable)
         {
             ImGui.SameLine();
             ImGui.TextColored(mp.IsEncrypted ? new Vector4(0.4f, 0.9f, 0.4f, 1f) : new Vector4(1f, 0.7f, 0.3f, 1f),
-                mp.IsEncrypted ? "(encrypted)" : "(NOT encrypted)");
+                mp.IsEncrypted ? "(encrypted)"
+                : mp.FellBackToUnencrypted ? "(NOT encrypted -- this relay doesn't support wss://)"
+                : "(NOT encrypted)");
         }
-        // See RelayClient.SupportsCompression -- purely informational: an old
-        // relay just means every message goes uncompressed (RelayClient falls
-        // back automatically), not that anything's actually broken.
         if (stable && !mp.SupportsCompression)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "This relay does not support compression.");
 
@@ -249,13 +223,8 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.TextUnformatted(mp.Session.Started ? "Running." : "Connected -- waiting for the host to start.");
         }
 
-        // Surfaced directly to whoever needs to act (update their plugin) --
-        // both checksums right here, not just a generic "different build"
-        // that would leave them guessing without hovering the host's row.
-        // Rather than leaving it as a silently-rejected Claim click they'd
-        // have to guess the reason for. Host mismatches vs. any claimed peer
-        // are covered per-row below since the host can't be "wrong" relative
-        // to itself.
+        // Surfaced directly with both checksums, rather than leaving it as a silently
+        // rejected Claim click. Mismatches vs. any claimed peer are covered per-row below.
         var myMismatchVsHost = !mp.IsHost && mp.IsVersionMismatched(mp.Session.HostId);
         if (myMismatchVsHost)
         {
@@ -273,9 +242,8 @@ public class MultiplayerWindow : Window, IDisposable
             var role = (PartyRole)i;
             var claimed = mp.Session.ClaimedBy.TryGetValue(role, out var peerId);
             var mine = claimed && peerId == mp.MyPeerId;
-            // The host never appears in the ping-based peerStatuses broadcast
-            // (it doesn't ping itself), so its row is tracked separately --
-            // via time-since-last-broadcast rather than a fabricated 0ms ping.
+            // The host doesn't ping itself, so its row is tracked separately, via
+            // time-since-last-broadcast rather than a fabricated 0ms ping.
             var isHostRow = claimed && !mine && peerId == mp.Session.HostId;
             var stale = claimed && !mine && (isHostRow ? mp.IsHostStale : mp.IsPeerStale(peerId));
             var mismatched = claimed && !mine && mp.IsVersionMismatched(peerId);
@@ -320,10 +288,8 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.PopID();
         }
 
-        // Session.Names gets an entry the moment someone's Hello lands, well
-        // before they've claimed a role -- without this, a connected friend
-        // who hasn't picked a slot yet is invisible anywhere in this window,
-        // leaving "did the invite even work?" with no positive answer.
+        // Session.Names gets an entry as soon as Hello lands, before a role is claimed --
+        // otherwise a connected friend with no slot yet is invisible in this window.
         var unclaimed = mp.Session.Names.Keys
             .Where(id => id != mp.MyPeerId && !mp.Session.ClaimedBy.ContainsValue(id))
             .Select(id => mp.Session.NameOf(id) + (mp.IsVersionMismatched(id) ? " (version mismatch)" : ""))
@@ -331,10 +297,7 @@ public class MultiplayerWindow : Window, IDisposable
         if (unclaimed.Count > 0)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), $"Connected, no role yet: {string.Join(", ", unclaimed)}");
 
-        // Testing aid, available to host and peer alike (see
-        // MultiplayerManager.SetDebugBotControlled). Locked once Started so it
-        // can't flip mid-fight; the choreography only makes sense replayed
-        // from a fresh Start.
+        // Locked once Started -- the choreography only makes sense replayed from a fresh Start.
         {
             var botControlled = mp.DebugBotControlled;
             ImGui.BeginDisabled(mp.Session.Started);
@@ -358,10 +321,7 @@ public class MultiplayerWindow : Window, IDisposable
         DrawLeaveSessionButton();
     }
 
-    // Host/peer Start button. Draws nothing once mp.Session.Started -- caller
-    // decides whether to show it at all (see the !Started guard in
-    // DrawConnectedPanel above). Self-contained (no params) so RunningSimWindow
-    // can call this directly while a sim is running.
+    // Self-contained (no params) so RunningSimWindow can call this directly while running.
     internal void DrawStartButton()
     {
         var stable = mp.IsConnected;
@@ -375,19 +335,10 @@ public class MultiplayerWindow : Window, IDisposable
             var anyMismatch = mp.Session.ClaimedBy.Values.Any(mp.IsVersionMismatched);
             var hasSupportedScenario = Plugin.MainWindow.SelectedScenario is { } sel2
                 && sel2.SupportsMultiplayer;
-            // A grouped scenario (e.g. P2 Forsaken's NA/EU strats) can leave
-            // SelectedStrat at -1 when the selected region has no strats --
-            // mirrors MainWindow's own solo-Start gate (HasStartableStrat),
-            // and matches the same check StartScenario itself enforces.
+            // Mirrors MainWindow's own solo-Start gate and StartScenario's own check.
             var hasStrat = hasSupportedScenario && Plugin.MainWindow.HasStartableStrat();
-            // Unclaimed roles are fine -- they fall back to an AI bot (see this
-            // file's own top comment) -- but an actual connected person who hasn't
-            // picked a role yet isn't a bot standing in for anyone, they're a
-            // spectator about to get left behind the instant Start loads everyone
-            // else into the zone. Session.Names is every connected person
-            // (including us, added alongside our own Hello -- see MultiplayerManager
-            // line ~409), so anyone in there missing from ClaimedBy's values hasn't
-            // claimed a role.
+            // Unclaimed roles are fine (fall back to an AI bot), but a connected person who
+            // hasn't picked a role is a spectator about to get left behind at Start.
             var claimedPeerIds = mp.Session.ClaimedBy.Values.ToHashSet();
             var everyoneHasClaimed = mp.Session.Names.Keys.All(claimedPeerIds.Contains);
             var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending && hasStrat && everyoneHasClaimed;
@@ -417,28 +368,19 @@ public class MultiplayerWindow : Window, IDisposable
         }
     }
 
-    // Self-contained like DrawStartButton above, for the same reason.
     internal void DrawLeaveSessionButton()
     {
         if (ImGui.Button("Leave session"))
         {
             mp.LeaveSession();
-            // Game.Leave() -> World.Map.Unload() assumes a zone was actually
-            // entered (it restores the real character to the position saved by
-            // ZoneSession.Enter()) -- calling it having never clicked Start
-            // means that save was never populated, and it teleports the real
-            // character to garbage/default coordinates in whatever zone
-            // they're actually in. Mirrors the same IsInInstance gate
-            // MainWindow's own "Leave" button already uses.
+            // IsInInstance guard, same as MainWindow's Leave button: Leave() -> Unload()
+            // assumes a zone was actually entered (it restores the saved position).
             if (plugin.Game.World.Map.IsInInstance) plugin.Game.Leave();
         }
     }
 
-    // The host doesn't ping itself, so there's no round-trip number to show
-    // for its row -- just whether we've heard from it recently. Green/red
-    // only (no yellow "fair" band): unlike a peer's ping, this is time-since-
-    // last-broadcast, not a latency measurement, so a three-way split would
-    // imply precision that isn't there.
+    // Green/red only, no "fair" band -- this is time-since-last-broadcast, not a latency
+    // measurement, so a three-way split would imply precision that isn't there.
     private static void DrawHostStatusDot(bool stale, float secondsSince)
     {
         var color = stale ? new Vector4(1f, 0.35f, 0.35f, 1f) : new Vector4(0.4f, 0.9f, 0.4f, 1f);
@@ -449,9 +391,8 @@ public class MultiplayerWindow : Window, IDisposable
                 : $"Host -- last message {secondsSince:F0}s ago.");
     }
 
-    // Ping color bands per the below thresholds; grey/red cover the two
-    // "no number to show" cases (no Pong yet vs. flagged stale) so the dot
-    // never silently reads as a suspiciously good 0ms.
+    // Grey/red cover the two "no number to show" cases so the dot never silently reads as a
+    // suspiciously good 0ms.
     private static void DrawStatusDot(PeerStatusEntry? status, bool stale)
     {
         Vector4 color;

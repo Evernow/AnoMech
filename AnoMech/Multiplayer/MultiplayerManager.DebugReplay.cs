@@ -26,15 +26,10 @@ public sealed partial class MultiplayerManager
 {
     // ---- Debug: bot-controlled peer replay ----------------------------------
 
-    // Host-only, edge-triggered once per run. LastState isn't guaranteed set on
-    // the very first Tick() after StartScenario -- RunScenarioAsHost's actual
-    // work (including constructing the scenario's *State) is deferred via
-    // Plugin.Framework.Run, same reasoning as peerEnteredInstance below -- so
-    // this polls instead of reading it synchronously right after the call.
-    // Sent unconditionally: the host never knows or cares which peers, if any,
-    // are using it locally. One case per IScenario.SupportsMultiplayer scenario --
-    // add a new one here alongside a new *AiReplayStateMessage and
-    // *State.FromNetworkReplay when porting another scenario.
+    // Host-only, edge-triggered once per run. LastState isn't guaranteed set on the very
+    // first Tick() after StartScenario (RunScenarioAsHost's real work is deferred a frame),
+    // so this polls instead of reading synchronously. One case per multiplayer scenario --
+    // add a sibling here alongside a new *AiReplayStateMessage/*State.FromNetworkReplay.
     private void TrySendAiReplayState()
     {
         switch (Plugin.GameInstance.Scenarios[Session.ScenarioIndex])
@@ -78,21 +73,15 @@ public sealed partial class MultiplayerManager
         }
     }
 
-    // Guards the AiStrats[Session.SelectedAi] indexing every multi-strat
-    // scenario's replay branch does below. StartScenario/MultiplayerWindow
-    // already refuse to broadcast an out-of-range SelectedAi (see
-    // MainWindow.HasStartableStrat), but a peer has no independent way to
-    // verify what the host sent, so this is the last line of defense against
-    // an IndexOutOfRangeException here.
+    // Guards AiStrats[Session.SelectedAi] indexing below -- StartScenario already refuses to
+    // broadcast an out-of-range SelectedAi, but a peer can't verify what the host sent.
     private bool IsValidAiIndex(IScenario scenario) =>
         Session.SelectedAi >= 0 && Session.SelectedAi < scenario.AiStrats.Count;
 
-    // Peer-only, idempotent, edge-triggered once per run: fires once both the
-    // host's *AiReplayStateMessage has arrived (pending*AiReplayState) and our
-    // own zone/party is actually ready (peerEnteredInstance) -- arrival order
-    // between those two isn't guaranteed, so both call sites (Dispatch and
-    // Tick) funnel through here. A no-op entirely unless debug-bot mode is on.
-    // Branches on the active scenario the same way TrySendAiReplayState does.
+    // Peer-only, idempotent, edge-triggered once per run: fires once both the host's
+    // *AiReplayStateMessage has arrived and our own zone/party is ready
+    // (peerEnteredInstance) -- arrival order isn't guaranteed, so both call sites
+    // (Dispatch and Tick) funnel through here. No-op unless debug-bot mode is on.
     private void TryStartDebugBotReplay()
     {
         if (!debugBotControlled || debugBotReplayStarted) return;
@@ -108,12 +97,8 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
                 var shadowState = UmadP3BlackHoleState.FromNetworkReplay(
                     world, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack);
-                // Chaos/Exdeath might not have been replicated yet (WorldSnapshot
-                // and this message are independent flows) -- OnWorldSnapshotReceived
-                // keeps retrying this resolution against debugShadowState below as
-                // new enemies come in, so a still-null boss here isn't a lost
-                // cause, just not needed until each choreography step that reads
-                // it, tens of seconds into the fight at the earliest.
+                // Chaos/Exdeath may not be replicated yet (WorldSnapshot is an independent
+                // flow) -- OnWorldSnapshotReceived keeps retrying this as enemies arrive.
                 shadowState.ScenarioObjects.Chaos = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.ChaosP3);
                 shadowState.ScenarioObjects.Exdeath = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.Exdeath);
                 debugShadowState = shadowState;
@@ -123,11 +108,8 @@ public sealed partial class MultiplayerManager
             }
             case UmadP2ForsakenScenario p2Scenario when pendingP2AiReplayState is { } p2Msg:
             {
-                // Belt-and-suspenders: StartScenario/MultiplayerWindow already refuse
-                // to broadcast an out-of-range SelectedAi (see HasStartableStrat), but
-                // marking replay "started" either way (rather than just `break`) stops
-                // this from silently re-attempting -- and re-logging nothing -- every
-                // single frame if it's ever somehow reached anyway.
+                // Mark "started" regardless, so an out-of-range SelectedAi doesn't retry
+                // (and re-log) every frame -- StartScenario already guards against this.
                 debugBotReplayStarted = true;
                 if (!IsValidAiIndex(p2Scenario))
                 {
@@ -170,12 +152,9 @@ public sealed partial class MultiplayerManager
                     break;
                 }
                 DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
-                // A fresh, peer-owned EventScheduler -- NOT the host's -- since
-                // UmadP5ExaflaresAi schedules its dodges directly onto it, and
-                // nothing would ever drive one shared with anything else. See
-                // MultiplayerManager.Tick's P5-specific branch just below for
-                // what actually ticks it every frame (mirrors UmadP5ExaflaresScenario.Tick,
-                // which normally does this but never runs on a peer).
+                // A fresh, peer-owned EventScheduler that UmadP5ExaflaresAi schedules its
+                // dodges onto -- MultiplayerManager.Tick's P5 branch ticks it every frame,
+                // mirroring UmadP5ExaflaresScenario.Tick, which never runs on a peer.
                 var shadowState = UmadP5ExaflaresState.FromNetworkReplay(p5Msg.LeftOrder, p5Msg.RightOrder, new EventScheduler());
                 debugShadowStateP5 = shadowState;
                 DebugBotControl.Enabled = true;
@@ -185,11 +164,8 @@ public sealed partial class MultiplayerManager
         }
     }
 
-    // Clears just the current run's replay state, not the debugBotControlled
-    // toggle itself (a sticky lobby preference) -- called whenever running
-    // stops for any reason, so a debug-bot peer's real character always
-    // regains normal control the instant the fight ends rather than staying
-    // bot-driven while standing in an empty arena or back in the inn.
+    // Clears the current run's replay state, not the sticky debugBotControlled toggle --
+    // called whenever running stops, so a debug-bot peer regains normal control immediately.
     private void StopDebugBotReplay()
     {
         if (debugBotReplayStarted) DiagnosticLog.Info("[Multiplayer] Peer: stopping debug-bot replay.");

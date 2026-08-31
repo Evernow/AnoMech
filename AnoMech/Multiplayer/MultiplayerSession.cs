@@ -5,10 +5,8 @@ using AnoMech.Core.Game.Party;
 
 namespace AnoMech.Multiplayer;
 
-// Lobby roster, mirrored on every client from the host's LobbyStateMessage
-// broadcasts. Host also owns the authoritative copy it mutates directly before
-// broadcasting (see MultiplayerManager) -- this class is a plain data holder,
-// not itself a source of truth.
+// Lobby roster, mirrored on every client from the host's LobbyStateMessage broadcasts. The
+// host owns the authoritative copy; this class is a plain data holder, not a source of truth.
 public sealed class MultiplayerSession
 {
     public Guid HostId { get; set; }
@@ -17,11 +15,8 @@ public sealed class MultiplayerSession
     public Dictionary<Guid, PeerBuildInfo> Builds { get; private set; } = new();
     public bool Started { get; set; }
 
-    // Which scenario/strat/waymark the host is running (or about to run) --
-    // indices into Game.Scenarios and that scenario's own AiStrats/WaymarkPresets.
-    // Set by the host in MultiplayerManager.StartScenario, read by OnStartReceived
-    // on every client (including the host's own copy of Session) so everyone
-    // resolves the identical scenario/strat/waymark. See LobbyStateMessage.
+    // Indices into Game.Scenarios and that scenario's own AiStrats/WaymarkPresets, set by the
+    // host in StartScenario so every client resolves the same scenario/strat/waymark.
     public int ScenarioIndex { get; set; }
     public int SelectedAi { get; set; }
     public int SelectedWaymark { get; set; }

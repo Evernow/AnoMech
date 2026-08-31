@@ -1,77 +1,62 @@
 # AnoMech.Relay
 
-Small standalone WebSocket relay for AnoMech's multiplayer mode. It knows nothing
-about AnoMech's message format — it just forwards any text frame one connected
-client sends to every other client connected under the same session code
-(`ws://host:port/session/<code>`). All lobby/gameplay logic lives in the plugin;
-this process only exists because Dalamud clients can't reach each other directly
-(most players are behind NAT, and AnoMech's `ZoneSession` firewall deliberately
-cuts the client off from FFXIV's own server traffic during a scenario, so that
-channel can't be reused either).
+A small WebSocket relay for AnoMech's multiplayer mode. It forwards frames between
+clients in the same session code (`/session/<code>`) — it doesn't understand AnoMech's
+message format at all. Dalamud clients can't reach each other directly (NAT, and
+AnoMech firewalls off FFXIV's own server traffic during a scenario), so this process
+exists just to get them talking.
 
-**There is no default/public relay.** Every group runs their own — the plugin
-will not connect anywhere until you type a URL into the Multiplayer window. This
-doc covers how to stand one up.
+**There's no default/public relay.** Every group runs their own — nothing connects
+until you type a URL into the Multiplayer window.
 
 ## Contents
 
 - [Quick local test](#quick-local-test)
-- [Option A — host on a cloud VPS](#option-a--host-on-a-cloud-vps-recommended)
-- [Option B — host from your own PC](#option-b--host-from-your-own-pc)
+- [Option A — cloud VPS](#option-a--cloud-vps-recommended)
+- [Option B — your own PC](#option-b--your-own-pc)
 - [Adding TLS (`wss://`)](#adding-tls-wss)
 - [Verifying it's reachable](#verifying-its-reachable)
 - [What to share with your group](#what-to-share-with-your-group)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
+- [Configuring the plugin](#configuring-the-plugin)
 
 ---
 
 ## Quick local test
 
-If everyone testing is on the same machine or same LAN (e.g. you and one
-friend both physically at your place), you don't need a VPS at all:
+Same machine or LAN as your test partner? Skip the VPS:
 
 ```
 cd Relay/AnoMech.Relay
 dotnet run -- --port 7890
 ```
 
-- On the host's own PC, the plugin connects to `ws://127.0.0.1:7890`.
-- Anyone else on the same LAN connects to `ws://<host's-LAN-IP>:7890` (find the
-  LAN IP with `ipconfig` on the host — the `IPv4 Address` under your active
-  network adapter, usually `192.168.x.x`).
-- No firewall/port-forwarding needed for same-LAN use beyond allowing the app
-  through Windows Firewall's *private network* prompt if one pops up.
-
-This is the fastest way to confirm everything works end to end before setting
-up anything internet-facing.
+- Host connects to `ws://127.0.0.1:7890`.
+- Others on the LAN connect to `ws://<host's-LAN-IP>:7890` (`ipconfig` → IPv4 Address).
+- Allow the app through Windows Firewall's private-network prompt if asked.
 
 ---
 
-## Option A — host on a cloud VPS (recommended)
+## Option A — cloud VPS (recommended)
 
-Best if your group isn't all on one LAN. Any small Linux VPS works — the relay
-is trivially light (it just forwards text frames); a $4–6/mo box with 512MB–1GB
-RAM from any provider (DigitalOcean, Hetzner, Vultr, Linode, AWS Lightsail,
-etc.) is overkill already.
+Best when your group isn't all on one LAN. Any small Linux box works — a $4–6/mo VPS
+is already overkill for a relay this light.
 
-1. **Publish a self-contained build on your own dev machine** (no .NET needs
-   to be installed on the VPS this way):
+1. **Publish self-contained** (no .NET needed on the VPS):
 
    ```bash
    cd Relay/AnoMech.Relay
    dotnet publish -c Release -r linux-x64 --self-contained -p:PublishSingleFile=true -o publish
    ```
 
-   This produces a single executable at `publish/AnoMech.Relay`.
-
-2. **Copy it to the VPS**:
+2. **Copy it over**:
 
    ```bash
    scp publish/AnoMech.Relay youruser@your-vps-ip:/home/youruser/anomech-relay
    ```
 
-3. **Make it executable and do a test run**:
+3. **Run it once to confirm it starts**:
 
    ```bash
    ssh youruser@your-vps-ip
@@ -79,24 +64,17 @@ etc.) is overkill already.
    ~/anomech-relay --port 7890
    ```
 
-   Leave it running in the foreground for now — you'll turn it into a proper
-   service in the next step once you've confirmed it starts without errors
-   (`Ctrl+C` to stop it).
-
-4. **Open the port in the VPS firewall.** Most providers default to `ufw` on
-   Ubuntu/Debian images:
+4. **Open the port**:
 
    ```bash
    sudo ufw allow 7890/tcp
-   sudo ufw status
    ```
 
-   If your provider also has a separate network-level firewall/security-group
-   UI (DigitalOcean, AWS, etc.), open the same port there too — `ufw` alone
-   isn't enough on providers that filter at the network edge.
+   Providers with a network-level firewall (DigitalOcean, AWS, etc.) need the same
+   port opened there too — `ufw` alone isn't enough.
 
-5. **Run it as a systemd service** so it survives reboots and SSH logouts.
-   Create `/etc/systemd/system/anomech-relay.service`:
+5. **Run it as a systemd service** so it survives reboots. Create
+   `/etc/systemd/system/anomech-relay.service`:
 
    ```ini
    [Unit]
@@ -117,81 +95,57 @@ etc.) is overkill already.
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable --now anomech-relay
-   sudo systemctl status anomech-relay   # confirm it's "active (running)"
-   journalctl -u anomech-relay -f        # tail its logs
    ```
 
-6. **Point the plugin at it**: `ws://your-vps-ip:7890` (or your domain name if
-   you've pointed one at it — see [TLS](#adding-tls-wss) below for `wss://`).
+6. **Point the plugin at it**: your VPS IP or domain (see [TLS](#adding-tls-wss) for
+   `wss://`).
 
 ---
 
-## Option B — host from your own PC
+## Option B — your own PC
 
-Works if you don't want to pay for a VPS and don't mind your own machine being
-the always-on party for the session. Friends outside your LAN need you to
-**port-forward** on your router, which is more setup than a VPS but free.
+Free, but friends outside your LAN need a router port-forward, and your PC has to
+stay on for the session.
 
-1. **Publish a self-contained Windows build**:
+1. **Publish self-contained**:
 
    ```
    cd Relay/AnoMech.Relay
    dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish
    ```
 
-2. **Allow the port through Windows Firewall** (run PowerShell as
-   Administrator):
+2. **Allow the port** (PowerShell, as Administrator):
 
    ```powershell
    New-NetFirewallRule -DisplayName "AnoMech Relay" -Direction Inbound -Protocol TCP -LocalPort 7890 -Action Allow
    ```
 
-3. **Grant the URL reservation** so `HttpListener` can bind a non-loopback
-   prefix without running the whole process elevated every time (run once, as
-   Administrator):
+3. **Grant the URL reservation**, so `HttpListener` doesn't need an elevated process
+   every run (Administrator, once):
 
    ```powershell
    netsh http add urlacl url=http://+:7890/ user=Everyone
    ```
 
-   (Skip this if you're fine just always launching the relay from an elevated
-   terminal instead.)
+4. **Port-forward on your router** (external TCP 7890 → your PC's LAN IP, port 7890)
+   if anyone joining isn't on your home LAN.
 
-4. **Port-forward on your router**, if anyone joining isn't on your home LAN:
-   log into your router's admin page (commonly `192.168.0.1` or `192.168.1.1`)
-   and forward external TCP port 7890 to your PC's LAN IP, port 7890. The
-   exact menu (often "Port Forwarding" or "Virtual Server") varies by router —
-   search your router model + "port forwarding" if you're not sure where it
-   lives.
+5. **Find your public IP** (search "what is my ip") and share it as the relay
+   address. No static IP? A dynamic-DNS service (No-IP, DuckDNS) gives you a stable
+   hostname instead.
 
-5. **Find your public IP** (e.g. search "what is my ip" in a browser) and give
-   that out as the relay address: `ws://<your-public-ip>:7890`.
-
-   If your ISP doesn't give you a static public IP (most residential
-   connections don't), it can change over time and everyone's saved URL will
-   go stale. A free dynamic-DNS service (No-IP, DuckDNS, etc.) gives you a
-   stable hostname that follows your IP automatically — worth setting up if
-   you'll host recurring sessions.
-
-6. **Run it**: `.\publish\AnoMech.Relay.exe --port 7890`. It has to keep
-   running for the duration of your session — closing the console kills it.
-   For something more persistent than "leave a window open," wrap it as a
-   Windows service with [NSSM](https://nssm.cc/) or run it via Task Scheduler
-   with "run whether user is logged in or not."
+6. **Run it**: `.\publish\AnoMech.Relay.exe --port 7890`. Closing the console kills
+   it — use [NSSM](https://nssm.cc/) or Task Scheduler for something persistent.
 
 ---
 
 ## Adding TLS (`wss://`)
 
-The relay itself only speaks plain `ws://` — no certificate handling built in.
-Plain WebSocket is fine for testing, but some networks/corporate proxies block
-unencrypted upgrades, and browsers/other tools generally expect `wss://` for
-anything crossing the public internet. The standard fix is a reverse proxy
-that terminates TLS and forwards to the relay's plain port.
+The relay only speaks plain `ws://`. Fine for testing, but some networks block
+unencrypted upgrades — put a reverse proxy in front to terminate TLS.
 
-**[Caddy](https://caddyserver.com/)** is the simplest option — it gets you
-automatic Let's Encrypt certificates with almost no config. If you have a
-domain pointed at your VPS, a `Caddyfile` like this is enough:
+**[Caddy](https://caddyserver.com/)** is the easiest: automatic Let's Encrypt certs,
+almost no config. With a domain pointed at your VPS:
 
 ```
 relay.yourdomain.com {
@@ -199,76 +153,52 @@ relay.yourdomain.com {
 }
 ```
 
-Run `caddy run` (or install it as a service — Caddy has first-class systemd
-support) and point the plugin at `wss://relay.yourdomain.com` (no port needed —
-Caddy handles 443 → 7890 internally).
+Run `caddy run` (or as a systemd service) and point the plugin at
+`wss://relay.yourdomain.com` — no port needed, Caddy handles 443 → 7890.
 
-Without a domain, you can still terminate TLS with a self-signed cert via
-nginx, but a domain + Caddy is far less setup for the same result — a domain
-from any registrar costs about as much as the VPS itself.
+No domain? nginx + a self-signed cert works, but a domain + Caddy is much less setup
+for the same result.
 
 ---
 
 ## Verifying it's reachable
 
-Before dragging friends into troubleshooting, confirm the relay answers from
-outside its own machine.
-
-From another machine (or your phone's data connection, to rule out LAN-only
-firewall rules), a quick PowerShell check:
+From another machine (or your phone's data connection):
 
 ```powershell
 Test-NetConnection -ComputerName your-vps-ip -Port 7890
 ```
 
-`TcpTestSucceeded : True` means the port is open and something's listening.
-`False` almost always means either the relay isn't running, the VPS/router
-firewall isn't open, or (for Option B) the port forward isn't set up correctly
-— see [Troubleshooting](#troubleshooting).
+`TcpTestSucceeded : True` means it's open. `False` means the relay isn't running, or
+a firewall/port-forward isn't set up — see [Troubleshooting](#troubleshooting).
 
-A full WebSocket-level check (confirms the relay's HTTP upgrade handshake
-works, not just that the TCP port is open) needs a WebSocket-aware tool, e.g.
+For a real WebSocket-level check, use
 [`websocat`](https://github.com/vi/websocat):
 
 ```
 websocat ws://your-vps-ip:7890/session/TEST
 ```
 
-If it connects and hangs waiting for input (rather than erroring immediately),
-the relay is working.
+Connects and hangs waiting for input → working.
 
 ---
 
 ## What to share with your group
 
-Two things, out of band (Discord, whatever) — the plugin has no discovery
-service, so both have to be communicated manually:
-
-1. **The relay URL** (`ws://...` or `wss://...`) — same for everyone, doesn't
-   change between sessions unless you tear down/move the relay.
-2. **The session code** — assigned by the relay (not chosen locally) each time
-   the host clicks "Host new session," guaranteeing it's not already in use by
-   another active session on that relay; shown in-window with a Copy button
-   once the relay responds. A session with no traffic at all for 10 seconds
-   (e.g. a host who requested a code but never actually connected/started) is
-   disbanded automatically, freeing the code back up.
+- **The relay URL** — same for everyone, doesn't change between sessions.
+- **The session code** — assigned by the relay when the host clicks "Host new
+  session" (guaranteed not already in use), shown in-window with a Copy button. A
+  code with no traffic for 10 seconds is disbanded automatically.
 
 ---
 
 ## Security notes
 
-- No authentication beyond the session code itself. Anyone who has both the
-  relay URL and a live session's code can join that session (capped at 8
-  peers). Treat the code like a party invite link — share it only with people
-  you're inviting to that specific run, and note the host can't kick someone
-  once they've joined a slot in this version.
-- The relay doesn't log or persist message contents, only connection
-  open/close and peer counts per session (see its console/journal output).
-- Running it on a machine you also use for other things exposes one more open
-  port on that machine — normal port-hygiene considerations apply (don't
-  reuse a port something else is already listening on, don't leave it
-  forwarded on your router longer than you're actually using it if you're
-  security-conscious about your home network).
+- No auth beyond the session code — anyone with the URL and a live code can join
+  (capped at 8 peers). Treat it like a party invite link; the host can't kick anyone
+  once they've joined.
+- The relay doesn't log message contents, only connection open/close and peer counts.
+- Running it on a shared machine opens one more port — normal port-hygiene applies.
 
 ---
 
@@ -276,17 +206,18 @@ service, so both have to be communicated manually:
 
 | Symptom | Likely cause |
 |---|---|
-| Plugin shows "Disconnected" immediately after Host/Join | Relay isn't running, or the URL/port is wrong. Check the relay's own console/journal output for a bind error. |
-| `Test-NetConnection` fails from outside | VPS firewall (`ufw`) or provider security group isn't open, or (home hosting) the router port-forward doesn't match the PC's *current* LAN IP — DHCP can reassign it after a reboot; consider a static DHCP lease for the hosting PC. |
-| Works locally, not for others | You're testing with `127.0.0.1`/LAN IP but gave others your *public* IP without actually port-forwarding, or vice versa. |
-| `HttpListenerException` on startup (Windows) | Missing the `netsh http add urlacl` grant, or another process already owns that port — check with `netstat -ano \| findstr 7890`. |
-| "session full" | The session already has 8 connected peers (relay-enforced cap); have the host start a new session. |
-| Connects, but nothing happens after Join | Confirm you're both pointed at the *same* relay URL and the *same* session code (codes are case-normalized, but a copy/paste typo is the usual culprit). |
+| "Disconnected" immediately after Host/Join | Relay isn't running, or the URL/port is wrong. Check the relay's own console/journal output. |
+| `Test-NetConnection` fails from outside | VPS firewall/security group isn't open, or the router port-forward doesn't match the PC's current LAN IP (consider a static DHCP lease). |
+| Works locally, not for others | Testing with a LAN IP but gave others your public IP without port-forwarding, or vice versa. |
+| `HttpListenerException` on startup (Windows) | Missing the `netsh http add urlacl` grant, or another process owns the port — check `netstat -ano \| findstr 7890`. |
+| "session full" | 8 peers already connected; host a new session. |
+| Connects, nothing happens after Join | Confirm the same relay URL and session code on both ends (case-normalized, but typos happen). |
 
 ## Configuring the plugin
 
-Open the Multiplayer window (`/anomech mp`, or the "Multiplayer..." button
-that appears once UMAD P3 Black Hole is selected) and type your relay's URL
-into the **Relay URL** field — there's no default, so Host/Join stay disabled
-until you enter one. It's remembered across sessions once set, so you only
-need to type it again if you switch relays.
+Open the Multiplayer window (`/anomech mp`, or the "Multiplayer..." button once a
+multiplayer-supported scenario is selected) and type your relay's address into the
+**Relay URL** field. Just the address is enough (`relay.example.com`, or
+`203.0.113.5:7890` without TLS) — the plugin tries `wss://` first and falls back to
+`ws://` only if that relay doesn't support it, telling you which one it used. An
+explicit `ws://`/`wss://` also works. Remembered across sessions once set.

@@ -4,60 +4,35 @@ using System.Text;
 
 namespace AnoMech.Relay;
 
-// Dumb session-scoped broadcast relay. Knows nothing about AnoMech's message
-// protocol -- it just forwards whatever frame (Text or Binary; the plugin uses
-// Binary for Brotli-compressed messages, see RelayClient.cs) one socket sends,
-// verbatim and with its original type, to every other socket connected under
-// the same session code. All app-level meaning (host/peer, role claims, world
-// snapshots, whether a given frame happens to be compressed) lives entirely in
-// the plugin.
+// Dumb session-scoped broadcast relay. Knows nothing about AnoMech's message protocol --
+// forwards whatever frame one socket sends, verbatim and with its original type, to every
+// other socket in the same session code. All app-level meaning lives in the plugin.
 //
-// Exists because a Dalamud client is firewalled off from FFXIV's own server
-// traffic while a scenario runs (see ZoneSession), and most players sit behind
-// NAT, so direct peer-to-peer isn't viable -- this is the same role Mare
-// Synchronos/Lightless's relay plays for cosmetic sync.
+// Exists because a Dalamud client is firewalled off from FFXIV's own server traffic during
+// a scenario (see ZoneSession), and most players sit behind NAT, so direct P2P isn't viable.
 internal static class Program
 {
     // Hard cap per session so one room can't be griefed into an unbounded fan-out.
     private const int MaxPeersPerSession = 8;
 
-    // Sent once to every socket right after it joins, letting a connecting client
-    // detect an old relay (which never sends this at all, or an older one with a
-    // narrower feature list) before it ever risks relying on a behavior that
-    // relay doesn't have -- see RelayClient.cs's own read of this. Deliberately
-    // not shaped as an MpMessage: the relay stays fully protocol-agnostic (see the
-    // class doc comment), so this is its own tiny, independent greeting, not a
-    // fake application message.
-    //
-    // A named capability set rather than a single version int deliberately: a
-    // bare "protocol >= 2" check ties a client's every feature check to one
-    // shared number, so adding *any* new relay-side behavior forces bumping it
-    // for everyone even if a given client only cares about one specific thing.
-    // Each entry here is a self-contained yes/no a client can check for whatever
-    // it actually needs -- add a new one alongside any future relay-side
-    // behavior a client needs to detect ahead of time, never remove/rename an
-    // existing one once shipped (an older client may still be checking for it).
+    // Sent once right after a socket joins, so a client can detect an old/narrower relay
+    // before relying on a behavior it doesn't have (see RelayClient.cs). Not an MpMessage --
+    // the relay stays protocol-agnostic. A named capability set, not one version int, so a
+    // client only checks for what it actually needs; never remove/rename a shipped entry.
     private const int RelayVersion = 2;
     private static readonly string[] RelayCapabilities = ["binaryCompression"];
     private static readonly string RelayCapabilitiesJson = string.Join(",", RelayCapabilities.Select(c => $"\"{c}\""));
 
-    // Codes were previously rolled client-side (a local Random.Shared pick in
-    // MultiplayerManager) -- fine odds, but the relay is what actually owns the
-    // room namespace below, so it's the only party that can actually GUARANTEE no
-    // collision rather than just hope for one. Hosting now goes through /host (no
-    // code in the URL at all); the relay picks a free one itself and hands it back
-    // in the greeting -- see CreateSession.
+    // The relay owns the room namespace, so it's the only party that can guarantee no
+    // collision (vs. a client picking one locally and hoping). Hosting goes through /host
+    // (no code in the URL); the relay picks a free one and hands it back in the greeting.
     private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
     private const int CodeLength = 6;
     private static readonly Random CodeRng = new();
 
-    // A room with no broadcast traffic for this long is considered abandoned -- a
-    // host who requested a code via /host but crashed/closed before ever sending a
-    // single message (not even their own periodic ping), or a session whose
-    // sockets all went half-dead without a clean close. Comfortably above
-    // MultiplayerManager's own 2s ping interval, so any actually-connected host
-    // keeps their room alive for free just by existing; this only reaps rooms
-    // where literally nothing has moved through in 5x that interval.
+    // A room idle this long is considered abandoned (crashed host, dead sockets that never
+    // closed cleanly). Comfortably above MultiplayerManager's 2s ping, so any live host
+    // keeps its room for free.
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ReapInterval = TimeSpan.FromSeconds(2);
 
@@ -152,16 +127,9 @@ internal static class Program
         Console.WriteLine($"[{sessionCode}] {(isHostRequest ? "session created" : "peer joined")} ({CountPeers(sessionCode)} connected)");
         await SendGreetingAsync(socket, isHostRequest ? sessionCode : null);
 
-        // A single logical WebSocket message (e.g. a large WorldSnapshotMessage,
-        // which grows with live enemy/tether count) can arrive split across many
-        // frames -- ReceiveAsync only fills one frame per call and reports
-        // EndOfMessage=false until the last one. Broadcasting after every single
-        // ReceiveAsync (the old behaviour) forwarded each fragment standalone,
-        // silently truncating/corrupting any message bigger than one read: fine
-        // early in a fight when snapshots are small, but as soon as enough adds
-        // are alive to push a snapshot past one frame, every later snapshot
-        // arrived at peers as broken JSON and got dropped. Buffer until
-        // EndOfMessage before forwarding anything.
+        // A large message (e.g. WorldSnapshotMessage) can arrive split across several
+        // frames; buffer until EndOfMessage before forwarding, or fragments get broadcast
+        // standalone and peers see truncated/corrupt JSON once a snapshot outgrows one frame.
         var readBuffer = new byte[16 * 1024];
         using var messageBuffer = new MemoryStream();
         try
@@ -205,10 +173,8 @@ internal static class Program
             : null;
     }
 
-    // Peer-join only -- hosting no longer creates a room implicitly (see
-    // CreateSession), so a code nobody actually hosted is now rejected immediately
-    // instead of silently vivifying an empty room a peer would otherwise sit in
-    // until their own client-side "no host responded" timeout gave up on it.
+    // Peer-join only -- a code nobody actually hosted is rejected immediately instead of
+    // silently vivifying an empty room.
     private static bool TryJoin(string sessionCode, WebSocket socket, out string reason)
     {
         lock (SessionsLock)
@@ -315,9 +281,6 @@ internal static class Program
         }
     }
 
-    // How long a single peer's send may take before we give up on it. Broad
-    // enough to absorb ordinary latency/jitter, tight enough that one stalled
-    // connection can't noticeably delay the rest of the party for long.
     private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(5);
 
     private static async Task BroadcastAsync(string sessionCode, WebSocket sender, byte[] bytes, WebSocketMessageType type)
@@ -330,25 +293,14 @@ internal static class Program
             targets = room.Peers.Where(p => !ReferenceEquals(p, sender) && p.State == WebSocketState.Open).ToList();
         }
 
-        // Parallel, not sequential: with a party's worth of peers in one session,
-        // a single slow/stalled connection must not delay delivery to everyone
-        // else -- the old sequential foreach blocked the whole broadcast (every
-        // message type, not just world snapshots) behind whichever peer happened
-        // to be unresponsive.
+        // Parallel, not sequential -- one slow peer must not delay delivery to everyone else.
         await Task.WhenAll(targets.Select(target => SendOneAsync(target, bytes, type)));
     }
 
-    // Sends to one target with a hard timeout. A timeout is treated as fatal
-    // for that connection (aborted, not just skipped this round): cancelling a
-    // WebSocket send mid-flight can leave a half-written frame sitting in the
-    // OS send buffer, and reusing the connection for the next broadcast risks
-    // interleaving a fresh frame with that leftover partial one -- corrupting
-    // the whole message stream for that peer from then on, not just this one
-    // message. Aborting is a clean hard reset instead, and lets both sides'
-    // own receive loops notice and clean up the normal way: this relay's own
-    // per-connection loop (HandleConnectionAsync) sees its ReceiveAsync fail
-    // and calls Leave(); the client's RelayClient sees its ReceiveAsync fail
-    // and fires Disconnected, which starts its own reconnect-with-backoff loop.
+    // A timed-out send is treated as fatal for that connection (aborted, not skipped): a
+    // cancelled send can leave a half-written frame in the OS buffer, and reusing the
+    // connection risks interleaving a fresh frame with that leftover -- corrupting the
+    // stream from then on. Abort lets both sides' own receive loops notice and clean up.
     private static async Task SendOneAsync(WebSocket target, byte[] bytes, WebSocketMessageType type)
     {
         using var cts = new CancellationTokenSource(SendTimeout);

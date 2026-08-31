@@ -26,31 +26,19 @@ public sealed partial class MultiplayerManager
 {
     // ---- Message pump -------------------------------------------------------
 
-    // Ordering, not just marshalling onto the Framework thread, is why this exists.
-    // RelayClient.ReceiveLoopAsync invokes MessageReceived synchronously and
-    // sequentially, one message fully handled before the next ReceiveAsync -- so this
-    // enqueue always happens in true wire-arrival order. But firing a separate
-    // Plugin.Framework.Run(() => Dispatch(message)) per message (the old approach)
-    // does NOT preserve that order once queued: Dalamud's Framework.Run schedules
-    // onto ThreadBoundTaskScheduler, whose Run() iterates a ConcurrentDictionary of
-    // pending tasks -- not insertion order. Confirmed via AnoMech-DamageDebug dumps:
-    // a burst of MapEffectMessages sent host-side in order 1-8,0 (and by then
-    // already verified arriving wire-ordered peer-side, per RelayClient's own FIFO
-    // send queue) still executed out of order once each hit its own Framework.Run,
-    // scrambling a peer's replicated arena-color transition (P2 Forsaken's
-    // gold->black swap). Draining this queue once per Tick (already called
-    // unconditionally every frame from Plugin.OnFrameworkUpdate) sidesteps that
-    // scheduler entirely instead of fighting its ordering.
+    // Exists for ordering, not just marshalling onto the Framework thread. RelayClient's
+    // receive loop invokes MessageReceived synchronously in wire order, but firing a
+    // separate Plugin.Framework.Run per message does NOT preserve that order once queued --
+    // Dalamud's ThreadBoundTaskScheduler doesn't run pending tasks in insertion order
+    // (confirmed via AnoMech-DamageDebug dumps: a MapEffectMessage burst arrived wire-ordered
+    // but executed scrambled). Draining this queue once per Tick sidesteps that scheduler.
     private readonly ConcurrentQueue<MpMessage> pendingMessages = new();
 
     private void OnMessageReceivedOffThread(MpMessage message) => pendingMessages.Enqueue(message);
 
-    // Skips a WorldSnapshotMessage/RolesSnapshotMessage when the next queued item is
-    // another of the same type -- under a bad connection this can back up several
-    // deep and then replay in a burst, firing every cast/position edge at once. Only
-    // drops an earlier same-type entry for a newer one right behind it, so cross-type
-    // wire order is untouched. Safe: CastSeq edges compare against this client's own
-    // last-seen value regardless of skips, and damage resolution is host-authoritative.
+    // Skips a WorldSnapshot/RolesSnapshot when the next queued item is another of the same
+    // type -- under a bad connection these can back up and replay in a burst. Only drops an
+    // earlier same-type entry for a newer one right behind it; cross-type order is untouched.
     private void DrainPendingMessages()
     {
         while (pendingMessages.TryDequeue(out var message))
@@ -62,16 +50,10 @@ public sealed partial class MultiplayerManager
         }
     }
 
-    // `source` is the specific RelayClient instance this event came from --
-    // compared against the current `relay` field so a stale event from a
-    // client we've already torn down (LeaveSession) or superseded (a
-    // newer reconnect attempt winning the race) is ignored rather than
-    // reprocessed or double-triggering another reconnect loop. This also
-    // doubles as the "was this intentional" check: LeaveSession always nulls
-    // `relay` before the corresponding Disconnected event can be dispatched
-    // (Dispose's cancellation unwinds on a background thread and this handler
-    // is itself marshalled to run on a later framework tick), so a manual
-    // Leave's own Disconnected(null) never reaches past this guard.
+    // `source` is compared against the current `relay` so a stale event from an
+    // already-torn-down or superseded client is ignored. Also doubles as the "was this
+    // intentional" check: LeaveSession always nulls `relay` before its own Disconnected(null)
+    // can be dispatched, so a manual Leave never reaches past this guard.
     private void OnDisconnectedOffThread(RelayClient source, Exception? failure)
         => Plugin.Framework.Run(() =>
         {
@@ -94,10 +76,7 @@ public sealed partial class MultiplayerManager
 
     private void Dispatch(MpMessage message)
     {
-        // A single malformed-but-parseable message (an unexpected null, a role
-        // enum out of range, whatever) must not take down the framework tick
-        // pump that every other plugin system also shares -- log and move on
-        // rather than letting one bad packet cascade.
+        // One malformed message must not take down the shared framework tick pump.
         try
         {
             DispatchCore(message);
@@ -110,18 +89,10 @@ public sealed partial class MultiplayerManager
 
     private void DispatchCore(MpMessage message)
     {
-        // Every message type the host actually broadcasts to everyone (as
-        // opposed to a fellow peer's request that the relay's dumb fan-out
-        // happens to deliver to us too, e.g. another peer's ClaimRoleMessage --
-        // this switch just never matches those on a non-host client). Used to
-        // drive the host's own roster-row liveness (see lastHostMessageMs);
-        // must be kept in sync with the `when !IsHost` cases below.
-        // SessionEndedMessage deliberately excluded -- unlike everything else
-        // here it isn't guaranteed to have come from the host (any peer can
-        // send it). When it *is* the host leaving, it's moot anyway since
-        // receiving it tears the whole session down a few lines later
-        // regardless; when it's a departing peer instead, it plainly isn't a
-        // host message at all and must not be mistaken for one.
+        // Every message type the host actually broadcasts (not a fellow peer's request the
+        // relay's fan-out happens to deliver to us too) -- drives lastHostMessageMs; keep in
+        // sync with the `when !IsHost` cases below. SessionEndedMessage excluded: any peer
+        // can send it, so it isn't reliably a host message.
         if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage or RolesSnapshotMessage
             or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage
             or AiReplayStateMessage or P2AiReplayStateMessage or P4AiReplayStateMessage or P5AiReplayStateMessage)
@@ -161,14 +132,10 @@ public sealed partial class MultiplayerManager
             case LobbyStateMessage lobby when !IsHost:
                 Session.ApplyLobbyState(lobby);
                 LobbyChanged?.Invoke();
-                // The host never re-sends Start to an already-open connection --
-                // only a fresh StartMessage triggers OnStartReceived. Without this,
-                // a peer who connects after Start already fired (a late join, or a
-                // manual rejoin after their connection dropped mid-fight) would sit
-                // forever on "Connected -- waiting for the host to start" even
-                // though the fight is already running. OnStartReceived is itself
-                // idempotent, so this is safe to also fall through for it on a
-                // normal fresh start (arrives just before StartMessage does).
+                // The host never re-sends Start to an already-open connection -- without
+                // this, a late join or a rejoin mid-fight would sit forever on "waiting for
+                // the host to start." OnStartReceived is idempotent, so this is also safe on
+                // a normal fresh start (arrives just before StartMessage).
                 if (lobby.Started && MyClaimedRole != null)
                     OnStartReceived();
                 break;
@@ -183,9 +150,7 @@ public sealed partial class MultiplayerManager
             }
             case StartCheckResponseMessage resp when IsHost:
                 DiagnosticLog.Info($"[Multiplayer] StartCheck reply from {Session.NameOf(resp.PeerId)}: ready={resp.Ready}{(resp.Reason is { } r ? $" ({r})" : "")}.");
-                // Remove(...) returning false means either a duplicate/stale
-                // reply or one that arrived after the timeout already gave up
-                // on this peer -- either way there's nothing left to do with it.
+                // false means a duplicate/stale reply, or the timeout already gave up on this peer.
                 if (pendingStartResponses == null || !pendingStartResponses.Remove(resp.PeerId)) break;
                 if (!resp.Ready) startCheckFailures[resp.PeerId] = resp.Reason ?? "not ready";
                 if (pendingStartResponses.Count == 0) FinishStartCheck();
@@ -210,25 +175,16 @@ public sealed partial class MultiplayerManager
                 foreach (var (id, entry) in status.Statuses)
                     peerStatuses[id] = entry;
                 break;
-            // No `when !IsHost` guard -- when the HOST leaves it ends the
-            // session for the whole group (including any other peers), so
-            // that branch has to run regardless of the recipient's role. A
-            // departing peer, by contrast, only ever shrinks the roster (see
-            // RemovePeer) -- the rest of the group keeps going.
+            // No `when !IsHost` guard -- when the HOST leaves it ends the session for
+            // everyone, so this must run regardless of the recipient's role. A departing
+            // peer only shrinks the roster (see RemovePeer); the group keeps going.
             case SessionEndedMessage ended when ended.PeerId == Session.HostId:
             {
                 // Read the sender's name before LeaveSessionInternal wipes Session out from under it.
                 var who = Session.NameOf(ended.PeerId);
                 DiagnosticLog.Info($"[Multiplayer] Host {who} left -- session ending for the whole group.");
-                // IsInInstance guard, not running -- same reasoning as
-                // LeaveRequestMessage below: a Reset earlier in the session (e.g. the
-                // peer clicking Reset before the host later leaves) clears running
-                // while leaving the group stuck in-instance, so gating on running here
-                // would skip Leave() and strand this peer in-instance with no session
-                // left to recover through. IsInInstance is only ever true once a zone
-                // was genuinely entered (MapController.TryLoad), which is the actual
-                // precondition Leave() -> Unload() needs (it restores the real
-                // character to the position ZoneSession.Enter() saved).
+                // IsInInstance guard, not running -- a Reset earlier in the session can clear
+                // running while leaving the group stuck in-instance (see LeaveRequestMessage).
                 if (Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
                 LeaveSessionInternal(notifyOthers: false);
                 SessionEndReason = $"{who} left -- session ended.";
@@ -242,27 +198,14 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested a reset.");
                 Plugin.GameInstance.Reset();
                 break;
-            // IsInInstance guard (not running -- Leave() must still work after
-            // a Reset, which clears running while leaving the group stuck
-            // in-instance with nothing to show for it and no way back short of
-            // disbanding the whole session): Leave() -> Unload() assumes a zone
-            // was actually entered (it restores the real character to the
-            // position ZoneSession.Enter() saved), and IsInInstance is only
-            // ever set true once that has genuinely happened (MapController.
-            // TryLoad), so it alone is the correct signal here.
+            // IsInInstance guard, not running -- Leave() must still work after a Reset, which
+            // clears running while leaving the group stuck in-instance.
             case LeaveRequestMessage req when IsHost:
                 DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested to leave the instance.");
                 if (Plugin.GameInstance.World.Map.IsInInstance)
                     Plugin.GameInstance.Leave();
-                // Unconditional, even when IsInInstance was already false above (e.g.
-                // the host left via their own Leave button, possibly after an earlier
-                // Reset, before this request arrived) -- the old code silently dropped
-                // the request in exactly that case, leaving the requesting peer's own
-                // Leave button waiting forever for a response the host never sent.
-                // Always returnedToInn: true -- this handler's whole purpose is
-                // granting a leave request, regardless of whether Leave() above was
-                // just queued (its deferred World.Map.Unload() hasn't run yet, so
-                // reading IsInInstance here would still see the pre-Leave state).
+                // Unconditional, even if IsInInstance was already false -- otherwise the
+                // requesting peer's own Leave button waits forever for a response.
                 BroadcastRunEnded(returnedToInn: true);
                 break;
             case AiReplayStateMessage state when !IsHost:
@@ -273,23 +216,17 @@ public sealed partial class MultiplayerManager
                 pendingP2AiReplayState = p2State;
                 TryStartDebugBotReplay();
                 break;
-            // Re-syncs the one field in P2AiReplayStateMessage's snapshot that
-            // actually changes mid-fight -- see P2LockonsUpdateMessage's own doc
-            // comment. Dropped if the shadow state doesn't exist yet: that only
-            // happens if this update raced ahead of the replay actually starting,
-            // in which case the initial P2AiReplayStateMessage.Lockons snapshot
-            // (sent before any tower has had a chance to resolve and reassign
-            // anything) already carries the same value.
+            // Re-syncs the one field in P2AiReplayStateMessage's snapshot that changes
+            // mid-fight -- see P2LockonsUpdateMessage. Dropped if the shadow state doesn't
+            // exist yet: only happens if this raced ahead of replay starting, in which case
+            // the initial snapshot already carries the same value.
             case P2LockonsUpdateMessage lockonsUpdate when !IsHost:
                 if (debugShadowStateP2 is { } p2Shadow)
                     p2Shadow.Lockons = lockonsUpdate.Lockons;
                 break;
-            // Pure replays of the exact host-side call -- see
-            // MapEffectMessage/MapDirectorUpdateMessage's doc comment. The
-            // handlers subscribed in SubscribeMapEventsOnce gate on IsHost, so
-            // this can't loop back into a re-broadcast: AddEffect/DirectorUpdate
-            // fire the same MapController events on a peer's own local call too,
-            // but that peer's own handler is a no-op since IsHost is false there.
+            // Pure replays of the host-side call. Can't loop into a re-broadcast: the
+            // SubscribeMapEventsOnce handlers gate on IsHost, so a peer's own local
+            // AddEffect/DirectorUpdate call is a no-op there.
             case MapEffectMessage effect when !IsHost:
                 DiagnosticLog.Info($"[Multiplayer] Peer: applying MapEffect packetFlags=0x{effect.PacketFlags:X8} index=0x{effect.Index:X}.");
                 Plugin.GameInstance.World.Map.AddEffect(effect.PacketFlags, effect.Index);

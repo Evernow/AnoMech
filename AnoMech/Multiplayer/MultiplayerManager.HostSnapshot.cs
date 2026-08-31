@@ -26,24 +26,18 @@ public sealed partial class MultiplayerManager
 {
     // ---- Host: sampling the live simulation --------------------------------
 
-    // Backpressure-gated rather than fired every Tick unconditionally: a connection
-    // that can't keep up otherwise queues sends behind each other on RelayClient's
-    // unbounded FIFO, growing an ever-larger backlog of stale state. Never starting a
-    // new send while the last is in flight self-adjusts the rate to what the
-    // connection can sustain.
+    // Backpressure-gated rather than fired every Tick: a connection that can't keep up
+    // otherwise queues sends behind each other on RelayClient's unbounded FIFO. Never
+    // starting a new send while the last is in flight self-adjusts to what it can sustain.
     private Task? pendingSnapshotSend;
 
     private Task SampleAndBroadcastSnapshot()
     {
         var world = Plugin.GameInstance.World;
 
-        // UMAD P2 only (harmless no-op elsewhere -- LastState is only non-null for
-        // the scenario that's actually running). See P2LockonsUpdateMessage's doc
-        // comment: UmadP2ForsakenScenario.ReapplyLockons reassigns state.Lockons
-        // dynamically as towers resolve, host-only, so a peer's replay-start
-        // snapshot of it goes stale the first time that happens. Re-broadcast
-        // whenever it actually changes, keyed by a sorted string (Dictionary has
-        // no value equality) so this doesn't spam a message every tick.
+        // UMAD P2 only. UmadP2ForsakenScenario.ReapplyLockons reassigns state.Lockons
+        // dynamically as towers resolve, host-only, so a peer's replay-start snapshot goes
+        // stale the first time that happens -- re-broadcast whenever it actually changes.
         if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is UmadP2ForsakenScenario { LastState: { } p2State })
         {
             var lockonsKey = string.Join(",", p2State.Lockons.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}"));
@@ -206,10 +200,9 @@ public sealed partial class MultiplayerManager
         return (null, null);
     }
 
-    // Same job as ResolveEnd, but for a Cast() target: SimCast only ever stores the raw
-    // GameObjectId it was given (see SimCast.TargetId's doc comment for why that number
-    // means nothing to a peer on its own), so this resolves by ID equality against the
-    // host's own local party/enemy set instead of ResolveEnd's reference equality.
+    // Same job as ResolveEnd, but for a Cast() target: SimCast only stores a raw
+    // GameObjectId (meaningless to a peer on its own), so this resolves by ID equality
+    // instead of ResolveEnd's reference equality.
     private (int? enemyNetId, PartyRole? role) ResolveTargetId(SimWorld world, GameObjectId? targetId)
     {
         if (targetId is not { } id) return (null, null);
@@ -223,19 +216,14 @@ public sealed partial class MultiplayerManager
     private void OnPartyMemberKilledHost(PartyRole role, string cause)
         => _ = relay?.SendAsync(new RoleKilledMessage(role, cause));
 
-    // True once a claimed peer hasn't been heard from for PeerStaleTimeoutMs.
-    // Host reads its own ground-truth peerLastSeenMs; a peer reads the same
-    // number as last relayed by the host (PeerStatusMessage) -- either way
-    // this surfaces in MultiplayerWindow so a dropped connection shows as
-    // something other than "their puppet just stopped moving."
+    // True once a claimed peer hasn't been heard from for PeerStaleTimeoutMs -- host reads
+    // its own ground truth, a peer reads the last value relayed via PeerStatusMessage.
     public bool IsPeerStale(Guid peerId) => IsHost
         ? peerLastSeenMs.TryGetValue(peerId, out var lastSeen) && Environment.TickCount64 - lastSeen > PeerStaleTimeoutMs
         : peerStatuses.TryGetValue(peerId, out var entry) && entry.SecondsSinceLastSeen * 1000f > PeerStaleTimeoutMs;
 
-    // Host-only, every PingIntervalSeconds regardless of running: pings every
-    // claimed peer, rebuilds the display-ready status snapshot from whatever
-    // was last measured (a full cycle behind the very latest Pong, which is
-    // fine for a coarse indicator), and broadcasts it so peers' rosters match.
+    // Host-only, every PingIntervalSeconds regardless of running: pings every claimed peer,
+    // rebuilds the display status from whatever was last measured, and broadcasts it.
     private void SendPingAndRefreshStatuses()
     {
         var nowMs = Environment.TickCount64;
@@ -262,17 +250,9 @@ public sealed partial class MultiplayerManager
             if (stale && warnedStalePeers.Add(peerId))
             {
                 DiagnosticLog.Warn($"[Multiplayer] {Session.NameOf(peerId)} ({role}) hasn't reported in over {PeerStaleTimeoutMs / 1000}s -- likely disconnected.");
-                // Mid-fight, a silently-vanished party member dooms the run the same
-                // way an explicit "Leave session" click does (see RemovePeer's mid-
-                // fight branch) -- but unlike that click, going stale isn't
-                // necessarily permanent (a network blip, not a deliberate leave), so
-                // only end the run here; their role claim and roster slot are left
-                // alone so a reconnect (their own client already retries the same
-                // relay/session automatically -- see BeginReconnect) drops them back
-                // into a normal lobby instead of finding their role already handed
-                // to someone else. IsInInstance guard: Leave() -> Unload() assumes a
-                // zone was actually entered, same reasoning as everywhere else this
-                // guard appears in this file.
+                // Ends the run like RemovePeer's mid-fight branch, but leaves the role claim
+                // and roster slot alone -- going stale may just be a network blip, and their
+                // own client already retries the reconnect (BeginReconnect).
                 if (running && Plugin.GameInstance.World.Map.IsInInstance)
                 {
                     DiagnosticLog.Info($"[Multiplayer] Ending the run because {Session.NameOf(peerId)} went stale mid-fight.");
