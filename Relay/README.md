@@ -107,35 +107,24 @@ is already overkill for a relay this light.
 Free, but friends outside your LAN need a router port-forward, and your PC has to
 stay on for the session.
 
-1. **Publish self-contained**:
+1. **Publish self-contained** (`-r win-x64` on Windows, `-r linux-x64` on Linux):
 
    ```
    cd Relay/AnoMech.Relay
    dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish
    ```
 
-2. **Allow the port** (PowerShell, as Administrator):
+2. **Open port 7890 in your firewall**, then **port-forward it on your router**
+   (external TCP 7890 → this PC's LAN IP, port 7890) if anyone joining isn't on your
+   home LAN.
 
-   ```powershell
-   New-NetFirewallRule -DisplayName "AnoMech Relay" -Direction Inbound -Protocol TCP -LocalPort 7890 -Action Allow
-   ```
-
-3. **Grant the URL reservation**, so `HttpListener` doesn't need an elevated process
-   every run (Administrator, once):
-
-   ```powershell
-   netsh http add urlacl url=http://+:7890/ user=Everyone
-   ```
-
-4. **Port-forward on your router** (external TCP 7890 → your PC's LAN IP, port 7890)
-   if anyone joining isn't on your home LAN.
-
-5. **Find your public IP** (search "what is my ip") and share it as the relay
+3. **Find your public IP** (search "what is my ip") and share it as the relay
    address. No static IP? A dynamic-DNS service (No-IP, DuckDNS) gives you a stable
    hostname instead.
 
-6. **Run it**: `.\publish\AnoMech.Relay.exe --port 7890`. Closing the console kills
-   it — use [NSSM](https://nssm.cc/) or Task Scheduler for something persistent.
+4. **Run it**: `.\publish\AnoMech.Relay.exe --port 7890` (`./publish/AnoMech.Relay
+   --port 7890` on Linux). Closing the console kills it — see
+   [Troubleshooting](#troubleshooting) if it won't start.
 
 ---
 
@@ -198,7 +187,9 @@ Connects and hangs waiting for input → working.
   (capped at 8 peers). Treat it like a party invite link; the host can't kick anyone
   once they've joined.
 - The relay doesn't log message contents, only connection open/close and peer counts.
-- Running it on a shared machine opens one more port — normal port-hygiene applies.
+- Running it on a shared machine opens one more port — don't reuse a port something
+  else is already listening on, and don't leave it forwarded on your router longer
+  than you're actually using it.
 
 ---
 
