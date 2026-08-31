@@ -230,7 +230,7 @@ public class MultiplayerWindow : Window, IDisposable
         // relay just means every message goes uncompressed (RelayClient falls
         // back automatically), not that anything's actually broken.
         if (stable && !mp.SupportsCompression)
-            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "This relay is out of date -- update it for lower bandwidth use.");
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "This relay does not support compression.");
 
         if (mp.IsHost && mp.SessionCode == null)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "Requesting a session code from the relay...");
