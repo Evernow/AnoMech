@@ -27,6 +27,7 @@ public sealed class UmadP5ExaflaresScenario : IScenario
     public IPhase Phase => UmadZone.P5;
     public bool SupportsSolo => true;
     public bool SupportsMultiplayer => true;
+    public uint? TankMaxHealth => Tunables.RealTankMaxHealth;
 
     // Enemy spawn level.
     private const byte Level = 100;

@@ -36,6 +36,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
     [PluginService] internal static IDutyState DutyState { get; private set; } = null!;
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
+    [PluginService] internal static IJobGauges JobGauges { get; private set; } = null!;
 
     private const string CommandName = "/anomech";
     private const string CommandAlias = "/ano";
@@ -46,6 +47,9 @@ public sealed class Plugin : IDalamudPlugin
     public readonly WindowSystem WindowSystem = new("AnoMech");
     public Game Game { get; }
     public MultiplayerManager Multiplayer { get; } = new();
+    // Mirrors GameInstance below -- lets scenario-side code (TankMitigation) reach the
+    // active session without its own Plugin reference.
+    internal static MultiplayerManager MultiplayerInstance { get; private set; } = null!;
     // SimObjects reach engine singletons through these statics (mirrors the
     // Plugin.* PluginService pattern).
     internal static Game GameInstance { get; private set; } = null!;
@@ -77,6 +81,7 @@ public sealed class Plugin : IDalamudPlugin
         PlayerInputHooks = new LocalPlayerInputHooks(GameInterop);
         Game = new Game();
         GameInstance = Game;
+        MultiplayerInstance = Multiplayer;
         ConfigWindow = new ConfigWindow(this);
         MainWindow = new MainWindow(this);
         MultiplayerWindow = new MultiplayerWindow(this);

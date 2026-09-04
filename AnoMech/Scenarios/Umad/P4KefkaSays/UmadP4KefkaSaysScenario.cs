@@ -21,6 +21,7 @@ public sealed class UmadP4KefkaSaysScenario : IScenario
     public string Name => "Kefka Says";
     public IPhase Phase => UmadZone.P4;
     public bool SupportsMultiplayer => true;
+    public uint? TankMaxHealth => Tunables.RealTankMaxHealth;
 
     public void DrawSettings() => settingsWindow.Draw();
     private readonly UmadP4KefkaSaysSettingsWindow settingsWindow = new();

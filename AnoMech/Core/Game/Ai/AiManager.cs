@@ -98,8 +98,9 @@ public sealed class AiManager
                     continue;
                 }
 
-                AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) can't make deadline {deadline:F1}, leaving now.");
-                world.Events.Add(PromptMoveDelay, () => member.MoveTo(target, speed: RunSpeed));
+                member.AddStatus(SprintStatusId, available, SprintStatusParam);
+                AnoMech.Core.DiagnosticLog.Info($"[AiManager] Move@{time:F1}: {role} from ({member.Position.X:F1},{member.Position.Z:F1}) -> ({target.X:F1},{target.Z:F1}) can't make deadline {deadline:F1} even sprinting ({neededSpeed:F2}y/s needed) -- sprinting anyway, leaving now.");
+                world.Events.Add(PromptMoveDelay, () => member.MoveTo(target, speed: SprintSpeed));
             }
         });
     }

@@ -27,6 +27,36 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
         if (bc != null && bc->Health < bc->MaxHealth) bc->Health = bc->MaxHealth;
     }
 
+    // Real native MaxHealth before OverrideMaxHealthForTankRole clobbered it; null if inactive.
+    private uint? realMaxHealth;
+
+    // Overrides the real player's MaxHealth to `tankMaxHealth` (IScenario.TankMaxHealth, via
+    // PartyCreator.Populate) so TankMitigation's fixed-HP tankbuster numbers land against the
+    // same reference pool bot tanks use, not whatever the player's real gear/level produces.
+    // No-op if already overridden.
+    public void OverrideMaxHealthForTankRole(uint tankMaxHealth)
+    {
+        var bc = BattleCharaPtr;
+        if (bc == null || realMaxHealth != null) return;
+        realMaxHealth = bc->MaxHealth;
+        bc->MaxHealth = tankMaxHealth;
+        bc->Health = tankMaxHealth;
+    }
+
+    // Undoes OverrideMaxHealthForTankRole from Despawn. MUST run before RestoreHpBar: restore
+    // MaxHealth first, then clamp Health down, to avoid a frame where Health exceeds it.
+    public void RestoreRealMaxHealth()
+    {
+        var bc = BattleCharaPtr;
+        if (realMaxHealth is not { } original) return;
+        if (bc != null)
+        {
+            bc->MaxHealth = original;
+            if (bc->Health > original) bc->Health = original;
+        }
+        realMaxHealth = null;
+    }
+
     public PartyRole Role { get; set; }
     public bool Dead { get; private set; }
 
@@ -88,6 +118,9 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     {
         base.Despawn();
         StopMoving();
+        // Must run before RestoreHpBar -- see RestoreRealMaxHealth's own doc comment for why
+        // the order matters.
+        RestoreRealMaxHealth();
         // Undo any KO bar drop (no-op if already full). Unconditional so it also covers a godmode
         // preview drop, where Dead is never set and a pending heal on Game.Events may be cleared by reset.
         RestoreHpBar();

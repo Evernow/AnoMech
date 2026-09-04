@@ -21,6 +21,11 @@ public sealed class MultiplayerSession
     public int SelectedAi { get; set; }
     public int SelectedWaymark { get; set; }
 
+    // Host's pre-fight tankbuster mitigation plan, keyed by TankBusterCastInfo.Id (see
+    // Scenarios/TankMitigation.cs). 0/missing = no mitigation planned for that cast --
+    // a bot-driven tank with no plan entry just takes the hit unmitigated.
+    public Dictionary<string, ushort> TankBusterPlan { get; private set; } = new();
+
     public void ApplyLobbyState(LobbyStateMessage msg)
     {
         HostId = msg.HostId;
@@ -31,11 +36,13 @@ public sealed class MultiplayerSession
         ScenarioIndex = msg.ScenarioIndex;
         SelectedAi = msg.SelectedAi;
         SelectedWaymark = msg.SelectedWaymark;
+        TankBusterPlan = new Dictionary<string, ushort>(msg.TankBusterPlan);
     }
 
     public LobbyStateMessage ToMessage() => new(
         HostId, new Dictionary<PartyRole, Guid>(ClaimedBy), new Dictionary<Guid, string>(Names),
-        new Dictionary<Guid, PeerBuildInfo>(Builds), Started, ScenarioIndex, SelectedAi, SelectedWaymark);
+        new Dictionary<Guid, PeerBuildInfo>(Builds), Started, ScenarioIndex, SelectedAi, SelectedWaymark,
+        new Dictionary<string, ushort>(TankBusterPlan));
 
     public PartyRole? RoleOf(Guid peerId) =>
         ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => (PartyRole?)kv.Key).FirstOrDefault();

@@ -31,11 +31,19 @@ public sealed class UmadP3BlackHoleState
     public int MiniBlackHoleInitialAngle { get; }
     public int MiniBlackHoleChirality { get; }
 
+    // See ThunderIIIAssignment. Read by both UmadP3BlackHoleAi (positioning) and
+    // UmadP3BlackHoleScenario.PopulateThunderIIIPlan (mitigation) -- both must agree on the
+    // same plan, or positioning sends a hit to a role mitigation never covers.
+    public ThunderIIIAssignment ThunderSet1 { get; }
+    public ThunderIIIAssignment ThunderSet2 { get; }
+
     public UmadP3BlackHoleState(SimWorld world, UmadP3BlackHoleStateOverrides overrides)
     {
         var party = world.Party;
         ScenarioObjects = new UmadP3BlackHoleScenarioObjects(world);
         Roles = BuildRoles(party, overrides);
+        ThunderSet1 = overrides.ThunderSet1;
+        ThunderSet2 = overrides.ThunderSet2;
 
         StackTargets = new RoleList(party, rng.Shuffle(rng.NextSupportRole(), rng.NextDpsRole()));
         EdictTargets = new RoleList(party, [rng.NextRole(), rng.NextRole()]);
@@ -53,8 +61,8 @@ public sealed class UmadP3BlackHoleState
 
     // Network-replay constructor: reconstructs only the fields UmadP3BlackHoleAi
     // actually reads (Roles/StackTargets/SlapAttacks/KefkaPosition/
-    // ImplosionAttack), from values the host already rolled and broadcast,
-    // instead of drawing fresh RNG. Used exclusively by a peer's local "debug:
+    // ImplosionAttack/ThunderSet1/ThunderSet2), from values the host already rolled/chose and
+    // broadcast, instead of drawing fresh RNG. Used exclusively by a peer's local "debug:
     // bot controls my character" mode (see MultiplayerManager) so its AI
     // choreography matches what a host-side bot in that role would actually do.
     // Every other property is a harmless placeholder -- no AI-only code path
@@ -62,7 +70,8 @@ public sealed class UmadP3BlackHoleState
     // only feed the scenario's own damage/VFX resolution, which peers never run.
     private UmadP3BlackHoleState(
         SimWorld world, RoleList roles, RoleList stackTargets,
-        IReadOnlyList<uint> slapAttacks, IReadOnlyList<Direction> kefkaPosition, uint implosionAttack)
+        IReadOnlyList<uint> slapAttacks, IReadOnlyList<Direction> kefkaPosition, uint implosionAttack,
+        ThunderIIIAssignment thunderSet1, ThunderIIIAssignment thunderSet2)
     {
         ScenarioObjects = new UmadP3BlackHoleScenarioObjects(world);
         Roles = roles;
@@ -71,6 +80,8 @@ public sealed class UmadP3BlackHoleState
         ImplosionAttack = implosionAttack;
         SlapAttacks = slapAttacks;
         ConeTargets = [];
+        ThunderSet1 = thunderSet1;
+        ThunderSet2 = thunderSet2;
         KefkaPosition = kefkaPosition;
         BlackHoleDirections = [];
         MiniBlackHoleInitialAngle = 0;
@@ -79,13 +90,15 @@ public sealed class UmadP3BlackHoleState
 
     public static UmadP3BlackHoleState FromNetworkReplay(
         SimWorld world, IReadOnlyList<PartyRole> roles, IReadOnlyList<PartyRole> stackTargets,
-        IReadOnlyList<uint> slapAttacks, IReadOnlyList<float> kefkaPositionRadians, uint implosionAttack)
+        IReadOnlyList<uint> slapAttacks, IReadOnlyList<float> kefkaPositionRadians, uint implosionAttack,
+        ThunderIIIAssignment thunderSet1, ThunderIIIAssignment thunderSet2)
         => new(world,
                new RoleList(world.Party, roles),
                new RoleList(world.Party, stackTargets),
                slapAttacks,
                kefkaPositionRadians.Select(r => new Direction(r)).ToList(),
-               implosionAttack);
+               implosionAttack,
+               thunderSet1, thunderSet2);
 
     // Final-slot (post-swap) line number and Accretion, mirroring the per-index status
     // assignment in UmadP3BlackHoleScenario.Run_OtherDebuffs. Slots 0-3 hold the supports

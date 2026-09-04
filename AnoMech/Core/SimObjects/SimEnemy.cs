@@ -470,13 +470,19 @@ public sealed unsafe class SimEnemy : SimNpc
     // scenario-authored animation cue, never used by Movement.
     public ushort? AnimationTimelineId { get; private set; }
 
+    // Monotonic counter, same reasoning as SimCast.CastSeq: lets a peer's edge-trigger dedup
+    // tell a genuine repeat of the same timeline id apart from "unchanged".
+    public int AnimationTimelineSeq { get; private set; }
+
     public void PlayAnimationTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
     {
         AnimationTimelineId = timelineId;
+        AnimationTimelineSeq++;
         PlayActionTimeline(timelineId, loopId, baseOverride);
     }
 
-    public void Follow(SimCharacter? target = null, float speed = 6f) => Movement.Follow(target, speed);
+    // Follow itself moved up to SimCharacter (a party member needs to call it too now -- see
+    // that class's own comment) -- nothing enemy-specific left to override here.
 
     private void ReconcileVisibility()
     {

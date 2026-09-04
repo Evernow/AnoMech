@@ -328,18 +328,22 @@ public unsafe class MainWindow : Window, IDisposable
         if (game.Paused) ImGui.TextDisabled("(scenario paused — press Reset to clear)");
 
         ImGui.Spacing();
-        ImGui.BeginDisabled(mpActive);
-        ImGui.BeginGroup();
         if (ImGui.CollapsingHeader("Scenario config", ImGuiTreeNodeFlags.DefaultOpen))
         {
             ImGui.Indent();
+            // DrawSettings (solo-only randomization) stays disabled in multiplayer;
+            // DrawMultiplayerSettings is the opposite (only matters in multiplayer), so it's
+            // deliberately outside this BeginDisabled/EndDisabled pair.
+            ImGui.BeginGroup();
+            ImGui.BeginDisabled(mpActive);
             _selectedScenario.DrawSettings();
+            ImGui.EndDisabled();
+            ImGui.EndGroup();
+            if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
+            _selectedScenario.DrawMultiplayerSettings();
             ImGui.Unindent();
         }
-        ImGui.EndGroup();
-        ImGui.EndDisabled();
-        if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-            ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
 
 #if DEBUG
         ImGui.Spacing();

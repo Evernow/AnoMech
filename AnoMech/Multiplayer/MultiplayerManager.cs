@@ -49,9 +49,11 @@ public sealed partial class MultiplayerManager : IDisposable
     // Host-only: edge-triggered logging so a mid-fight change gets one log line instead of
     // one per sample. ModelState/statuses/animation are still sent in full every snapshot.
     private readonly Dictionary<SimEnemy, byte> hostEnemyLastLoggedModelState = new();
-    private readonly Dictionary<SimEnemy, string> hostEnemyLastLoggedStatuses = new();
-    private readonly Dictionary<SimEnemy, ushort> hostEnemyLastLoggedAnimationTimeline = new();
-    private readonly Dictionary<PartyRole, string> hostRoleLastLoggedStatuses = new();
+    // Per-status-id (not just "did the set change") so LogStatusChanges can log an
+    // individual gain/loss/stack-change line instead of one "the whole set changed" summary.
+    private readonly Dictionary<SimEnemy, Dictionary<ushort, ushort>> hostEnemyLastLoggedStatuses = new();
+    private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationTimeline = new();
+    private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> hostRoleLastLoggedStatuses = new();
     // Host-only, edge-triggered against UmadP2ForsakenState.Lockons -- see
     // P2LockonsUpdateMessage for why this needs its own re-syncable channel.
     private string? hostLastBroadcastP2Lockons;
@@ -66,8 +68,8 @@ public sealed partial class MultiplayerManager : IDisposable
     // snapshot -- SetModelState's native rebuild flickers the model, animation replay would
     // restart the loop, etc.
     private readonly Dictionary<int, byte> peerEnemyModelState = new();
-    private readonly Dictionary<int, string> peerEnemyLastLoggedStatuses = new();
-    private readonly Dictionary<int, ushort> peerEnemyAnimationTimeline = new();
+    private readonly Dictionary<int, Dictionary<ushort, ushort>> peerEnemyLastLoggedStatuses = new();
+    private readonly Dictionary<int, int> peerEnemyAnimationTimeline = new();
     // Peer-only: see EnemyState.LastInstantCastSeq/CastSeq for why instant and telegraphed
     // casts each need their own dedup counter instead of the IsCasting rising edge.
     private readonly Dictionary<int, int> peerEnemyLastInstantCastSeq = new();
@@ -75,7 +77,7 @@ public sealed partial class MultiplayerManager : IDisposable
     private readonly Dictionary<int, ushort> peerEventObjectState = new();
     // Peer-only role equivalent of peerEnemyLastLoggedStatuses -- reconciled/applied for
     // every role including the peer's own, since a peer never runs scenario logic itself.
-    private readonly Dictionary<PartyRole, string> peerRoleLastLoggedStatuses = new();
+    private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> peerRoleLastLoggedStatuses = new();
     // Peer-only: statusIds THIS reconciliation applied to a role, as opposed to one the
     // local client manages itself (e.g. Sprint via LocalPlayerInputHooks on the peer's own
     // claimed role) -- removal here must only ever undo what this code added.
@@ -96,6 +98,10 @@ public sealed partial class MultiplayerManager : IDisposable
     private readonly Dictionary<Guid, long> peerLastSeenMs = new();
     private readonly Dictionary<Guid, float> peerLatencyMs = new();
     private readonly HashSet<Guid> warnedStalePeers = new();
+    // Host-only: a peer's own real tank-mitigation statuses, self-reported (see
+    // SelfMitigationMessage) since a peer's real button press never reaches the host's
+    // SimNetworkPuppet copy of them. Read by TankMitigation.ComputeMitigation.
+    private readonly Dictionary<Guid, HashSet<ushort>> peerMitigationStatusIds = new();
     // Display-ready status per claimed peer, rebuilt by the host each ping cycle and
     // broadcast (PeerStatusMessage) so peers can render the roster without their own
     // liveness bookkeeping.
@@ -205,6 +211,15 @@ public sealed partial class MultiplayerManager : IDisposable
     public event Action? LobbyChanged;
 
     public PeerStatusEntry? GetPeerStatus(Guid peerId) => peerStatuses.GetValueOrDefault(peerId);
+
+    // Host-only: whatever `role`'s claimed peer last self-reported as active (see
+    // SelfMitigationMessage) -- empty if unclaimed, unreported yet, or called on a peer
+    // client (a peer has no visibility into another peer's statuses).
+    public IReadOnlyCollection<ushort> PeerMitigationStatusIds(PartyRole role)
+    {
+        if (!IsHost || !Session.ClaimedBy.TryGetValue(role, out var peerId)) return [];
+        return peerMitigationStatusIds.TryGetValue(peerId, out var ids) ? ids : [];
+    }
 
     public float SecondsSinceHostMessage => (Environment.TickCount64 - lastHostMessageMs) / 1000f;
     // Lets MultiplayerWindow hold a peer on "connecting" instead of the full lobby until a
@@ -334,6 +349,10 @@ public sealed partial class MultiplayerManager : IDisposable
         peerLastSeenMs.Clear();
         peerLatencyMs.Clear();
         peerStatuses.Clear();
+        peerMitigationStatusIds.Clear();
+        lastSentMitigationStatusIds.Clear();
+        lastSentShieldFraction = 0f;
+        TankShieldTracker.Reset();
         warnedStalePeers.Clear();
         pingTimer = 0f;
         pendingStartResponses = null;
@@ -486,12 +505,18 @@ public sealed partial class MultiplayerManager : IDisposable
         var who = Session.NameOf(peerId);
         DiagnosticLog.Info($"[Multiplayer] Removing {who} ({peerId}) from the session (running={running}).");
         foreach (var r in Session.ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => kv.Key).ToList())
+        {
             Session.ClaimedBy.Remove(r);
+            // A departed peer sends no more reports -- clear their banked shield so it
+            // doesn't linger onto whoever claims this role next.
+            TankShieldTracker.SetFromPeerReport(r, 0f);
+        }
         Session.Names.Remove(peerId);
         Session.Builds.Remove(peerId);
         peerLastSeenMs.Remove(peerId);
         peerLatencyMs.Remove(peerId);
         peerStatuses.Remove(peerId);
+        peerMitigationStatusIds.Remove(peerId);
         warnedStalePeers.Remove(peerId);
         startCheckFailures.Remove(peerId);
         if (pendingStartResponses?.Remove(peerId) == true && pendingStartResponses.Count == 0)
@@ -517,10 +542,19 @@ public sealed partial class MultiplayerManager : IDisposable
 
     // Same preconditions RunScenarioInternal enforces, checked client-side up front so a
     // failure produces an immediate message instead of a silent no-op. Null when ready.
-    private static string? CheckOwnStartReadiness()
+    // Also gates a claimed tank role on actually being on a tank job -- job-aware bot
+    // mitigation picks ability ids off whoever's in the seat. Pre-start only; a mid-run job
+    // swap isn't caught here (see JobForRole's Paladin fallback for that case).
+    private string? CheckOwnStartReadiness()
     {
         if (!ZoneSession.IsInInn()) return "not in an inn";
         if (ZoneSession.IsPlayerBusy()) return "busy";
+        if (MyClaimedRole is { } role && role.IsTank())
+        {
+            var jobId = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId ?? 0;
+            if (!PartyPresets.SkipRoleForJob(jobId).IsTank())
+                return "queued as a tank role but not on a tank job";
+        }
         return null;
     }
 
@@ -692,6 +726,38 @@ public sealed partial class MultiplayerManager : IDisposable
         StopDebugBotReplay();
         Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles);
         running = true;
+    }
+
+    // Describes who/what occupies a role for logging purposes -- the local real player (with
+    // their real job), a network puppet (a peer, with the job they connected as), or a bot.
+    private string DescribeRoleOwner(PartyRole role, SimCharacter? member)
+    {
+        if (member == null) return "empty";
+        if (member is SimNetworkPuppet puppet) return $"{puppet.DisplayName}, job {puppet.ClassJob}";
+        if (ReferenceEquals(member, Plugin.GameInstance.World.Party.Player))
+            return $"{DisplayName} (me), job {Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId.ToString() ?? "?"}";
+        return "bot";
+    }
+
+    // Shared by all four status-broadcast paths -- logs one line per status gained/lost/
+    // restacked instead of one "set changed" summary. `lastSeen` is mutated in place.
+    private static void LogStatusChanges(string who, IReadOnlyList<(ushort StatusId, ushort Stacks, float RemainingTime)> current, Dictionary<ushort, ushort> lastSeen)
+    {
+        var currentIds = new HashSet<ushort>();
+        foreach (var (id, stacks, remaining) in current)
+        {
+            currentIds.Add(id);
+            if (!lastSeen.TryGetValue(id, out var lastStacks))
+                DiagnosticLog.Info($"[Multiplayer] {who}: status {id} gained (stacks={stacks}, duration={remaining:F1}).");
+            else if (lastStacks != stacks)
+                DiagnosticLog.Info($"[Multiplayer] {who}: status {id} stacks {lastStacks}->{stacks}.");
+            lastSeen[id] = stacks;
+        }
+        foreach (var id in lastSeen.Keys.Where(id => !currentIds.Contains(id)).ToList())
+        {
+            DiagnosticLog.Info($"[Multiplayer] {who}: status {id} lost.");
+            lastSeen.Remove(id);
+        }
     }
 
 }

@@ -32,6 +32,7 @@ public sealed class UmadP2ForsakenScenario : IScenario
     public string Name => "Forsaken";
     public IPhase Phase => UmadZone.P2;
     public bool SupportsMultiplayer => true;
+    public uint? TankMaxHealth => Tunables.RealTankMaxHealth;
 
     public void DrawSettings() => settingsWindow.Draw();
     private readonly UmadP2ForsakenSettingsWindow settingsWindow = new();

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Numerics;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Party;
+using AnoMech.Scenarios;
 
 namespace AnoMech.Core.SimObjects;
 
@@ -58,18 +59,25 @@ public sealed class SimParty : ISimObject
     public void WipeAllPlayers(string cause)
         => ForEachActive(m => { if (m.IsAlive()) m.Die(cause); });
 
-    // Status a member carries while temporarily invulnerable (GiveInvuln). Game.Kill
-    // swallows any death of a member holding it — every death path routes through Kill,
-    // so this covers DamageSolver and direct .Die() alike. Hallowed Ground (409): a
-    // recognizable buff icon that renders on doppels; the death gate reads it sim-side
-    // (HasStatus), so it works on the local player too even though the icon doesn't show.
+    // Fallback invuln status for GiveInvuln when the target's job isn't recognized (see
+    // TankMitigationChart.InvulnStatusIdByJob) -- being Holmgang's real id is incidental, it
+    // just needs to be SOME status TankMitigation.IsInvuln recognizes.
     public const ushort InvulnStatusId = 409;
 
-    // Makes `role` immune to death for `seconds` (default 10). Backed by InvulnStatusId,
-    // so it auto-expires and Game.Kill swallows any death — from DamageSolver or a direct
-    // .Die() — while it's held. No-op if the slot is empty.
-    public void GiveInvuln(PartyRole role, float seconds = 10f)
-        => Get(role)?.AddStatus(InvulnStatusId, seconds);
+    // Makes `role` immune to death for `seconds` -- Game.Kill swallows any death (DamageSolver
+    // or direct .Die()) of a member holding a recognized invuln. Applies the target's OWN
+    // job's real invuln (TankMitigationChart.InvulnStatusIdByJob) so the icon matches its job,
+    // falling back to InvulnStatusId for an unrecognized job. No-op if the slot is empty.
+    public unsafe void GiveInvuln(PartyRole role, float seconds = 10f)
+    {
+        var member = Get(role);
+        if (member == null) return;
+        var bc = member.BattleCharaPtr;
+        var statusId = bc != null && TankMitigationChart.InvulnStatusIdByJob.TryGetValue((uint)bc->ClassJob, out var real)
+            ? real
+            : InvulnStatusId;
+        member.AddStatus(statusId, seconds);
+    }
 
     // Raidwide knockback: pushes every active slot `distance` units away from
     // `source`. Each slot resolves its own direction from its current position.

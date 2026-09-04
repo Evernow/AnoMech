@@ -37,6 +37,8 @@ internal class Movement(SimCharacter parent)
     private bool internalReissue;
 
     public bool IsMoving => destination != null;
+    // Unused -- reserved for a possible future Move/Intercept race guard.
+    public bool IsIntercepting => interceptTether != null;
 
     public virtual void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)
         => InternalMoveTo(t, sp, finalRot, tl, baseOverride);
@@ -63,17 +65,22 @@ internal class Movement(SimCharacter parent)
         followTarget = null;
         interceptTether = tether;
         interceptMargin = margin;
-        RetargetIntercept();
+        RetargetIntercept(logDetail: true);
     }
 
     // Re-project the parent onto the tether segment and re-issue the move. Self-cancels
     // (clears tracking, issues no move) if the tether is gone or an endpoint died, so any
-    // in-flight move just finishes.
-    private void RetargetIntercept()
+    // in-flight move just finishes. logDetail is true only for the initial Intercept() call --
+    // TickIntercept's per-frame re-calls would spam a log line otherwise.
+    private void RetargetIntercept(bool logDetail = false)
     {
         var margin = interceptMargin;
         if (interceptTether is not { A: { } a, B: { } b } || !a.IsAlive() || !b.IsAlive())
         {
+            DiagnosticLog.Warn(
+                $"[Movement] RetargetIntercept self-cancelled: tether={(interceptTether == null ? "null" : "present")} "
+                + $"A={(interceptTether?.A == null ? "null" : interceptTether.A.IsAlive() ? "alive" : "dead")} "
+                + $"B={(interceptTether?.B == null ? "null" : interceptTether.B.IsAlive() ? "alive" : "dead")} -- no MoveTo issued.");
             interceptTether = null;
             return;
         }
@@ -92,6 +99,10 @@ internal class Movement(SimCharacter parent)
         // obstacles, so the bot lands on the grab corridor instead of being parked
         // perpendicular off it when a black hole sits on the line.
         var target = parent.Obstacles.NearestClearOnSegment(src, src + seg, t, tMin, tMax);
+        if (logDetail)
+            DiagnosticLog.Info(
+                $"[Movement] RetargetIntercept: from ({parent.Position.X:F1},{parent.Position.Z:F1}) toward "
+                + $"target ({target.X:F1},{target.Y:F1}) on segment A({src.X:F1},{src.Y:F1})-B({(src + seg).X:F1},{(src + seg).Y:F1}), t={t:F2}.");
         MoveTo(new Vector3(target.X, parent.Position.Y, target.Y));
         internalReissue = false;
     }

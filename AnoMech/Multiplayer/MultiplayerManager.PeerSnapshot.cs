@@ -38,6 +38,49 @@ public sealed partial class MultiplayerManager
         pendingSelfPoseSend = relay!.SendAsync(new SelfPoseMessage(MyPeerId, player.Position.X, player.Position.Y, player.Position.Z, player.Rotation));
     }
 
+    // Peer -> host, event-driven (only on change, not every tick) -- how the host's
+    // DamageSolver learns about a peer's own real Rampart/invuln press. Reads the real native
+    // StatusManager (TankMitigation.ActiveTrackedStatusIds), not ActiveStatusSnapshot, since a
+    // real button press never populates that internal list. Shield fraction comes from
+    // TankShieldTracker (Self-scope grants already applied locally) and just needs reporting too.
+    private HashSet<ushort> lastSentMitigationStatusIds = new();
+    private float lastSentShieldFraction;
+
+    private void SendSelfMitigationIfChanged()
+    {
+        var party = Plugin.GameInstance.World.Party;
+        var player = party.Player;
+        if (player == null) return;
+        var current = TankMitigation.ActiveTrackedStatusIds(player).ToHashSet();
+        var shieldFraction = TankShieldTracker.RemainingFraction(party.PlayerRole);
+        if (current.SetEquals(lastSentMitigationStatusIds) && MathF.Abs(shieldFraction - lastSentShieldFraction) < 0.001f)
+            return;
+        lastSentMitigationStatusIds = current;
+        lastSentShieldFraction = shieldFraction;
+        _ = relay!.SendAsync(new SelfMitigationMessage(MyPeerId, current.ToList(), shieldFraction));
+    }
+
+    // Peer-only: reports enemies a SourceSide mitigation (Reprisal) was just applied to
+    // locally. No-op on the host (already authoritative) or when not connected.
+    public void ReportAppliedEnemyStatus(IReadOnlyList<SimEnemy> enemies, ushort statusId, float duration)
+    {
+        if (IsHost || relay is not { IsConnected: true } || enemies.Count == 0) return;
+        var netIds = peerEnemies.Where(kv => enemies.Contains(kv.Value)).Select(kv => kv.Key).ToList();
+        if (netIds.Count == 0) return;
+        DiagnosticLog.Info($"[Multiplayer] Peer: reporting applied status {statusId} on enemy NetIds [{string.Join(",", netIds)}] to host.");
+        _ = relay.SendAsync(new PeerAppliedEnemyStatusMessage(MyPeerId, netIds, statusId, duration));
+    }
+
+    // Peer-only: the Party/Ally-scope counterpart to ReportAppliedEnemyStatus above -- see
+    // PeerAppliedRoleStatusMessage's own doc comment. No-op on the host or when not connected.
+    public void ReportAppliedRoleStatus(IReadOnlyList<PartyRole> roles, ushort statusId, float duration, float shieldFraction = 0f)
+    {
+        if (IsHost || relay is not { IsConnected: true } || roles.Count == 0) return;
+        DiagnosticLog.Info($"[Multiplayer] Peer: reporting applied status {statusId} on roles [{string.Join(",", roles)}] to host" +
+                            (shieldFraction > 0f ? $" (shieldFraction={shieldFraction:F3})." : "."));
+        _ = relay.SendAsync(new PeerAppliedRoleStatusMessage(MyPeerId, roles.ToList(), statusId, duration, shieldFraction));
+    }
+
     // ---- Host: applying a peer's reported pose to their puppet -------------
 
     private void OnSelfPoseReceived(SelfPoseMessage msg)
@@ -110,12 +153,10 @@ public sealed partial class MultiplayerManager
                 if (e.Statuses.Any(s => s.StatusId == current.StatusId)) continue;
                 enemy.RemoveStatus(current.StatusId);
             }
-            var statusKey = string.Join(",", e.Statuses.Select(s => $"{s.StatusId}:{s.Stacks}"));
-            if (!peerEnemyLastLoggedStatuses.TryGetValue(e.NetId, out var lastStatusKey) || lastStatusKey != statusKey)
-            {
-                peerEnemyLastLoggedStatuses[e.NetId] = statusKey;
-                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) statuses -> [{statusKey}].");
-            }
+            if (!peerEnemyLastLoggedStatuses.TryGetValue(e.NetId, out var lastStatuses))
+                peerEnemyLastLoggedStatuses[e.NetId] = lastStatuses = new Dictionary<ushort, ushort>();
+            LogStatusChanges($"Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId})",
+                e.Statuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
             // Rising-edge trigger, replayed through the real SimCast pipeline (cast bar +
             // omen VFX). targetLocation, castSeconds, and omenDelay are all threaded through
             // explicitly -- leaving any of them at their defaults desyncs the telegraph from
@@ -157,13 +198,14 @@ public sealed partial class MultiplayerManager
                 var instantTargetId = ResolvePeerEnd(world, e.LastInstantCastTargetEnemyNetId, e.LastInstantCastTargetRole)?.GameObjectId;
                 enemy.Cast(e.LastInstantCastActionId, targetLocation: instantTargetLocation, castSeconds: 0f, targetId: instantTargetId);
             }
-            // Edge-triggered like ModelState -- re-issuing a one-shot cue every snapshot
-            // would restart the same animation on a loop.
+            // Edge-triggered like ModelState. Dedupes off AnimationTimelineSeq, not
+            // AnimationTimelineId's value -- a reused enemy (P2 Forsaken's clone) replays the
+            // same id, which the id-only comparison couldn't tell from "unchanged."
             if (e.AnimationTimelineId is { } timelineId
-                && (!peerEnemyAnimationTimeline.TryGetValue(e.NetId, out var lastTimeline) || lastTimeline != timelineId))
+                && (!peerEnemyAnimationTimeline.TryGetValue(e.NetId, out var lastSeq) || lastSeq != e.AnimationTimelineSeq))
             {
-                peerEnemyAnimationTimeline[e.NetId] = timelineId;
-                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
+                peerEnemyAnimationTimeline[e.NetId] = e.AnimationTimelineSeq;
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4} (seq {e.AnimationTimelineSeq}).");
                 enemy.PlayAnimationTimeline(timelineId);
             }
             if (e.NewLockonVfxIds.Count > 0)
@@ -281,7 +323,7 @@ public sealed partial class MultiplayerManager
     }
 
     // Same peerEnteredInstance guard/reasoning as OnWorldSnapshotReceived below.
-    private void OnRolesSnapshotReceived(RolesSnapshotMessage snap)
+    private unsafe void OnRolesSnapshotReceived(RolesSnapshotMessage snap)
     {
         if (IsHost) return;
         if (!peerEnteredInstance) return;
@@ -297,6 +339,16 @@ public sealed partial class MultiplayerManager
                 puppet.ApplyNetworkPose(new Vector3(r.X, r.Y, r.Z), r.Rotation);
 
             if (world.Party.Get(r.Role) is not { } member) continue;
+
+            // HP is host-authoritative for every role, including our own -- TankMitigation/
+            // TankHpRegen only ever run on the host, so without this write our own HP bar
+            // would sit at spawn-default full HP forever after a hit the host tracked.
+            var bc = member.BattleCharaPtr;
+            if (r.MaxHp > 0 && bc != null)
+            {
+                bc->MaxHealth = r.MaxHp;
+                bc->Health = r.CurrentHp;
+            }
             var currentStatuses = member.ActiveStatusSnapshot;
             if (!peerRoleReconciledStatusIds.TryGetValue(r.Role, out var reconciledIds))
                 peerRoleReconciledStatusIds[r.Role] = reconciledIds = new HashSet<ushort>();
@@ -317,12 +369,10 @@ public sealed partial class MultiplayerManager
                 member.RemoveStatus(trackedId);
                 reconciledIds.Remove(trackedId);
             }
-            var statusKey = string.Join(",", r.Statuses.Select(s => $"{s.StatusId}:{s.Stacks}"));
-            if (!peerRoleLastLoggedStatuses.TryGetValue(r.Role, out var lastStatusKey) || lastStatusKey != statusKey)
-            {
-                peerRoleLastLoggedStatuses[r.Role] = statusKey;
-                DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} statuses -> [{statusKey}].");
-            }
+            if (!peerRoleLastLoggedStatuses.TryGetValue(r.Role, out var lastStatuses))
+                peerRoleLastLoggedStatuses[r.Role] = lastStatuses = new Dictionary<ushort, ushort>();
+            LogStatusChanges($"Peer: role {r.Role} ({DescribeRoleOwner(r.Role, member)})",
+                r.Statuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
             if (r.NewLockonVfxIds.Count > 0)
             {
                 DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} NewLockonVfxIds -> [{string.Join(",", r.NewLockonVfxIds)}].");

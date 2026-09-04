@@ -243,6 +243,7 @@ public sealed partial class MultiplayerManager
                 return;
             }
             SendSelfPose();
+            SendSelfMitigationIfChanged();
         }
     }
 

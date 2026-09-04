@@ -127,6 +127,58 @@ public sealed partial class MultiplayerManager
                 peerLastSeenMs[pong.PeerId] = Environment.TickCount64;
                 peerLatencyMs[pong.PeerId] = Environment.TickCount64 - pong.SentAtMs;
                 break;
+            case SelfMitigationMessage mit when IsHost:
+            {
+                var previous = peerMitigationStatusIds.GetValueOrDefault(mit.PeerId, []);
+                var current = mit.ActiveMitigationStatusIds.ToHashSet();
+                var who = Session.NameOf(mit.PeerId);
+                foreach (var gained in current.Except(previous))
+                    DiagnosticLog.Info($"[Multiplayer] Host: {who} ({Session.RoleOf(mit.PeerId)}) reported mitigation status {gained} gained.");
+                foreach (var lost in previous.Except(current))
+                    DiagnosticLog.Info($"[Multiplayer] Host: {who} ({Session.RoleOf(mit.PeerId)}) reported mitigation status {lost} lost.");
+                peerMitigationStatusIds[mit.PeerId] = current;
+                // Self-scope shield counterpart -- a snapshot overwrite, not an incremental grant.
+                if (Session.RoleOf(mit.PeerId) is { } selfRole)
+                    TankShieldTracker.SetFromPeerReport(selfRole, mit.SelfShieldFraction);
+                break;
+            }
+            case PeerAppliedEnemyStatusMessage applied when IsHost:
+            {
+                // A SourceSide mitigation (Reprisal) lands on an enemy, not the caster --
+                // apply to the host's authoritative enemy; the normal snapshot broadcasts it out.
+                var who = Session.NameOf(applied.PeerId);
+                foreach (var netId in applied.EnemyNetIds)
+                {
+                    var enemy = hostEnemyNetIds.FirstOrDefault(kv => kv.Value == netId).Key;
+                    if (enemy == null)
+                    {
+                        DiagnosticLog.Warn($"[Multiplayer] Host: {who} reported status {applied.StatusId} on unknown enemy NetId {netId} -- dropping.");
+                        continue;
+                    }
+                    enemy.AddStatus(applied.StatusId, applied.Duration);
+                    DiagnosticLog.Info($"[Multiplayer] Host: applied {who}'s reported status {applied.StatusId} (duration={applied.Duration:F1}) to enemy NetId {netId}.");
+                }
+                break;
+            }
+            case PeerAppliedRoleStatusMessage applied when IsHost:
+            {
+                // Party/Ally-scope counterpart to the enemy case above.
+                var who = Session.NameOf(applied.PeerId);
+                foreach (var role in applied.Roles)
+                {
+                    if (Plugin.GameInstance.World.Party.Get(role) is not { } member)
+                    {
+                        DiagnosticLog.Warn($"[Multiplayer] Host: {who} reported status {applied.StatusId} on role {role}, but that slot is empty -- dropping.");
+                        continue;
+                    }
+                    member.AddStatus(applied.StatusId, applied.Duration);
+                    DiagnosticLog.Info($"[Multiplayer] Host: applied {who}'s reported status {applied.StatusId} (duration={applied.Duration:F1}) to role {role}.");
+                    // Grant (additive), not SetFromPeerReport -- a genuine new application.
+                    if (applied.ShieldFraction > 0f)
+                        TankShieldTracker.Grant(role, applied.ShieldFraction, applied.Duration);
+                }
+                break;
+            }
 
             // Peer-facing broadcasts from the host.
             case LobbyStateMessage lobby when !IsHost:

@@ -221,4 +221,13 @@ public static class UmadConstants
         public const float AllThingsEndHalfCone = MathF.PI / 2;
     }
 
+    public static class Tunables
+    {
+        // A real level-100 tank's own observed max HP (2026-09) -- every Umad scenario's
+        // IScenario.TankMaxHealth points here so TankMitigation's fixed-HP tankbuster numbers
+        // (calibrated against this) land as intended, not against the generic doppel HP.
+        // Scoped to this namespace deliberately -- not a universal constant to reach for.
+        public const uint RealTankMaxHealth = 325_047;
+    }
+
 }

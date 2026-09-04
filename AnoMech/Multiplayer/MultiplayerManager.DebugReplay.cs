@@ -40,7 +40,8 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info("[Multiplayer] Host: broadcasting AiReplayState for this run.");
                 _ = relay!.SendAsync(new AiReplayStateMessage(
                     p3State.Roles.List, p3State.StackTargets.List, p3State.SlapAttacks.ToArray(),
-                    p3State.KefkaPosition.Select(d => d.RadiansFromNorth).ToArray(), p3State.ImplosionAttack));
+                    p3State.KefkaPosition.Select(d => d.RadiansFromNorth).ToArray(), p3State.ImplosionAttack,
+                    p3State.ThunderSet1, p3State.ThunderSet2));
                 break;
             case UmadP2ForsakenScenario p2Scenario:
                 if (p2Scenario.LastState is not { } p2State) return;
@@ -96,7 +97,8 @@ public sealed partial class MultiplayerManager
                 debugBotReplayStarted = true;
                 DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
                 var shadowState = UmadP3BlackHoleState.FromNetworkReplay(
-                    world, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack);
+                    world, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack,
+                    msg.ThunderSet1, msg.ThunderSet2);
                 // Chaos/Exdeath may not be replicated yet (WorldSnapshot is an independent
                 // flow) -- OnWorldSnapshotReceived keeps retrying this as enemies arrive.
                 shadowState.ScenarioObjects.Chaos = peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.ChaosP3);
@@ -104,6 +106,7 @@ public sealed partial class MultiplayerManager
                 debugShadowState = shadowState;
                 DebugBotControl.Enabled = true;
                 new UmadP3BlackHoleAi().Run(shadowState, world);
+                SchedulePeerThunderMitigation(shadowState, world, myRole);
                 break;
             }
             case UmadP2ForsakenScenario p2Scenario when pendingP2AiReplayState is { } p2Msg:
@@ -162,6 +165,31 @@ public sealed partial class MultiplayerManager
                 break;
             }
         }
+    }
+
+    // Applies the host's Thunder III Share kit to this peer's own character locally, at
+    // RunThunder's own resolve times -- that scenario logic never runs on a peer at all
+    // (UmadP3BlackHoleAi.Run above only handles positioning), so without this a Share-planned
+    // hit landed with nothing applied. AddStatus writes through the native StatusManager, so
+    // the existing self-report poller (SendSelfMitigationIfChanged) picks it up automatically.
+    // Skips InvulnsBoth (matches SetThunderSetPlan's own gating) -- a real invuln already covers it.
+    private static void SchedulePeerThunderMitigation(UmadP3BlackHoleState state, SimWorld world, PartyRole myRole)
+    {
+        void ApplyIfMine(float time, ThunderIIIAssignment plan)
+        {
+            if (plan is not (ThunderIIIAssignment.ShareMtFirst or ThunderIIIAssignment.ShareOtFirst)) return;
+            var (first, second) = ThunderIIIPlanning.Roles(plan);
+            if (first != myRole && second != myRole) return;
+            world.Events.Add(time, () =>
+            {
+                if (world.Party.Player is { } player)
+                    UmadP3BlackHoleScenario.ApplyThunderShareKit(player);
+            });
+        }
+        ApplyIfMine(38f, state.ThunderSet1);
+        ApplyIfMine(43.5f, state.ThunderSet1);
+        ApplyIfMine(79f, state.ThunderSet2);
+        ApplyIfMine(84.9f, state.ThunderSet2);
     }
 
     // Clears the current run's replay state, not the sticky debugBotControlled toggle --

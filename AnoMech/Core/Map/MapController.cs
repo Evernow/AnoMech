@@ -229,28 +229,33 @@ public sealed class MapController : IDisposable
     // yet -- otherwise a peer whose async zone-load lags the host's by even a
     // couple seconds silently loses any effect called in that window, since
     // there's no other way to know it was missed and no packet to re-request it.
-    public void AddEffect(uint packetFlags, byte index)
+    //
+    // broadcast: false for RunInstanceEvents calls, which host and peer already both run
+    // locally by design -- broadcasting there double-applies it on the peer. True (default)
+    // for every other, host-only call site.
+    public void AddEffect(uint packetFlags, byte index, bool broadcast = true)
     {
         if (!effects.Apply(packetFlags, index))
         {
             DiagnosticLog.Warn($"[MapEffect] packetFlags=0x{packetFlags:X8} index=0x{index:X} not ready yet -- queued for retry.");
             pendingEffects.Add(new PendingMapEffect { PacketFlags = packetFlags, Index = index, FramesLeft = BarrierDropMaxFrames });
         }
-        EffectApplied?.Invoke(packetFlags, index);
+        if (broadcast) EffectApplied?.Invoke(packetFlags, index);
     }
 
     // Replay a native DirectorUpdate event (instance progress / state sync) — the
     // server-side InstanceContentDirector message a scenario timeline replays. Thin
     // forwarder so scenarios address it through world.Map alongside AddEffect.
     // Same retry-if-not-ready treatment as AddEffect, and for the same reason.
-    public void DirectorUpdate(uint category, uint arg1 = 0, uint arg2 = 0, uint arg3 = 0, uint arg4 = 0, uint arg5 = 0, uint arg6 = 0)
+    // broadcast: see AddEffect's own doc comment -- identical reasoning, same bug, same fix.
+    public void DirectorUpdate(uint category, uint arg1 = 0, uint arg2 = 0, uint arg3 = 0, uint arg4 = 0, uint arg5 = 0, uint arg6 = 0, bool broadcast = true)
     {
         if (!InstanceContentDirectorHelper.ProcessDirectorUpdate(category, arg1, arg2, arg3, arg4, arg5, arg6))
         {
             DiagnosticLog.Warn($"[MapEffect] DirectorUpdate category=0x{category:X8} not ready yet -- queued for retry.");
             pendingDirectorUpdates.Add(new PendingDirectorUpdate { Category = category, Arg1 = arg1, Arg2 = arg2, Arg3 = arg3, Arg4 = arg4, Arg5 = arg5, Arg6 = arg6, FramesLeft = BarrierDropMaxFrames });
         }
-        DirectorUpdated?.Invoke(category, arg1, arg2, arg3, arg4, arg5, arg6);
+        if (broadcast) DirectorUpdated?.Invoke(category, arg1, arg2, arg3, arg4, arg5, arg6);
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────

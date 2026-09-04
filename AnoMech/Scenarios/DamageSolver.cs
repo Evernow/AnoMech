@@ -28,7 +28,7 @@ public class DamageSolver
         ushort[]? removeStatus = null,
         int stackMinTargets = 0, int wildChargeTargets = 0, DamageType[]? wildChargeDamageType = null,
         float? size = null, float? coneRotationDelta = null, SimCharacter[]? excludeTargets = null,
-        bool killTargets = true)
+        bool killTargets = true, float tankBusterRawDamage = 0f, SimEnemy? tankBusterSource = null)
     {
         if (source == null) return [];
         var placement = source.Placement();
@@ -81,7 +81,7 @@ public class DamageSolver
                 if (killTargets)
                     target.Die($"Died to {ActionLookup.Name(actionId)} ({targets.Count}/{stackMinTargets} players in stack)");
             }
-            else if (CheckLethal(actionId, target, wildCharge ? damageTypeWildCharge : damageTypeBase, killTargets))
+            else if (CheckLethal(actionId, target, wildCharge ? damageTypeWildCharge : damageTypeBase, killTargets, tankBusterRawDamage, tankBusterSource))
             {
                 deadTargets.Add(target);
             }
@@ -131,7 +131,7 @@ public class DamageSolver
         return killed;
     }
 
-    private bool CheckLethal(uint actionId, SimCharacter target, HashSet<DamageType> damageTypes, bool killTarget)
+    private bool CheckLethal(uint actionId, SimCharacter target, HashSet<DamageType> damageTypes, bool killTarget, float tankBusterRawDamage, SimEnemy? tankBusterSource)
     {
         if (damageTypes.Contains(DamageType.Lethal))
         {
@@ -143,9 +143,17 @@ public class DamageSolver
             if (killTarget) target.Die($"Died to {ActionLookup.Name(actionId)} (had vuln up debuff)");
             return true;
         }
-        else if (damageTypes.Contains(DamageType.TankBuster) && target is not ISimPartyMember { Role: PartyRole.OffTank or PartyRole.MainTank })
+        else if (damageTypes.Contains(DamageType.TankBuster))
         {
-            if(killTarget) target.Die($"Died to {ActionLookup.Name(actionId)} (tank buster)");
+            // Not a tank at all -- always lethal, no mitigation check needed.
+            if (target is not ISimPartyMember { Role: PartyRole.OffTank or PartyRole.MainTank })
+            {
+                if (killTarget) target.Die($"Died to {ActionLookup.Name(actionId)} (tank buster)");
+                return true;
+            }
+            var role = ((ISimPartyMember)target).Role;
+            if (TankMitigation.ApplyTankBusterDamage(party, role, tankBusterRawDamage, tankBusterSource)) return false;
+            if (killTarget) target.Die($"Died to {ActionLookup.Name(actionId)} (tank buster, not enough mitigation)");
             return true;
         }
         else

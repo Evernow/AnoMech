@@ -209,7 +209,7 @@ public sealed class Game : IDisposable
         World.ScenarioOrigin = zone.Origin;
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
         World.PlaceWaymarks(ResolveWaymarks(zone, selectedWaymark));
-        World.CreateParty(player.ClassJob.RowId, roleOverride, solo, networkRoles);
+        World.CreateParty(player.ClassJob.RowId, scenario.TankMaxHealth, roleOverride, solo, networkRoles);
         // Client-asset setup (e.g. Umad's replay-derived RSV/RSF resource paths) a peer's
         // own client needs just as much as the host's -- see IZone.RunClientSetup.
         zone.RunClientSetup(World);
@@ -272,11 +272,33 @@ public sealed class Game : IDisposable
         detail->Elapsed = 0f;
     }
 
+    // Undoes LocalPlayerInputHooks.ForceRecastSweep's fake cooldown display on every
+    // intercepted mitigation -- the real recast group never actually started, so this just
+    // clears our own fake sweep (same as ResetSprintCooldown above).
+    private static unsafe void ClearFakedTankMitigationCooldowns()
+    {
+        var am = ActionManager.Instance();
+        if (am == null) return;
+        foreach (var ability in TankMitigation.ByActionId.Values)
+        {
+            var group = am->GetRecastGroup((int)ActionType.Action, ability.ActionId);
+            if (group < 0) continue;
+            var detail = am->GetRecastGroupDetail(group);
+            if (detail == null) continue;
+            detail->IsActive = false;
+            detail->Elapsed = 0f;
+        }
+    }
+
     public void Tick(float deltaSeconds)
     {
         if (Paused) return;
         Events.Tick(deltaSeconds * EventTimeScale);
         World.Tick(deltaSeconds);
+        // Host/solo only -- a peer's own tick would fight OnRolesSnapshotReceived's write of
+        // the host's authoritative Health/MaxHealth (see RoleState.CurrentHp/MaxHp).
+        if (Plugin.MultiplayerInstance is not { IsHost: false })
+            TankHpRegen.Tick(World.Party, deltaSeconds);
         if (activeScenario != null)
         {
             scenarioElapsed += deltaSeconds;
@@ -320,7 +342,9 @@ public sealed class Game : IDisposable
     {
         if (target == null) return false;
         if (target.Dead) return false;
-        if (target is SimCharacter sc && sc.HasStatus(SimParty.InvulnStatusId))
+        // Recognizes SimParty.InvulnStatusId and any real job invuln GiveInvuln applied instead.
+        // ActiveStatusSnapshot, not native StatusManager -- AddStatus writes through our own list.
+        if (target is SimCharacter sc && sc.ActiveStatusSnapshot.Any(s => TankMitigation.IsInvuln(s.StatusId)))
         {
             Plugin.Log.Info($"[Invuln] {DescribeName(target)} survived: {cause}");
             AnoMech.Core.DiagnosticLog.Info($"[Game] Kill: {target.Role} survived via Invuln -- {cause}");
@@ -438,6 +462,16 @@ public sealed class Game : IDisposable
         scenarioElapsed = 0f;
         Events.Clear();
         World.Despawn();
+        // Sim-only bookkeeping (cooldowns/shields/HP regen), never real game state -- see each
+        // tracker's own doc comment. ClearAllVisuals additionally undoes the native ShieldValue
+        // byte TankShieldTracker wrote; TankHpRegen.Reset needs no HP restore of its own since
+        // Despawn/RestoreHpBar above already handle that.
+        TankMitigationTracker.Reset();
+        ClearFakedTankMitigationCooldowns();
+        Plugin.PlayerInputHooks.RestoreGaugeIllusion();
+        TankShieldTracker.Reset();
+        TankShieldTracker.ClearAllVisuals(World.Party);
+        TankHpRegen.Reset();
         // BGM is owned by the callers: a scenario start reconciles it to the new
         // track (keeping it playing when unchanged); Reset/Leave stop it. Resetting
         // here would force a same-track restart on every scenario switch.

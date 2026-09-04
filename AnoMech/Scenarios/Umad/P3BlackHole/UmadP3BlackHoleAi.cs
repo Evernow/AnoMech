@@ -45,21 +45,40 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         // wiping the party on them. Moving immediately, like before arrivalTime was added
         // here, is safe for all four since DodgeSlap's target holds through the whole wave.
         ai.Move(18f, () => DodgeSlap(slapIndex: 0, kefkaIndex: 0));
-        ai.Move(26f, StackCentre);
+        // Was ai.Move(26f, StackCentre) with GrabTether at 26.2f -- only a 0.2s gap. Move's own
+        // PromptMoveDelay landed StackCentre's MoveTo (~26.3s) AFTER GrabTether's Intercept
+        // (26.2s), and InternalMoveTo unconditionally clears interceptTether, silently
+        // cancelling the tether walk the instant it started. Pulled a full second earlier so
+        // StackCentre safely finishes before GrabTether fires.
+        ai.Move(25f, StackCentre);
         world.Events.Add(26.2f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
         world.Events.Add(28.2f, () => PullTether(playerIndex: 4));
         world.Events.Add(32.4f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
         world.Events.Add(32.4f, () => GrabTether(tetherIndex: 1, playerIndex: 0));
         world.Events.Add(34.4f, () => PullTether(playerIndex: 4));
         world.Events.Add(34.4f, () => PullTether(playerIndex: 0));
-        ai.GiveInvuln(38f, PartyRole.OffTank);
-        ai.Move(40.5f, ResolveFirstThunder);
+        // Null (a Share plan) means no invuln -- mitigation handles it instead.
+        if (ThunderIIIPlanning.InvulnRole(state.ThunderSet1) is { } set1InvulnRole)
+            ai.GiveInvuln(38f, set1InvulnRole);
+        // Plain scheduled call, not ai.Move -- ResolveFirstThunder produces no AiMove
+        // coordinates (Follow self-sustains; see its own doc comment).
+        world.Events.Add(40.5f, ResolveFirstThunder);
+        // Always scheduled -- SwapThunderTanks itself no-ops unless Set 1 is a Share.
+        ai.Move(43.19f, SwapFirstThunderTanks);
+        // Standing invariant for the whole Set 1 danger window (see EnforceThunderClearanceOnce).
+        // Swaps roles at 43.5f, just after SwapFirstThunderTanks's own deferred MoveTo lands.
+        {
+            var (set1First, set1Second) = ThunderIIIPlanning.Roles(state.ThunderSet1);
+            ScheduleThunderClearance(39.5f, 43.5f, 46.2f, set1First, set1Second);
+        }
         ai.Move(46.5f, DodgeEdict);
-        // Same reasoning as the wave-1 DodgeSlap above -- RunSlapAttack's second wave also
-        // has four staggered resolves (rows at 52.59/53.24/53.89, FinalSlap ~55.21) behind
-        // this one Move call, so arrivalTime matching only the last of them deferred the
-        // walk past the first two rows the same way.
-        ai.Move(50.6f, () => DodgeSlap(slapIndex: 1, kefkaIndex: 1));
+        // Same reasoning as the wave-1 DodgeSlap above for why arrivalTime is off the table --
+        // four staggered resolves behind one Move call. Unlike wave 1, plain run speed isn't
+        // safe here either: DodgeEdict's landing spot can be ~20y from DodgeSlap's next
+        // target, more than RunSpeed covers in the ~1.7s available. Confirmed via
+        // AnoMech-DamageDebug: OffTank died ~9y short. sprint departs immediately, no deadline
+        // math to defer past an earlier row like arrivalTime did.
+        ai.Move(50.6f, () => DodgeSlap(slapIndex: 1, kefkaIndex: 1), sprint: true);
         ai.Move(56f, StackCentre);
         world.Events.Add(58.1f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
         world.Events.Add(58.1f, () => GrabTether(tetherIndex: 1, playerIndex: 0));
@@ -73,8 +92,21 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         world.Events.Add(71f, () => ReturnToMiddle(playerIndex: 0));
         ai.Move(74f, DodgeEdictAndLookUpon);
         ai.Move(80f, StackCentre);
-        ai.Move(82f, ResolveSecondThunder);
+        // Only fires for a Set 2 plan that's actually an InvulnsBoth override -- the sim's own
+        // default (ShareMtFirst) resolves to null here (see ThunderIIIPlanning.InvulnRole) and
+        // never grants a scripted invuln, relying on mitigation instead.
+        if (ThunderIIIPlanning.InvulnRole(state.ThunderSet2) is { } set2InvulnRole)
+            ai.GiveInvuln(79f, set2InvulnRole);
+        // Plain scheduled call -- see ResolveFirstThunder's own doc comment for why this no
+        // longer goes through ai.Move.
+        world.Events.Add(82f, ResolveSecondThunder);
         ai.Move(84.5f, SwapSecondThunderTanks);
+        // Standing invariant for the whole Set 2 danger window -- see Set 1's own matching call
+        // above. Swaps roles at 84.9f, just after SwapSecondThunderTanks's own MoveTo lands.
+        {
+            var (set2First, set2Second) = ThunderIIIPlanning.Roles(state.ThunderSet2);
+            ScheduleThunderClearance(80.5f, 84.9f, 87.5f, set2First, set2Second);
+        }
         ai.Move(88f, StackCentre);
         world.Events.Add(92.3f, () => GrabTether(tetherIndex: 0, playerIndex: 5));
         world.Events.Add(92.3f, () => GrabTether(tetherIndex: 1, playerIndex: 1));
@@ -127,7 +159,8 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         world.Events.Add(127.9f, () => PullTether(playerIndex: 6));
         world.Events.Add(127.9f, () => PullTether(playerIndex: 2));
         world.Events.Add(132f, () => GrabTether(tetherIndex: 0, playerIndex: 2));
-        world.Events.Add(134f, () => DodgeLookUponSplit(tetherPlayerIndex: 2, lookKefkaIndex: 4));
+        ai.Move(134f, () => DodgeLookUponSplitHolder(tetherPlayerIndex: 2, lookKefkaIndex: 4), sprint: true);
+        ai.Move(134f, () => DodgeLookUponSplitOthers(tetherPlayerIndex: 2, lookKefkaIndex: 4), sprint: true);
         ai.Move(139f, PrepositionForStomp);
         ai.Move(147f, StompBlizzardCorners);
         ai.Move(149.8f, StompStackAndTowers);
@@ -185,77 +218,126 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
     private const float ThunderBusterRadius = 8f;     // blast radius non-OTs must clear
     private const float ThunderClearDistance = 10f;   // where they park, just past it
 
-    private IAiMove ResolveFirstThunder()
+    // Role resolution (Roles/InvulnRole) now lives in ThunderIIIPlanning, shared with
+    // UmadP3BlackHoleScenario which needs the same assignment.
+
+    // Kicks off "first" chasing Exdeath directly instead of a one-time coordinate snapshot --
+    // Exdeath keeps following OffTank right up until RunThunder's freeze, so a static target
+    // goes stale immediately whenever `first` isn't OffTank. Follow keeps re-tracking on its
+    // own, so this only needs issuing once (unlike the Share seat, see EnforceThunderClearanceOnce).
+    private void ResolveFirstThunder()
     {
-        var exdeath = state.ScenarioObjects.Exdeath;
-        if (exdeath is null) return AiMove.Create().NaturalOrder();
+        if (state.ScenarioObjects.Exdeath is not { } exdeath) return;
+        var (first, _) = ThunderIIIPlanning.Roles(state.ThunderSet1);
+        if (world.Party.Get((int)first) is { } firstMember && firstMember.IsAlive())
+            firstMember.Follow(exdeath);
+    }
 
-        var centre = new Vector2(exdeath.Position.X, exdeath.Position.Z);
+    // See ResolveFirstThunder's own doc comment -- same idea, Set 2's own "first" role.
+    private void ResolveSecondThunder()
+    {
+        if (state.ScenarioObjects.Exdeath is not { } exdeath) return;
+        var (first, _) = ThunderIIIPlanning.Roles(state.ThunderSet2);
+        if (world.Party.Get((int)first) is { } firstMember && firstMember.IsAlive())
+            firstMember.Follow(exdeath);
+    }
+
+    // Shared by both sets' swap: after the first hit the two tanks trade spots, so "first"
+    // slides into the middle and "second" takes over the seat. Reads live positions (Exdeath
+    // is frozen across both hits). No-op if this set's plan doesn't call for a swap.
+    private IAiMove SwapThunderTanks(ThunderIIIAssignment plan)
+    {
+        var (first, second) = ThunderIIIPlanning.Roles(plan);
+        if (second is not { } secondRole) return AiMove.Create().NaturalOrder();
+        var a = world.Party.Get(first);
+        var b = world.Party.Get(secondRole);
+        if (a is null || b is null) return AiMove.Create().NaturalOrder();
+
         var coords = new Vector2?[8];
-        for (int i = 0; i < 8; i++)
-        {
-            var member = world.Party.Get(i);
-            if (member is null || !member.IsAlive()) continue;
+        coords[(int)secondRole] = new Vector2(a.Position.X, a.Position.Z);
+        coords[(int)first]      = new Vector2(b.Position.X, b.Position.Z);
+        return AiMove.Create(coords).NaturalOrder();
+    }
 
-            if (i == (int)PartyRole.OffTank)
+    private IAiMove SwapFirstThunderTanks() => SwapThunderTanks(state.ThunderSet1);
+    private IAiMove SwapSecondThunderTanks() => SwapThunderTanks(state.ThunderSet2);
+
+    // Keeps every role other than first/second at least ThunderClearDistance from Exdeath,
+    // reasserted repeatedly instead of computed once -- a one-shot "predict the blast, clear
+    // that point" approach kept losing the race against Exdeath's own continuous chase of
+    // OffTank. A standing "stay clear, always" invariant needs no prediction.
+    //
+    // Exdeath only, NOT Chaos -- MainTank permanently follows Chaos all fight, so checking
+    // Chaos here too fought that Follow every 0.4s with no convergence, dragging MainTank (and
+    // whoever was tracking them) 40+ yalms outside the arena. Only Exdeath casts Thunder III.
+    private void EnforceThunderClearanceOnce(PartyRole first, PartyRole? second)
+    {
+        // Re-seats "second" relative to "first"'s LIVE position every check, not a one-time
+        // snapshot -- "first" is still converging on Exdeath via Follow, so a stale seat could
+        // catch both tanks at once (confirmed: a Share hit carried vuln into the second hit
+        // and killed second regardless of mitigation).
+        if (second is { } secondRole
+            && world.Party.Get((int)first) is { } firstMember && firstMember.IsAlive()
+            && world.Party.Get((int)secondRole) is { } secondMember && secondMember.IsAlive())
+        {
+            var firstPos = new Vector2(firstMember.Position.X, firstMember.Position.Z);
+            var secondPos = new Vector2(secondMember.Position.X, secondMember.Position.Z);
+            var offset = secondPos - firstPos;
+            if (offset.LengthSquared() < ThunderClearDistance * ThunderClearDistance)
             {
-                coords[i] = centre;
-                continue;
+                var away = firstPos.LengthSquared() > 1e-4f ? Vector2.Normalize(-firstPos) : new Vector2(0f, -1f);
+                var seat = firstPos + RotateVec(away, MathF.PI / 2f) * ThunderClearDistance;
+                // Same arena-boundary clamp as the boss-clearance loop below -- the seat can
+                // land past the wall whenever first itself is out near the edge.
+                var seatClearRadius = ArenaRadius - 1f;
+                if (seat.LengthSquared() > seatClearRadius * seatClearRadius)
+                    seat = seat.LengthSquared() > 1e-4f ? Vector2.Normalize(seat) * seatClearRadius : seat;
+                secondMember.MoveTo(new Vector3(seat.X, 0f, seat.Y));
             }
-
-            var away = new Vector2(member.Position.X, member.Position.Z) - centre;
-            if (away.LengthSquared() >= ThunderBusterRadius * ThunderBusterRadius) continue;
-            var dir = away.LengthSquared() > 1e-4f
-                          ? Vector2.Normalize(away)
-                          : new Vector2(MathF.Sin(i * MathF.Tau / 8f), MathF.Cos(i * MathF.Tau / 8f));
-            coords[i] = centre + dir * ThunderClearDistance;
         }
-        return AiMove.Create(coords).NaturalOrder();
-    }
 
-    // Second Lightning III from Exdeath: a two-hit tank-swap buster. The OT eats the first
-    // hit in the middle of Exdeath's hitbox (closest, so it's the one snapshotted); the MT
-    // waits exactly 8y out, perpendicular to the stack axis so it's clear of both the blast
-    // and the party. Everyone else stacks at centre, shoved straight away from Exdeath (along
-    // the Exdeath->centre axis) far enough to clear the blast when Exdeath sits near middle.
-    private IAiMove ResolveSecondThunder()
-    {
-        var exdeath = state.ScenarioObjects.Exdeath;
-        if (exdeath is null) return AiMove.Create().NaturalOrder();
-
-        var e = new Vector2(exdeath.Position.X, exdeath.Position.Z);
-        var away = e.LengthSquared() > 1e-4f ? Vector2.Normalize(-e) : new Vector2(0f, -1f);
-        var stack = e.Length() >= ThunderBusterRadius ? Vector2.Zero : e + away * ThunderClearDistance;
-        var mtSeat = e + RotateVec(away, MathF.PI / 2f) * ThunderBusterRadius;
-
-        var coords = new Vector2?[8];
-        for (int i = 0; i < 8; i++)
+        if (state.ScenarioObjects.Exdeath is { } exdeath && exdeath.IsAlive())
         {
-            if (world.Party.Get(i) is not { } m || !m.IsAlive()) continue;
-            coords[i] = i switch
+            var bossPos = new Vector2(exdeath.Position.X, exdeath.Position.Z);
+            for (int i = 0; i < 8; i++)
             {
-                (int)PartyRole.OffTank  => e,
-                (int)PartyRole.MainTank => mtSeat,
-                _                       => stack,
-            };
+                var role = (PartyRole)i;
+                if (role == first || (second is { } sec && role == sec)) continue;
+                if (world.Party.Get(i) is not { } member || !member.IsAlive()) continue;
+                var pos = new Vector2(member.Position.X, member.Position.Z);
+                var offset = pos - bossPos;
+                if (offset.LengthSquared() >= ThunderClearDistance * ThunderClearDistance) continue;
+                var dir = offset.LengthSquared() > 1e-4f ? Vector2.Normalize(offset) : new Vector2(1f, 0f);
+                var target = bossPos + dir * ThunderClearDistance;
+                // Clamp inside the arena -- "away from Exdeath" can point through the wall
+                // whenever Exdeath is already near the edge. Confirmed via AnoMech-DamageDebug:
+                // the non-tanking party ended up ~23y out, past the 20y ring, doing exactly this.
+                var clearRadius = ArenaRadius - 1f;
+                if (target.LengthSquared() > clearRadius * clearRadius)
+                    target = target.LengthSquared() > 1e-4f ? Vector2.Normalize(target) * clearRadius : target;
+                member.MoveTo(new Vector3(target.X, 0f, target.Y));
+            }
         }
-        return AiMove.Create(coords).NaturalOrder();
     }
 
-    // After the first hit the tanks trade spots, so the MT slides into the middle and is the
-    // closest player for the second hit while the OT takes over the 8y seat. Reads live
-    // positions (Exdeath is frozen across both hits) so it's a literal swap of where they
-    // each stand.
-    private IAiMove SwapSecondThunderTanks()
-    {
-        var mt = world.Party.Get(PartyRole.MainTank);
-        var ot = world.Party.Get(PartyRole.OffTank);
-        if (mt is null || ot is null) return AiMove.Create().NaturalOrder();
+    // Schedules repeated EnforceThunderClearanceOnce calls across [fromTime, toTime], close
+    // enough together that nobody can drift far into either boss's clear radius between checks.
+    //
+    // Split at swapTime because the seat-reassertion branch doesn't know a swap is happening --
+    // it keeps pulling "second" toward "first"'s live position, which fights SwapThunderTanks
+    // mid-crossing (confirmed: OffTank landed ~20y off target, MainTank alone as "closest").
+    // After the swap, "second" is settled at the boss and "first" is a normal bystander --
+    // passing second:null for the back half turns off seat-reassertion and stops excluding
+    // "first" from the boss-clearance loop, both at once.
+    private const float ThunderClearanceInterval = 0.4f;
 
-        var coords = new Vector2?[8];
-        coords[(int)PartyRole.OffTank]  = new Vector2(mt.Position.X, mt.Position.Z);
-        coords[(int)PartyRole.MainTank] = new Vector2(ot.Position.X, ot.Position.Z);
-        return AiMove.Create(coords).NaturalOrder();
+    private void ScheduleThunderClearance(float fromTime, float swapTime, float toTime, PartyRole first, PartyRole? second)
+    {
+        for (var t = fromTime; t < swapTime; t += ThunderClearanceInterval)
+            world.Events.Add(t, () => EnforceThunderClearanceOnce(first, second));
+        var postSwapExcluded = second ?? first;
+        for (var t = swapTime; t <= toTime; t += ThunderClearanceInterval)
+            world.Events.Add(t, () => EnforceThunderClearanceOnce(postSwapExcluded, null));
     }
 
     // Dodge the edict by tucking just behind the casting boss, but as close to arena
@@ -425,7 +507,7 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
     // edge, but the hole's bearing may sit in the Look-Upon corridor; nudge it ±45° to the
     // side that clears the line and send the holder there. The rest take the opposite edge
     // (180°), which the centre-symmetric corridor leaves equally clear.
-    private void DodgeLookUponSplit(int tetherPlayerIndex, int lookKefkaIndex)
+    private Vector3 LookUponHolderSpot(int tetherPlayerIndex, int lookKefkaIndex)
     {
         var theta = state.KefkaPosition[lookKefkaIndex].RadiansFromNorth;   // Look-Upon line bearing
 
@@ -445,9 +527,36 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         var beta = MathF.Abs(MathF.Sin(plus - theta)) >= MathF.Abs(MathF.Sin(minus - theta)) ? plus : minus;
 
         const float edge = 18f;   // ride out to the arena edge, past the hole's r=17 ring
-        var holderSpot = new Vector3(edge * MathF.Sin(beta), 0f, -edge * MathF.Cos(beta));
+        return new Vector3(edge * MathF.Sin(beta), 0f, -edge * MathF.Cos(beta));
+    }
+
+    // Split into two ai.Move calls instead of one MoveTo-everyone method -- both trips are
+    // tight against this wave's cast deadline (3.67s), so both use sprint: true. Confirmed via
+    // AnoMech-DamageDebug: the holder didn't make it at plain run speed, and separately a
+    // non-holder (MeleeDpsB, ~25.7y in ~3.05s) also came up short.
+    // tetherPlayerIndex is a slot into state.Roles, NOT a PartyRole ordinal -- must be
+    // resolved through state.Roles before indexing coords[] (mirrors SwapThunderTanks).
+    // Indexing coords[tetherPlayerIndex] directly sent this duty to whatever PartyRole shares
+    // that ordinal instead of the actual randomized holder -- confirmed as the cause of a
+    // wrong-person sprint that killed both the true holder and an uninvolved role.
+    private IAiMove DodgeLookUponSplitHolder(int tetherPlayerIndex, int lookKefkaIndex)
+    {
+        var holderSpot = LookUponHolderSpot(tetherPlayerIndex, lookKefkaIndex);
+        var holderRole = state.Roles[tetherPlayerIndex];
+        var coords = new Vector2?[8];
+        coords[(int)holderRole] = new Vector2(holderSpot.X, holderSpot.Z);
+        return AiMove.Create(coords).NaturalOrder();
+    }
+
+    private IAiMove DodgeLookUponSplitOthers(int tetherPlayerIndex, int lookKefkaIndex)
+    {
+        var holderSpot = LookUponHolderSpot(tetherPlayerIndex, lookKefkaIndex);
+        var holderRole = state.Roles[tetherPlayerIndex];
+        var coords = new Vector2?[8];
         for (int i = 0; i < 8; i++)
-            state.Roles.Get(i)?.MoveTo(i == tetherPlayerIndex ? holderSpot : -holderSpot);
+            if ((PartyRole)i != holderRole)
+                coords[i] = new Vector2(-holderSpot.X, -holderSpot.Z);
+        return AiMove.Create(coords).NaturalOrder();
     }
 
     // playerIndex -> the specific black hole (tether.A) that player's most recent

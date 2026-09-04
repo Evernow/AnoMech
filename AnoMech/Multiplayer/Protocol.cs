@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
 using AnoMech.Scenarios.Umad.P2Forsaken;
+using AnoMech.Scenarios.Umad.P3BlackHole;
 
 namespace AnoMech.Multiplayer;
 
@@ -38,6 +39,9 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(SetWeatherMessage), "setWeather")]
 [JsonDerivedType(typeof(P4AiReplayStateMessage), "p4AiReplayState")]
 [JsonDerivedType(typeof(P5AiReplayStateMessage), "p5AiReplayState")]
+[JsonDerivedType(typeof(SelfMitigationMessage), "selfMitigation")]
+[JsonDerivedType(typeof(PeerAppliedEnemyStatusMessage), "peerAppliedEnemyStatus")]
+[JsonDerivedType(typeof(PeerAppliedRoleStatusMessage), "peerAppliedRoleStatus")]
 public abstract record MpMessage;
 
 // Peer -> host, sent once right after connecting to register a display name before any role
@@ -62,7 +66,8 @@ public sealed record LobbyStateMessage(
     bool Started,
     int ScenarioIndex,
     int SelectedAi,
-    int SelectedWaymark) : MpMessage;
+    int SelectedWaymark,
+    Dictionary<string, ushort> TankBusterPlan) : MpMessage;
 
 public sealed record ClaimRoleMessage(Guid PeerId, PartyRole Role) : MpMessage;
 public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
@@ -100,7 +105,7 @@ public sealed record EnemyState(
     int NetId, uint BNpcBaseId, uint NameId, byte Level, bool Targetable,
     EnemyListMode EnemyList, uint ModelCharaId, float Scale, float HitboxRadius,
     byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
-    IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, IReadOnlyList<uint> NewLockonVfxIds,
+    IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, int AnimationTimelineSeq, IReadOnlyList<uint> NewLockonVfxIds,
     float X, float Y, float Z, float Rotation,
     bool IsCasting, int CastSeq, uint CastActionId, float CastSeconds, float CastOmenDelay,
     float? CastTargetX, float? CastTargetY, float? CastTargetZ,
@@ -113,12 +118,14 @@ public sealed record EnemyState(
 // peer reconstructs it via world.Tether for the real VFX plumbing.
 public sealed record TetherState(int NetId, ushort TetherId, int? AEnemyNetId, PartyRole? ARole, int? BEnemyNetId, PartyRole? BRole);
 
-// Statuses/NewLockonVfxIds mirror EnemyState, same reasoning, for a party-role member.
-// Unlike position (self-authoritative for a peer's own claimed role), these are not
-// self-authoritative even then -- a peer runs no scenario logic itself.
+// Statuses/NewLockonVfxIds mirror EnemyState -- not self-authoritative even for a peer's own
+// role, since a peer runs no scenario logic. CurrentHp/MaxHp are the same story:
+// TankMitigation/TankHpRegen only ever run on the host, so without broadcasting these a
+// peer's own puppet for another role would sit at spawn-default HP forever.
 public sealed record RoleState(
     PartyRole Role, bool Filled, bool Dead, float X, float Y, float Z, float Rotation,
-    IReadOnlyList<EnemyStatusState> Statuses, IReadOnlyList<uint> NewLockonVfxIds);
+    IReadOnlyList<EnemyStatusState> Statuses, IReadOnlyList<uint> NewLockonVfxIds,
+    uint CurrentHp, uint MaxHp);
 
 // One SimEventObject (or SimTower) as the host has it. Without this message type, event
 // objects don't replicate at all -- the enemy sampler only ever walks SimEnemy.
@@ -171,14 +178,14 @@ public sealed record ResetRequestMessage(Guid PeerId) : MpMessage;
 // ResetRequestMessage -- the session itself is untouched, only the current run ends.
 public sealed record LeaveRequestMessage(Guid PeerId) : MpMessage;
 
-// Host -> everyone, broadcast once per run once the host's randomized per-run assignments are
-// available, sent unconditionally regardless of whether any peer is using debug-bot mode.
-// Carries only the subset UmadP3BlackHoleAi actually reads (see
-// UmadP3BlackHoleState.FromNetworkReplay) -- everything else only feeds damage/VFX resolution,
-// which peers never run.
+// Host -> everyone, broadcast once per run with the host's randomized per-run assignments.
+// Carries only the subset UmadP3BlackHoleAi reads (see UmadP3BlackHoleState.FromNetworkReplay).
+// ThunderSet1/ThunderSet2 are the exception: a peer under debug-bot control needs the host's
+// REAL plan (not FromNetworkReplay's standing-default fallback) to self-apply the right kit.
 public sealed record AiReplayStateMessage(
     PartyRole[] Roles, PartyRole[] StackTargets, uint[] SlapAttacks,
-    float[] KefkaPositionRadians, uint ImplosionAttack) : MpMessage;
+    float[] KefkaPositionRadians, uint ImplosionAttack,
+    ThunderIIIAssignment ThunderSet1, ThunderIIIAssignment ThunderSet2) : MpMessage;
 
 // P2 Forsaken's version of AiReplayStateMessage. Unlike P3, carries the state's entire public
 // surface rather than a curated subset -- every field is a plain value, and P2 has 7 debug-bot
@@ -217,3 +224,20 @@ public sealed record P4AiReplayStateMessage(
 // P5 Exaflares' version of AiReplayStateMessage. UmadP5ExaflaresState's entire meaningful
 // surface is LeftOrder/RightOrder -- Timeline/SpreadTick are plumbing the peer builds locally.
 public sealed record P5AiReplayStateMessage(int[] LeftOrder, int[] RightOrder) : MpMessage;
+
+// Peer -> host, event-driven. Reports which tracked mitigation status ids are active on the
+// sender's own real character -- a real Rampart/invuln press never touches the host's puppet
+// copy, so this is the only way DamageSolver can see it. SelfShieldFraction is a current-total
+// snapshot (TankShieldTracker.SetFromPeerReport), not an incremental grant.
+public sealed record SelfMitigationMessage(Guid PeerId, List<ushort> ActiveMitigationStatusIds, float SelfShieldFraction = 0f) : MpMessage;
+
+// Peer -> host: reports enemies whose SourceSide mitigation (Reprisal) was applied locally --
+// a peer's own enemy doppel is cosmetic-only, so this is how the host's authoritative enemy
+// actually receives the debuff.
+public sealed record PeerAppliedEnemyStatusMessage(Guid PeerId, List<int> EnemyNetIds, ushort StatusId, float Duration) : MpMessage;
+
+// Peer -> host: the Party/Ally-scope counterpart to PeerAppliedEnemyStatusMessage above -- a
+// party-wide/ally-targeted mitigation can touch roles other than the caster, whose puppets are
+// cosmetic-only. Self-scope presses don't send this (SelfMitigationMessage covers those).
+// ShieldFraction is the shield component of what was applied, 0f if none.
+public sealed record PeerAppliedRoleStatusMessage(Guid PeerId, List<PartyRole> Roles, ushort StatusId, float Duration, float ShieldFraction = 0f) : MpMessage;

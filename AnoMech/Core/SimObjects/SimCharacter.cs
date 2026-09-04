@@ -103,6 +103,10 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     protected void StopMoving() => Movement.Stop();
 
     public void Intercept(SimTether? tether, float margin = 3f) => Movement.Intercept(tether, margin);
+    public bool IsIntercepting => Movement.IsIntercepting;
+
+    // Moved up from SimEnemy so a party member can chase an enemy too.
+    public void Follow(SimCharacter? target = null, float speed = 6f) => Movement.Follow(target, speed);
 
 
     // -------------------------

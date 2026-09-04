@@ -1,10 +1,13 @@
 #if DEBUG
+using AnoMech.Core;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
 using AnoMech.Core.Native;
 using AnoMech.Core.SimObjects;
 using AnoMech.Helpers;
+using AnoMech.Scenarios;
 using Dalamud.Bindings.ImGui;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -250,6 +253,38 @@ internal sealed unsafe class DebugMenu
         ImGui.SameLine();
         if (ImGui.Button("Apply on player##status"))
             ApplyStatus(onPlayer: true);
+
+        ImGui.Spacing();
+        ImGui.TextUnformatted("Tank mitigation id lookup");
+        ImGui.Separator();
+        ImGui.TextWrapped("Press a mitigation cooldown in-game, then read its real id off " +
+                           "these two lists -- use them to fill in TankMitigationChart's " +
+                           "StatusId/ActionId for whichever ability you just pressed.");
+        var myStatuses = MyActiveStatuses();
+        ImGui.TextUnformatted("My active statuses:");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Copy all##statuses"))
+            ImGui.SetClipboardText(string.Join("\n", myStatuses.Select(s => $"{s.Id} -- {s.Name}")));
+        foreach (var (id, name) in myStatuses)
+            ImGui.BulletText($"{id} -- {name}");
+
+        // For a SourceSide mitigation like Reprisal, which debuffs whatever's targeted, not
+        // the caster -- MyActiveStatuses above would never see it land.
+        var targetStatuses = TargetActiveStatuses();
+        ImGui.TextUnformatted("My target's active statuses:");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Copy all##targetStatuses"))
+            ImGui.SetClipboardText(string.Join("\n", targetStatuses.Select(s => $"{s.Id} -- {s.Name}")));
+        foreach (var (id, name) in targetStatuses)
+            ImGui.BulletText($"{id} -- {name}");
+
+        var recentActions = Plugin.PlayerInputHooks.RecentActions;
+        ImGui.TextUnformatted("Recent actions pressed (newest last):");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Copy all##actions"))
+            ImGui.SetClipboardText(string.Join("\n", recentActions.Select(a => $"{a.ActionId} ({a.Type}) -- {ActionLookup.Name(a.ActionId)}")));
+        foreach (var (id, type) in recentActions)
+            ImGui.BulletText($"{id} ({type}) -- {ActionLookup.Name(id)}");
 
         ImGui.Spacing();
         ImGui.TextUnformatted("Dump objects near player");
@@ -500,12 +535,41 @@ internal sealed unsafe class DebugMenu
         Plugin.Log.Warning($"Cast: target '{target.Name}' is not a tracked enemy");
     }
 
-    // Applies the StatusId/Duration/Stacks inputs to either the local player or
-    // the currently-targeted sim character (enemy doppel, party doppel, or the
-    // player if they target themselves). Goes through SimCharacter.AddStatus so
-    // the status is tracked + re-stamped like a scenario-applied one; blank
-    // Duration falls through to AddStatus's default, blank Stacks means 1.
-    // overrideStacks: true so re-applying sets the absolute stack count typed.
+    // Every real status on the local player's real character, read straight off native
+    // StatusManager (not ActiveStatusSnapshot, which only reflects engine-applied statuses)
+    // and off Plugin.ObjectTable.LocalPlayer directly (not plugin.Game.Player, which is only
+    // populated mid-scenario) -- unfiltered, since the point is spotting an id not in the chart yet.
+    private List<(ushort Id, string Name)> MyActiveStatuses()
+    {
+        var result = new List<(ushort, string)>();
+        var localPlayer = Plugin.ObjectTable.LocalPlayer;
+        if (localPlayer == null) return result;
+        var bc = (BattleChara*)localPlayer.Address;
+        if (bc == null) return result;
+        foreach (var status in bc->StatusManager.Status)
+            if (status.StatusId != 0)
+                result.Add((status.StatusId, StatusLookup.Name(status.StatusId)));
+        return result;
+    }
+
+    // For confirming a SourceSide mitigation (Reprisal) -- those debuff whatever's
+    // targeted, not the caster, so MyActiveStatuses above can never see them land.
+    private List<(ushort Id, string Name)> TargetActiveStatuses()
+    {
+        var result = new List<(ushort, string)>();
+        var target = Plugin.TargetManager.Target;
+        if (target == null) return result;
+        var bc = (BattleChara*)target.Address;
+        if (bc == null) return result;
+        foreach (var status in bc->StatusManager.Status)
+            if (status.StatusId != 0)
+                result.Add((status.StatusId, StatusLookup.Name(status.StatusId)));
+        return result;
+    }
+
+    // Applies the StatusId/Duration/Stacks inputs to either the local player or the
+    // currently-targeted sim character. Goes through SimCharacter.AddStatus; blank Duration
+    // falls through to its default, blank Stacks means 1, overrideStacks: true.
     private void ApplyStatus(bool onPlayer)
     {
         if (!TryParseId(debugStatusIdText, out var statusId) || statusId == 0 || statusId > ushort.MaxValue)

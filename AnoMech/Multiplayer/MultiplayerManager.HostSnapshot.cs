@@ -76,17 +76,14 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) ModelState -> 0x{modelState:X2}.");
             }
             var statusSnapshot = enemy.ActiveStatusSnapshot;
-            var statusKey = string.Join(",", statusSnapshot.Select(s => $"{s.StatusId}:{s.Stacks}"));
-            if (!hostEnemyLastLoggedStatuses.TryGetValue(enemy, out var lastStatusKey) || lastStatusKey != statusKey)
-            {
-                hostEnemyLastLoggedStatuses[enemy] = statusKey;
-                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) statuses -> [{statusKey}].");
-            }
+            if (!hostEnemyLastLoggedStatuses.TryGetValue(enemy, out var lastStatuses))
+                hostEnemyLastLoggedStatuses[enemy] = lastStatuses = new Dictionary<ushort, ushort>();
+            LogStatusChanges($"Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId})", statusSnapshot, lastStatuses);
             if (enemy.AnimationTimelineId is { } timelineId
-                && (!hostEnemyLastLoggedAnimationTimeline.TryGetValue(enemy, out var lastTimeline) || lastTimeline != timelineId))
+                && (!hostEnemyLastLoggedAnimationTimeline.TryGetValue(enemy, out var lastSeq) || lastSeq != enemy.AnimationTimelineSeq))
             {
-                hostEnemyLastLoggedAnimationTimeline[enemy] = timelineId;
-                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4}.");
+                hostEnemyLastLoggedAnimationTimeline[enemy] = enemy.AnimationTimelineSeq;
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4} (seq {enemy.AnimationTimelineSeq}).");
             }
             var newLockonVfxIds = enemy.DrainPendingLockonVfxIds();
             if (newLockonVfxIds.Count > 0)
@@ -97,7 +94,7 @@ public sealed partial class MultiplayerManager
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, cfg.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
                 statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList(),
-                enemy.AnimationTimelineId, newLockonVfxIds,
+                enemy.AnimationTimelineId, enemy.AnimationTimelineSeq, newLockonVfxIds,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
                 enemy.IsCasting, enemy.CastSeq, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
                 enemy.CastTargetLocation?.X, enemy.CastTargetLocation?.Y, enemy.CastTargetLocation?.Z,
@@ -156,7 +153,7 @@ public sealed partial class MultiplayerManager
     // doc comment.
     private Task? pendingRolesSend;
 
-    private Task SampleAndBroadcastRoles()
+    private unsafe Task SampleAndBroadcastRoles()
     {
         var world = Plugin.GameInstance.World;
         var roles = new List<RoleState>(8);
@@ -166,19 +163,23 @@ public sealed partial class MultiplayerManager
             var dead = member is ISimPartyMember { Dead: true };
             IReadOnlyList<EnemyStatusState> statuses = [];
             IReadOnlyList<uint> newLockonVfxIds = [];
+            uint currentHp = 0, maxHp = 0;
             if (member != null)
             {
                 var statusSnapshot = member.ActiveStatusSnapshot;
-                var statusKey = string.Join(",", statusSnapshot.Select(s => $"{s.StatusId}:{s.Stacks}"));
-                if (!hostRoleLastLoggedStatuses.TryGetValue(role, out var lastStatusKey) || lastStatusKey != statusKey)
-                {
-                    hostRoleLastLoggedStatuses[role] = statusKey;
-                    DiagnosticLog.Info($"[Multiplayer] Host: role {role} statuses -> [{statusKey}].");
-                }
+                if (!hostRoleLastLoggedStatuses.TryGetValue(role, out var lastStatuses))
+                    hostRoleLastLoggedStatuses[role] = lastStatuses = new Dictionary<ushort, ushort>();
+                LogStatusChanges($"Host: role {role} ({DescribeRoleOwner(role, member)})", statusSnapshot, lastStatuses);
                 newLockonVfxIds = member.DrainPendingLockonVfxIds();
                 if (newLockonVfxIds.Count > 0)
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
                 statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList();
+                var bc = member.BattleCharaPtr;
+                if (bc != null)
+                {
+                    currentHp = bc->Health;
+                    maxHp = bc->MaxHealth;
+                }
             }
             else
             {
@@ -186,7 +187,7 @@ public sealed partial class MultiplayerManager
             }
             roles.Add(new RoleState(role, member != null, dead,
                 member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f,
-                statuses, newLockonVfxIds));
+                statuses, newLockonVfxIds, currentHp, maxHp));
         }
         return relay!.SendAsync(new RolesSnapshotMessage(roles));
     }

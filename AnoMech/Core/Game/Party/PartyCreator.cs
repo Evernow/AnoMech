@@ -36,6 +36,10 @@ internal static unsafe class PartyCreator
     private const float LalafellVfxScale = 0.4f;
     private const float LalafellHeight = 0.6f;
 
+    // Fallback for every role, and for tank roles when IScenario.TankMaxHealth is null (see
+    // Populate's tankMaxHealth param).
+    private const uint DoppelMaxHealth = 100_000;
+
     private const float RingRadius = 2.5f;
     private const float RadiusJitter = 0.6f;
     private const float AngleJitter = 0.4f;
@@ -47,7 +51,7 @@ internal static unsafe class PartyCreator
     // of an AI-driven SimPartyNpc — same visuals, but position comes from the
     // network (see SimNetworkPuppet) rather than AiManager. Takes priority over
     // `solo` so a solo-selected AI strat still shows other real participants.
-    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null)
+    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, uint? tankMaxHealth = null, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null)
     {
         var presets = roleOverride is { } skip
             ? PartyPresets.ForRole(skip)
@@ -63,6 +67,7 @@ internal static unsafe class PartyCreator
                 // Player's own job slot — wire the SimPlayer in directly so
                 // Party.Get(role) returns a uniform SimCharacter.
                 party.SetSlot(role, player);
+                if (role.IsTank() && tankMaxHealth is { } realHp) player.OverrideMaxHealthForTankRole(realHp);
                 continue;
             }
 
@@ -70,7 +75,7 @@ internal static unsafe class PartyCreator
             {
                 var angle0 = (i / (float)presets.Count) * MathF.Tau;
                 var localPos0 = new Vector3(MathF.Sin(angle0) * RingRadius, 0f, MathF.Cos(angle0) * RingRadius);
-                var puppet = SpawnPuppet(preset, world, role, new Placement(localPos0, MathF.Atan2(-localPos0.X, -localPos0.Z)), itemSheet);
+                var puppet = SpawnPuppet(preset, world, role, new Placement(localPos0, MathF.Atan2(-localPos0.X, -localPos0.Z)), itemSheet, tankMaxHealth);
                 if (puppet != null) party.SetSlot(role, puppet);
                 continue;
             }
@@ -86,14 +91,14 @@ internal static unsafe class PartyCreator
             var localPos = new Vector3(MathF.Sin(angle) * distance, 0f, MathF.Cos(angle) * distance);
             var facingPlayer = MathF.Atan2(-localPos.X, -localPos.Z);
 
-            var member = Spawn(preset, world, role, new Placement(localPos, facingPlayer), itemSheet);
+            var member = Spawn(preset, world, role, new Placement(localPos, facingPlayer), itemSheet, tankMaxHealth);
             if (member != null) party.SetSlot(role, member);
         }
     }
 
-    private static SimPartyNpc? Spawn(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet)
+    private static SimPartyNpc? Spawn(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet, uint? tankMaxHealth)
     {
-        if (!SpawnNative(preset, world, placement, itemSheet, out var idx)) return null;
+        if (!SpawnNative(preset, world, role, placement, itemSheet, tankMaxHealth, out var idx)) return null;
 
         Plugin.Log.Info($"PartyCreator: spawned {preset.Name} ({role}, job {preset.ClassJob}) at index {idx}");
         var member = new SimPartyNpc(idx, world.Coordinates, role, preset.ClassJob, preset.Name);
@@ -110,9 +115,9 @@ internal static unsafe class PartyCreator
     // A puppet needs the same doppel visuals as a bot (Spawn) but never moves on
     // its own — its Movement is a no-op (SimNetworkPuppet), so it's excluded from
     // the Obstacles field that only steering doppels need.
-    private static SimNetworkPuppet? SpawnPuppet(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet)
+    private static SimNetworkPuppet? SpawnPuppet(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet, uint? tankMaxHealth)
     {
-        if (!SpawnNative(preset, world, placement, itemSheet, out var idx)) return null;
+        if (!SpawnNative(preset, world, role, placement, itemSheet, tankMaxHealth, out var idx)) return null;
 
         Plugin.Log.Info($"PartyCreator: spawned network puppet {preset.Name} ({role}, job {preset.ClassJob}) at index {idx}");
         var puppet = new SimNetworkPuppet(idx, world.Coordinates, role, preset.ClassJob, preset.Name);
@@ -122,7 +127,7 @@ internal static unsafe class PartyCreator
 
     // Shared native BattleChara setup for both a bot doppel and a network puppet
     // — identical visuals, only the wrapper type and movement behaviour differ.
-    private static bool SpawnNative(PartyMemberPreset preset, SimWorld world, Placement placement, ExcelSheet<Item> itemSheet, out int idx)
+    private static bool SpawnNative(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet, uint? tankMaxHealth, out int idx)
     {
         idx = -1;
         if (!CharacterManagerHelper.CreateCharacter(out idx, out var obj)) return false;
@@ -145,8 +150,9 @@ internal static unsafe class PartyCreator
 
         chara->TargetableStatus = ObjectTargetableFlags.IsTargetable;
         chara->HitboxRadius = 0.5f;
-        chara->MaxHealth = 100_000;
-        chara->Health = 100_000;
+        var maxHealth = role.IsTank() && tankMaxHealth is { } real ? real : DoppelMaxHealth;
+        chara->MaxHealth = maxHealth;
+        chara->Health = maxHealth;
         chara->MaxMana = 10_000;
         chara->Mana = 10_000;
         chara->Battalion = 0;
