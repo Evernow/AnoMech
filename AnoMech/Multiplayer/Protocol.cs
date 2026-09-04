@@ -44,6 +44,13 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(PeerAppliedRoleStatusMessage), "peerAppliedRoleStatus")]
 public abstract record MpMessage;
 
+// Marker for a message type only the host ever legitimately sends. RelayClient tags each
+// received message with whether the relay says it came from the room's host; DispatchCore
+// drops one of these if that tag says otherwise, so a peer who joined a session can't forge
+// host-authoritative state. Best-effort -- a relay predating "senderIdentity" can't attest to
+// this at all, so the tag defaults to trusted then (see RelayClient.SupportsSenderIdentity).
+internal interface IHostOnlyMessage;
+
 // Peer -> host, sent once right after connecting to register a display name before any role
 // is claimed. Version/Checksum identify the sender's plugin build so the host can catch a
 // mismatch before it desyncs.
@@ -67,7 +74,7 @@ public sealed record LobbyStateMessage(
     int ScenarioIndex,
     int SelectedAi,
     int SelectedWaymark,
-    Dictionary<string, ushort> TankBusterPlan) : MpMessage;
+    Dictionary<string, ushort> TankBusterPlan) : MpMessage, IHostOnlyMessage;
 
 public sealed record ClaimRoleMessage(Guid PeerId, PartyRole Role) : MpMessage;
 public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
@@ -75,12 +82,12 @@ public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
 // Host -> everyone. Each client independently calls RunScenarioAsHost/AsPeer on receipt --
 // no tight clock sync needed, since host-authoritative mechanic resolution is what keeps
 // outcomes consistent regardless of a little start skew.
-public sealed record StartMessage : MpMessage;
+public sealed record StartMessage : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, sent before Session.Started/StartMessage. RunScenarioInternal silently
 // no-ops if a client isn't in an inn -- this round-trip surfaces that to the host instead.
 // Every claimed peer answers with StartCheckResponseMessage.
-public sealed record StartCheckMessage : MpMessage;
+public sealed record StartCheckMessage : MpMessage, IHostOnlyMessage;
 
 public sealed record StartCheckResponseMessage(Guid PeerId, bool Ready, string? Reason) : MpMessage;
 
@@ -137,32 +144,32 @@ public sealed record EventObjectState(
 // staleness, not a permanently wrong reconstruction.
 public sealed record WorldSnapshotMessage(
     List<EnemyState> Enemies, List<TetherState> Tethers,
-    List<EventObjectState> EventObjects) : MpMessage;
+    List<EventObjectState> EventObjects) : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, paced independently of WorldSnapshotMessage (see RelayClient's priority
 // queue) -- role positions are small and urgent, enemy data can be large.
-public sealed record RolesSnapshotMessage(List<RoleState> Roles) : MpMessage;
+public sealed record RolesSnapshotMessage(List<RoleState> Roles) : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, one per Game.PartyMemberKilled. The recipient calls Game.Kill on whatever
 // currently occupies that role locally.
-public sealed record RoleKilledMessage(PartyRole Role, string Cause) : MpMessage;
+public sealed record RoleKilledMessage(PartyRole Role, string Cause) : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, sent whenever the host's run ends for any reason. ReturnedToInn
 // distinguishes Reset() (stays in-zone) from Leave()/a natural finish (unloads to the inn) --
 // both clear ActiveScenario identically, so the host reads World.Map.IsInInstance at
 // broadcast time to tell them apart.
-public sealed record EndMessage(bool ReturnedToInn) : MpMessage;
+public sealed record EndMessage(bool ReturnedToInn) : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, every PingIntervalSeconds, decoupled from Started so connection quality
 // is live in the lobby before Start. SentAtMs is the host's own clock; only the host ever
 // compares it, so there's no cross-machine sync to worry about.
-public sealed record PingMessage(long SentAtMs) : MpMessage;
+public sealed record PingMessage(long SentAtMs) : MpMessage, IHostOnlyMessage;
 
 public sealed record PongMessage(Guid PeerId, long SentAtMs) : MpMessage;
 
 public sealed record PeerStatusEntry(float? LatencyMs, float SecondsSinceLastSeen);
 
-public sealed record PeerStatusMessage(Dictionary<Guid, PeerStatusEntry> Statuses) : MpMessage;
+public sealed record PeerStatusMessage(Dictionary<Guid, PeerStatusEntry> Statuses) : MpMessage, IHostOnlyMessage;
 
 // Sent by whoever clicks Leave session, to every other client. Only ends the session for the
 // whole group when the host is who left; a departing peer just gets dropped from the roster.
@@ -185,32 +192,32 @@ public sealed record LeaveRequestMessage(Guid PeerId) : MpMessage;
 public sealed record AiReplayStateMessage(
     PartyRole[] Roles, PartyRole[] StackTargets, uint[] SlapAttacks,
     float[] KefkaPositionRadians, uint ImplosionAttack,
-    ThunderIIIAssignment ThunderSet1, ThunderIIIAssignment ThunderSet2) : MpMessage;
+    ThunderIIIAssignment ThunderSet1, ThunderIIIAssignment ThunderSet2) : MpMessage, IHostOnlyMessage;
 
 // P2 Forsaken's version of AiReplayStateMessage. Unlike P3, carries the state's entire public
 // surface rather than a curated subset -- every field is a plain value, and P2 has 7 debug-bot
 // Ai variants, so there's no single "what does the Ai read" answer to trim against.
 public sealed record P2AiReplayStateMessage(
-    EndAttack[] EndAttacks, float NewNorthRadians, int Rotation, Dictionary<PartyRole, uint> Lockons) : MpMessage;
+    EndAttack[] EndAttacks, float NewNorthRadians, int Rotation, Dictionary<PartyRole, uint> Lockons) : MpMessage, IHostOnlyMessage;
 
 // P2AiReplayStateMessage.Lockons is a one-time snapshot, but UmadP2ForsakenScenario
 // .ReapplyLockons reassigns it dynamically as towers resolve (host-only). Without a way to
 // re-sync it, a peer's stale replay lookup can miss and throw inside EventScheduler.Tick,
 // permanently breaking every later scheduled move. Host -> everyone, sent whenever
 // ReapplyLockons actually changes something.
-public sealed record P2LockonsUpdateMessage(Dictionary<PartyRole, uint> Lockons) : MpMessage;
+public sealed record P2LockonsUpdateMessage(Dictionary<PartyRole, uint> Lockons) : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, mirroring MapController.AddEffect/DirectorUpdate 1:1. Scenarios call these
 // directly from their own event schedule (host-only) to drive native, client-local instance
 // state (arena color/lighting, tower reveals, director flags) that's outside any SimObject and
 // so outside the normal snapshot sync. Pure replays -- a peer never computes these itself.
-public sealed record MapEffectMessage(uint PacketFlags, byte Index) : MpMessage;
+public sealed record MapEffectMessage(uint PacketFlags, byte Index) : MpMessage, IHostOnlyMessage;
 public sealed record MapDirectorUpdateMessage(
-    uint Category, uint Arg1, uint Arg2, uint Arg3, uint Arg4, uint Arg5, uint Arg6) : MpMessage;
+    uint Category, uint Arg1, uint Arg2, uint Arg3, uint Arg4, uint Arg5, uint Arg6) : MpMessage, IHostOnlyMessage;
 
 // Pure replay of a host-side world.SetWeather call -- scenarios use this mid-fight for
 // arena-transform lighting cues, not just initial spawn weather.
-public sealed record SetWeatherMessage(byte WeatherId, float Transition) : MpMessage;
+public sealed record SetWeatherMessage(byte WeatherId, float Transition) : MpMessage, IHostOnlyMessage;
 
 // P4 Kefka Says' version of AiReplayStateMessage. Carries only the subset UmadP4KefkaSaysAi
 // reads (see UmadP4KefkaSaysState.FromNetworkReplay) -- MysteryCast reduced to its three
@@ -219,11 +226,11 @@ public sealed record P4AiReplayStateMessage(
     int[] MysteryBlizzardOffset, int[] MysteryLightningOffset, float[] MysteryLightningOrientation,
     bool Wave1First, PartyRole[] Wave1, bool Wave1True, PartyRole[] Wave2, bool Wave2True,
     bool InfernoIsTrue, bool TsunamiIsTrue, PartyRole[] Wave3, bool[] Wounds,
-    bool Antilight0IsWhite, float NeoExdeathDirectionRadians) : MpMessage;
+    bool Antilight0IsWhite, float NeoExdeathDirectionRadians) : MpMessage, IHostOnlyMessage;
 
 // P5 Exaflares' version of AiReplayStateMessage. UmadP5ExaflaresState's entire meaningful
 // surface is LeftOrder/RightOrder -- Timeline/SpreadTick are plumbing the peer builds locally.
-public sealed record P5AiReplayStateMessage(int[] LeftOrder, int[] RightOrder) : MpMessage;
+public sealed record P5AiReplayStateMessage(int[] LeftOrder, int[] RightOrder) : MpMessage, IHostOnlyMessage;
 
 // Peer -> host, event-driven. Reports which tracked mitigation status ids are active on the
 // sender's own real character -- a real Rampart/invuln press never touches the host's puppet

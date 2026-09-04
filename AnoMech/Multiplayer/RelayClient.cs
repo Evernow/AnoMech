@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -35,7 +37,8 @@ public sealed class RelayClient : IDisposable
         Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
     private bool disposed;
 
-    public event Action<MpMessage>? MessageReceived;
+    // bool is IsFromHost -- see IHostOnlyMessage's own doc comment.
+    public event Action<MpMessage, bool>? MessageReceived;
     public event Action<Exception?>? Disconnected;
 
     public bool IsConnected => socket.State == WebSocketState.Open;
@@ -53,13 +56,15 @@ public sealed class RelayClient : IDisposable
     public IReadOnlySet<string> RelayCapabilities { get; private set; } = new HashSet<string>();
     public bool HasRelayCapability(string name) => RelayCapabilities.Contains(name);
     public bool SupportsCompression => HasRelayCapability("binaryCompression");
+    public bool SupportsSenderIdentity => HasRelayCapability("senderIdentity");
 
-    public Task ConnectAsync(string relayUrl, string sessionCode) =>
-        ConnectCoreAsync(relayUrl, $"session/{Uri.EscapeDataString(sessionCode)}");
+    public Task ConnectAsync(string relayUrl, string sessionCode, string? accessToken = null) =>
+        ConnectCoreAsync(relayUrl, $"session/{Uri.EscapeDataString(sessionCode)}", accessToken);
 
     // Requests a relay-assigned session code (Program.cs's /host endpoint) instead of
     // picking one locally, since only the relay can guarantee no collision.
-    public Task<string?> ConnectAndHostAsync(string relayUrl) => ConnectCoreAsync(relayUrl, "host");
+    public Task<string?> ConnectAndHostAsync(string relayUrl, string? accessToken = null) =>
+        ConnectCoreAsync(relayUrl, "host", accessToken);
 
     // A bare host is tried encrypted first, falling back to plain ws:// only on failure --
     // there's no way to ask a server "do you speak TLS" other than trying. Default ports
@@ -97,9 +102,74 @@ public sealed class RelayClient : IDisposable
 
     private static Uri BuildUri(string baseUrl, string path) => new($"{baseUrl.TrimEnd('/')}/{path}");
 
-    private async Task<string?> ConnectCoreAsync(string relayUrl, string path)
+    // Same host/port resolution as ResolveCandidateUris, mapped to https/http instead of
+    // wss/ws -- the relay's plain-HTTP /info endpoint lives on the exact same host:port a WS
+    // connect would use (a TLS-terminating reverse proxy in front forwards both the same way).
+    private static IReadOnlyList<Uri> ResolveInfoCandidateUris(string relayUrl)
+    {
+        var trimmed = relayUrl.Trim();
+        var explicitScheme = trimmed.IndexOf("://", StringComparison.Ordinal) is var idx && idx > 0
+            ? trimmed[..idx].ToLowerInvariant()
+            : null;
+        if (explicitScheme is not null)
+        {
+            var mapped = explicitScheme switch { "wss" => "https", "ws" => "http", _ => explicitScheme };
+            return [BuildUri($"{mapped}://{trimmed[(idx + 3)..]}", "info")];
+        }
+        var (host, explicitPort) = SplitHostPort(trimmed);
+        return
+        [
+            BuildUri($"https://{host}:{explicitPort ?? 443}", "info"),
+            BuildUri($"http://{host}:{explicitPort ?? 7890}", "info"),
+        ];
+    }
+
+    private sealed record RelayInfo(int RelayVersion, string[]? Capabilities, bool RequiresToken);
+
+    private static readonly HttpClient InfoHttpClient = new() { Timeout = TimeSpan.FromSeconds(5) };
+
+    // Plain HTTP GET, not a WS connection -- lets the UI learn whether a relay needs an
+    // access token BEFORE the user has one to offer, so the password box in
+    // MultiplayerWindow only shows up when it's actually needed. Best-effort: null means
+    // either candidate failed (unreachable, or an old relay with no /info at all) -- callers
+    // should fall back to "assume no token needed" rather than block on this.
+    public static async Task<(int RelayVersion, bool RequiresToken)?> FetchInfoAsync(string relayUrl, CancellationToken ct = default)
+    {
+        foreach (var uri in ResolveInfoCandidateUris(relayUrl))
+        {
+            try
+            {
+                var json = await InfoHttpClient.GetStringAsync(uri, ct).ConfigureAwait(false);
+                var info = JsonSerializer.Deserialize<RelayInfo>(json, JsonOptions);
+                if (info != null) return (info.RelayVersion, info.RequiresToken);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                DiagnosticLog.Info($"[RelayClient] /info fetch from {uri} failed: {e.Message}");
+            }
+        }
+        return null;
+    }
+
+    private async Task<string?> ConnectCoreAsync(string relayUrl, string path, string? accessToken)
     {
         var candidates = ResolveCandidateUris(relayUrl, path);
+        // A password is worthless sent in the clear -- never attempt (let alone fall back to)
+        // a ws:// candidate once one is set, whether that's the auto-detect fallback or an
+        // explicit ws:// the user typed. Matches the relay's own enforcement (see
+        // Program.cs's IsRequestEncrypted), so this is defense-in-depth, not the only guard.
+        if (!string.IsNullOrEmpty(accessToken))
+        {
+            var encryptedOnly = candidates.Where(u => u.Scheme == "wss").ToList();
+            if (encryptedOnly.Count == 0)
+            {
+                var reason = "A relay password is set, but this connection isn't encrypted (wss://) -- refusing to send it in plaintext.";
+                DiagnosticLog.Warn($"[RelayClient] {reason}");
+                Disconnected?.Invoke(new InvalidOperationException(reason));
+                return null;
+            }
+            candidates = encryptedOnly;
+        }
         Exception? lastFailure = null;
         for (var i = 0; i < candidates.Count; i++)
         {
@@ -108,6 +178,10 @@ public sealed class RelayClient : IDisposable
                 socket.Dispose();
                 socket = new ClientWebSocket();
             }
+            // Options only take effect before ConnectAsync, so this has to be set again on
+            // every fresh ClientWebSocket instance, not once outside the loop.
+            if (!string.IsNullOrEmpty(accessToken))
+                socket.Options.SetRequestHeader("X-AnoMech-Relay-Token", accessToken);
             var uri = candidates[i];
             IsEncrypted = uri.Scheme == "wss";
             try
@@ -191,12 +265,25 @@ public sealed class RelayClient : IDisposable
         return output.ToArray();
     }
 
+    // Bounded manually -- CopyTo has no output-size limit, so a small malicious/corrupted
+    // payload claiming a huge decompressed size (a compression bomb) could otherwise exhaust
+    // memory in the game's own process, not just this connection. 64 MB is far past anything
+    // a real WorldSnapshotMessage produces even compressed at CompressionThresholdBytes.
+    private const int MaxDecompressedBytes = 64 * 1024 * 1024;
+
     private static byte[] Decompress(byte[] data)
     {
         using var input = new MemoryStream(data);
         using var brotli = new BrotliStream(input, CompressionMode.Decompress);
         using var output = new MemoryStream();
-        brotli.CopyTo(output);
+        var chunk = new byte[64 * 1024];
+        int read;
+        while ((read = brotli.Read(chunk, 0, chunk.Length)) > 0)
+        {
+            output.Write(chunk, 0, read);
+            if (output.Length > MaxDecompressedBytes)
+                throw new InvalidDataException($"Decompressed message exceeded {MaxDecompressedBytes} bytes.");
+        }
         return output.ToArray();
     }
 
@@ -271,9 +358,18 @@ public sealed class RelayClient : IDisposable
                 } while (!result.EndOfMessage);
 
                 MpMessage? message;
+                var isFromHost = true;
                 try
                 {
                     var raw = ms.ToArray();
+                    // Leading byte is the relay's host-tag (see Relay/Program.cs BroadcastAsync)
+                    // -- only present when the relay actually advertised support for it.
+                    if (SupportsSenderIdentity)
+                    {
+                        if (raw.Length == 0) throw new InvalidDataException("empty frame with senderIdentity active.");
+                        isFromHost = raw[0] == 1;
+                        raw = raw[1..];
+                    }
                     if (result.MessageType == WebSocketMessageType.Binary) raw = Decompress(raw);
                     message = JsonSerializer.Deserialize<MpMessage>(raw, JsonOptions);
                 }
@@ -283,7 +379,7 @@ public sealed class RelayClient : IDisposable
                     DiagnosticLog.Warn($"[RelayClient] Malformed message dropped: {e.Message}");
                     continue;
                 }
-                if (message != null) MessageReceived?.Invoke(message);
+                if (message != null) MessageReceived?.Invoke(message, isFromHost);
             }
         }
         catch (OperationCanceledException)

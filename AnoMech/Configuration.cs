@@ -17,6 +17,10 @@ public class Configuration : IPluginConfiguration
     // sessions so the user only has to type it once.
     public string RelayServerUrl { get; set; } = "";
 
+    // Optional shared secret some relays require to connect -- remembered the same way as
+    // RelayServerUrl. Only ever sent to the relay URL above; never logged.
+    public string RelayAccessToken { get; set; } = "";
+
     // Stable per-install multiplayer identity. Reused across Host/Join calls
     // (instead of a fresh Guid each time) so that if a peer's connection drops
     // and they rejoin the same session, the host's still-held role claim for

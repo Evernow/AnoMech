@@ -6,8 +6,11 @@ message format at all. Dalamud clients can't reach each other directly (NAT, and
 AnoMech firewalls off FFXIV's own server traffic during a scenario), so this process
 exists just to get them talking.
 
-**There's no default/public relay.** Every group runs their own — nothing connects
-until you type a URL into the Multiplayer window.
+**There's no default/public relay bundled with the plugin.** Every group runs their
+own — nothing connects until you type a URL into the Multiplayer window. It's built to
+be safe to run as a genuinely public service too (anyone, not just people you've
+personally shared a URL with) — see [Running it as a public
+service](#running-it-as-a-public-service) and [Security notes](#security-notes).
 
 ## Contents
 
@@ -17,6 +20,9 @@ until you type a URL into the Multiplayer window.
 - [Adding TLS (`wss://`)](#adding-tls-wss)
 - [Verifying it's reachable](#verifying-its-reachable)
 - [What to share with your group](#what-to-share-with-your-group)
+- [Running it as a public service](#running-it-as-a-public-service)
+- [Logging](#logging)
+- [Admin dashboard](#admin-dashboard)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 - [Configuring the plugin](#configuring-the-plugin)
@@ -181,12 +187,201 @@ Connects and hangs waiting for input → working.
 
 ---
 
+## Running it as a public service
+
+Everything in [Quick local test](#quick-local-test)/[Option A](#option-a--cloud-vps-recommended)
+still applies — these just add the flags worth setting once real strangers (not just
+your own group) can reach the port.
+
+```
+anomech-relay --port 7890 --token <shared-secret> --admin-token <a-different-secret>
+```
+
+- **`--token <value>`** — an access password. Once set, `/host` and `/session/<code>`
+  both require it (sent as a header, never in the URL/query string). Hand it out to
+  the people you actually want using this relay; everyone else gets `401` before a
+  WebSocket ever opens. Leave unset to keep the original "anyone with the URL" model.
+  The plugin's Multiplayer window only shows a password field when the relay it's
+  pointed at actually has one set (see [Configuring the plugin](#configuring-the-plugin)).
+
+  **Setting `--token` also enforces TLS.** A password sent in the clear isn't a
+  password. Once `--token` (or `--admin-token`) is set, the relay refuses (`426`)
+  any connection it can't confirm was TLS-terminated — it checks for
+  `X-Forwarded-Proto: https`, which Caddy and nginx both set automatically for a
+  proxied request (see [Adding TLS](#adding-tls-wss)). A direct, unproxied `ws://`
+  connection carries no such header and is rejected the same way, including your own
+  [quick local test](#quick-local-test) — put the reverse proxy in front (even a local
+  Caddy instance with a self-signed cert) before setting a token, or don't set one for
+  pure local testing. The plugin independently refuses to send a saved password over
+  anything but `wss://` too, so this is enforced on both ends, not just trusted to the
+  relay operator having configured the proxy correctly.
+
+  **Minimum length: 16 characters, enforced at startup.** The relay refuses to start
+  (not just warn) if `--token`/`--admin-token` is shorter — a short shared secret is
+  still guessable over time even with the lockout in place. Generate one with e.g.
+  `openssl rand -hex 16`.
+
+  **Can also come from an environment variable** (`ANOMECH_RELAY_TOKEN`) instead of
+  the CLI flag — the flag wins if both are set. A CLI argument is visible to any other
+  local user via a process listing (`ps`/Task Manager) and often ends up preserved in
+  shell history; an env var avoids both of those, if you'd rather not type the secret
+  directly on the command line.
+- **`--admin-token <value>`** — a *separate* secret gating the [admin
+  dashboard](#admin-dashboard). Keep it different from `--token`: people you hand the
+  join password to don't necessarily need to see live abuse counters and connection
+  state. Leave unset and the admin endpoint doesn't exist at all (404, not just 401).
+  Also subject to the same TLS enforcement, minimum length, and env var
+  (`ANOMECH_RELAY_ADMIN_TOKEN`) as `--token` above.
+- **`--require-tls`** — enforces the same TLS check as above (`X-Forwarded-Proto:
+  https` or `426`) even with no `--token`/`--admin-token` set at all. A relay with no
+  password still carries session codes and full match state; this is for an operator
+  who wants everything encrypted end-to-end regardless of whether a secret is
+  involved. Applies to `/info` too, which otherwise carries nothing sensitive and
+  wouldn't need it on its own — the point is no exceptions, not case-by-case.
+- **Tuning flags**, all optional (defaults are sane for moderate public traffic; raise
+  or lower to match your actual load):
+  | Flag | Default | What it caps |
+  |---|---|---|
+  | `--max-sessions` | 500 | Live rooms process-wide |
+  | `--max-peers-per-session` | 8 | Peers in one room |
+  | `--max-connections-per-ip` | 64 | Live sockets from one source address at once, across every room. Sized with slack for CGNAT/mobile carriers sharing one IP across many real users — a public relay sees much more of this than a friend-only one, so don't set it too tight (see [Security notes](#security-notes)) |
+  | `--max-message-bytes` | 1048576 (1 MiB) | One logical message's size |
+  | `--max-messages-per-second` | 100 | Messages from one connection before it gets cut off — well above any legitimate send rate |
+  | `--max-fragments-per-message` | 2000 | Fragments allowed while assembling one message, independent of its byte size — bounds someone deliberately sending many tiny frames to burn CPU rather than a large one |
+  | `--max-failed-joins` | 10 | Failed attempts per address before a 5-minute lockout — shared across session-code guesses, wrong `--token`, and wrong `--admin-token` alike |
+  | `--log-dir` | `logs/` next to the executable | Where compressed logs are written — see [Logging](#logging) |
+  | `--log-max-bytes` | 5368709120 (5 GiB) | Total on-disk size of all log segments combined |
+
+**Put a real reverse proxy in front regardless of TLS.** `HttpListener` is a
+hand-rolled HTTP front door with far less adversarial-traffic hardening than nginx or
+Caddy, which have absorbed years of internet-facing attack traffic. For a public
+deployment this isn't optional the way it is for a friend group — see [Adding
+TLS](#adding-tls-wss), which gets you both the proxy and the cert in one step with
+Caddy.
+
+**Give the process real OS-level resource ceilings.** The systemd unit in [Option
+A](#option-a--cloud-vps-recommended) has none by default. Add to the `[Service]`
+block:
+
+```ini
+MemoryMax=512M
+LimitNOFILE=65536
+CPUQuota=80%
+```
+
+Sizes above are a starting point, not a recommendation — tune to your box. `LimitNOFILE`
+matters most: each live connection holds a file descriptor, and the OS default (often
+1024) caps you well below `--max-sessions × --max-peers-per-session` long before the
+app-level limits do anything.
+
+**A single process cannot stop a real distributed attack.** Everything above defends
+against a single bad actor or a single-source flood. A botnet spread across thousands
+of IPs sails past any per-IP cap while still exhausting the total-session limit in
+aggregate — that needs infrastructure-level DDoS protection (a host/CDN that provides
+it, e.g. Cloudflare in front). No amount of code in this process substitutes for that;
+see [Security notes](#security-notes) for the full reasoning.
+
+---
+
+## Logging
+
+On by default — everything the console prints (session lifecycle, rejections, alerts,
+summaries) also lands in a compressed log directory, plus much finer detail that would
+otherwise drown out the console (every individual rejected attempt, and every message
+broadcast — size, type, sender, how many peers it reached). Message *contents* are
+never logged, only that metadata; see [Security notes](#security-notes).
+
+Logs live in `logs/` next to the executable by default (`--log-dir` to change it,
+`--no-file-log` to disable file logging entirely and keep console-only output). Each
+segment is plain text while active and gets gzip-compressed once it hits 64 MiB; the
+oldest compressed segments are deleted as needed to keep the directory's total size
+under `--log-max-bytes` (5 GiB by default) — the currently-active segment is never
+deleted. A `journalctl`/log-rotation setup on top of this is optional, not required.
+
+**Reading back one session's logs:**
+
+```
+anomech-relay --session-log ABCD23 --log-dir logs
+```
+
+Scans every segment — live and compressed — for lines tagged with that session code
+and prints them in order. Useful for reconstructing what happened around a specific
+report (a disconnect, a suspected abuse attempt, a bug) without needing to `zgrep`
+through `.gz` files by hand.
+
+---
+
+## Admin dashboard
+
+A live text dashboard for whoever's running the relay — session/connection counts,
+per-category rejection totals, memory/GC stats. Requires `--admin-token` to be set on
+the relay (see above).
+
+```
+anomech-relay --admin --host https://relay.yourdomain.com --admin-token <the-same-value>
+```
+
+`--host` defaults to `http://localhost:<port>` if omitted, for running it on the same
+box as the relay. Refreshes every 2 seconds; Ctrl+C to exit. Nothing here requires
+running the dashboard continuously — it's a `curl`-style snapshot tool you open when
+you want to look, not a required always-on process. The same data is available as
+plain JSON at `GET /admin/stats` (with the `X-AnoMech-Admin-Token` header) if you want
+to pull it into something else.
+
+The relay also logs a one-line summary every minute on its own (session/peer/IP
+counts) and an `[ALERT]` line if rejected connections spike within a ~2s window —
+both land in the same console/journal output as everything else, no dashboard needed
+to notice something's wrong.
+
+---
+
 ## Security notes
 
-- No auth beyond the session code — anyone with the URL and a live code can join
-  (capped at 8 peers). Treat it like a party invite link; the host can't kick anyone
-  once they've joined.
-- The relay doesn't log message contents, only connection open/close and peer counts.
+- **Access control**: no auth by default — anyone with the URL and a live session code
+  can join (capped at 8 peers per session). Set `--token` to require a shared password
+  for anyone to connect at all; see [Running it as a public
+  service](#running-it-as-a-public-service), including the TLS enforcement that comes
+  with it. Trust is scoped to one session, not the whole relay: anyone who has that
+  session's code is trusted for the duration of that session, nothing more — the host
+  still can't kick a peer once they've joined it, and nothing about one session
+  carries over to another.
+- **Session-code guessing**: codes are drawn from a cryptographically random
+  generator (not a predictable PRNG), so a stranger who's observed some issued codes
+  can't predict a future one. Repeated failed joins from one address get locked out
+  for 5 minutes (`--max-failed-joins`).
+- **Resource exhaustion (the relay itself)**: caps on total sessions, peers per
+  session, connections per address, and one message's size, plus timeouts on a
+  stalled handshake or a message that never finishes arriving. All tunable via CLI
+  flags; see [Running it as a public service](#running-it-as-a-public-service).
+- **CGNAT / shared-IP collateral**: at public scale, unrelated strangers legitimately
+  share one address more often than in a friend-only deployment (mobile carriers,
+  corporate NAT). `--max-connections-per-ip` defaults with slack for this, but if you
+  see real users getting capped, raise it rather than assume it's abuse.
+- **Message impersonation**: every forwarded message is tagged with whether the
+  original sender was the room's host, so a peer who joins a session can't forge a
+  host-authoritative message (world state, run start/end, ...) — the plugin drops
+  those. Best-effort: needs both the relay and the plugin build to be reasonably
+  current (see `RelayVersion`/capabilities in `Program.cs`).
+- **It cannot be used to attack a third party.** It's TCP (WebSocket), not the
+  connectionless UDP protocols IP-spoofing reflection/amplification attacks need — you
+  can't fake a TCP source address without completing the handshake back to that faked
+  address, which the real attacker can't do. It's also not an open proxy: it never
+  opens an outbound connection anywhere a client tells it to, only ever forwarding
+  between sockets that each independently connected in. The one amplification that
+  does exist (one message fans out to up to `--max-peers-per-session - 1` others) can
+  only ever land on people already in that same session, not an arbitrary target, and
+  is bounded by the message-size cap.
+- **Volumetric/distributed attacks are out of scope for this process.** Everything
+  above stops a single bad actor. A real botnet needs infrastructure-level DDoS
+  protection in front (see [Running it as a public
+  service](#running-it-as-a-public-service)) — no in-process code can substitute for
+  that.
+- **Logging**: connection open/close, peer counts, connecting IPs, every rejection
+  reason, and every message's shape (size/type/sender/how many peers it reached) are
+  logged — compressed and capped on disk by default; see [Logging](#logging). Message
+  *contents* are never logged, only that metadata. A `--admin-token`-gated
+  `/admin/stats` endpoint and the [admin dashboard](#admin-dashboard) expose live
+  counters without needing to read logs at all.
 - Running it on a shared machine opens one more port — don't reuse a port something
   else is already listening on, and don't leave it forwarded on your router longer
   than you're actually using it.
@@ -212,3 +407,8 @@ multiplayer-supported scenario is selected) and type your relay's address into t
 `203.0.113.5:7890` without TLS) — the plugin tries `wss://` first and falls back to
 `ws://` only if that relay doesn't support it, telling you which one it used. An
 explicit `ws://`/`wss://` also works. Remembered across sessions once set.
+
+If the relay you typed requires `--token`, a **Relay password** field appears
+automatically underneath (the plugin asks the relay's plain `/info` endpoint whether
+one is needed before showing it) — also remembered across sessions. A relay with no
+token set never shows the field at all.

@@ -197,6 +197,10 @@ public sealed partial class MultiplayerManager : IDisposable
     public bool IsRunning => running;
     public string? SessionCode { get; private set; }
     public string? RelayUrl { get; private set; }
+    // Read fresh from config at Host/Join time (Plugin.Config.RelayAccessToken), then reused
+    // for the reconnect loop the same way RelayUrl is -- so a mid-session config edit can't
+    // change what an already-open reconnect attempt sends.
+    private string? relayAccessToken;
     public string DisplayName { get; set; } = "Player";
     // Set when RelayClient.Disconnected fires from a failed connect (bad scheme, relay
     // unreachable, TLS misconfig) rather than a later drop, so it's surfaced in the UI
@@ -237,6 +241,7 @@ public sealed partial class MultiplayerManager : IDisposable
         MyPeerId = Plugin.Config.LocalPeerId;
         IsHost = true;
         RelayUrl = relayUrl;
+        relayAccessToken = Plugin.Config.RelayAccessToken;
         Session = new MultiplayerSession { HostId = MyPeerId };
         Session.Names[MyPeerId] = DisplayName;
         Session.Builds[MyPeerId] = new PeerBuildInfo(PluginBuildInfo.Version, PluginBuildInfo.Checksum);
@@ -254,7 +259,7 @@ public sealed partial class MultiplayerManager : IDisposable
     // abandoned session with a late-arriving code (same guard as OnDisconnectedOffThread).
     private async Task FinishHostConnectAsync(RelayClient client)
     {
-        var code = await client.ConnectAndHostAsync(RelayUrl!);
+        var code = await client.ConnectAndHostAsync(RelayUrl!, relayAccessToken);
         if (!ReferenceEquals(relay, client)) return;
         if (code is null) return; // Disconnected already fired from inside ConnectAndHostAsync
         SessionCode = code;
@@ -269,6 +274,7 @@ public sealed partial class MultiplayerManager : IDisposable
         MyPeerId = Plugin.Config.LocalPeerId;
         IsHost = false;
         RelayUrl = relayUrl;
+        relayAccessToken = Plugin.Config.RelayAccessToken;
         SessionCode = code.Trim().ToUpperInvariant();
         Session = new MultiplayerSession();
         // Seed to "now", not the long default (0), or the host's row reads as silent for
@@ -284,7 +290,7 @@ public sealed partial class MultiplayerManager : IDisposable
 
     private async Task ConnectAndHelloAsync(string relayUrl, string code)
     {
-        await relay!.ConnectAsync(relayUrl, code);
+        await relay!.ConnectAsync(relayUrl, code, relayAccessToken);
         DiagnosticLog.Info($"[Multiplayer] Connected to relay, socket ready -- sending Hello.");
         await relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
     }
@@ -394,7 +400,7 @@ public sealed partial class MultiplayerManager : IDisposable
 
             var client = new RelayClient();
             WireRelay(client);
-            await client.ConnectAsync(relayUrl, sessionCode).ConfigureAwait(false);
+            await client.ConnectAsync(relayUrl, sessionCode, relayAccessToken).ConfigureAwait(false);
             var connected = client.IsConnected;
             DiagnosticLog.Info($"[Multiplayer] Reconnect attempt {ReconnectAttempt + 1}: {(connected ? "succeeded" : "failed")}.");
 

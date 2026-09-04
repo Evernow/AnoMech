@@ -32,21 +32,21 @@ public sealed partial class MultiplayerManager
     // Dalamud's ThreadBoundTaskScheduler doesn't run pending tasks in insertion order
     // (confirmed via AnoMech-DamageDebug dumps: a MapEffectMessage burst arrived wire-ordered
     // but executed scrambled). Draining this queue once per Tick sidesteps that scheduler.
-    private readonly ConcurrentQueue<MpMessage> pendingMessages = new();
+    private readonly ConcurrentQueue<(MpMessage Message, bool IsFromHost)> pendingMessages = new();
 
-    private void OnMessageReceivedOffThread(MpMessage message) => pendingMessages.Enqueue(message);
+    private void OnMessageReceivedOffThread(MpMessage message, bool isFromHost) => pendingMessages.Enqueue((message, isFromHost));
 
     // Skips a WorldSnapshot/RolesSnapshot when the next queued item is another of the same
     // type -- under a bad connection these can back up and replay in a burst. Only drops an
     // earlier same-type entry for a newer one right behind it; cross-type order is untouched.
     private void DrainPendingMessages()
     {
-        while (pendingMessages.TryDequeue(out var message))
+        while (pendingMessages.TryDequeue(out var entry))
         {
-            if ((message is WorldSnapshotMessage && pendingMessages.TryPeek(out var nextSnap) && nextSnap is WorldSnapshotMessage)
-                || (message is RolesSnapshotMessage && pendingMessages.TryPeek(out var nextRoles) && nextRoles is RolesSnapshotMessage))
+            if ((entry.Message is WorldSnapshotMessage && pendingMessages.TryPeek(out var next) && next.Message is WorldSnapshotMessage)
+                || (entry.Message is RolesSnapshotMessage && pendingMessages.TryPeek(out var next2) && next2.Message is RolesSnapshotMessage))
                 continue;
-            Dispatch(message);
+            Dispatch(entry.Message, entry.IsFromHost);
         }
     }
 
@@ -74,12 +74,12 @@ public sealed partial class MultiplayerManager
             BeginReconnect();
         });
 
-    private void Dispatch(MpMessage message)
+    private void Dispatch(MpMessage message, bool isFromHost)
     {
         // One malformed message must not take down the shared framework tick pump.
         try
         {
-            DispatchCore(message);
+            DispatchCore(message, isFromHost);
         }
         catch (Exception e)
         {
@@ -87,8 +87,17 @@ public sealed partial class MultiplayerManager
         }
     }
 
-    private void DispatchCore(MpMessage message)
+    private void DispatchCore(MpMessage message, bool isFromHost)
     {
+        // Drops a host-authoritative message the relay says did NOT come from this room's
+        // host -- e.g. a joined peer forging a WorldSnapshotMessage. Best-effort: an older
+        // relay can't attest to this, so RelayClient defaults isFromHost to true then (see
+        // IHostOnlyMessage's own doc comment) and this check is a no-op against one.
+        if (message is IHostOnlyMessage && !isFromHost)
+        {
+            DiagnosticLog.Warn($"[Multiplayer] Dropped {message.GetType().Name} -- relay says it wasn't from the host.");
+            return;
+        }
         // Every message type the host actually broadcasts (not a fellow peer's request the
         // relay's fan-out happens to deliver to us too) -- drives lastHostMessageMs; keep in
         // sync with the `when !IsHost` cases below. SessionEndedMessage excluded: any peer

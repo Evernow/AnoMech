@@ -20,9 +20,15 @@ public class MultiplayerWindow : Window, IDisposable
     private readonly Plugin plugin;
     private readonly MultiplayerManager mp;
     private string relayUrl;
+    private string relayToken;
     private string joinCode = "";
     private string displayName = "Player";
     private bool namePrefilled;
+    // null = not checked yet (or the check failed/relay is unreachable -- assume no token
+    // needed rather than block the UI on it). Re-checked whenever relayUrl actually changes;
+    // see DrawConnectPanel.
+    private bool? relayRequiresToken;
+    private string? relayInfoCheckedForUrl;
 
     public MultiplayerWindow(Plugin plugin) : base("AnoMech Multiplayer###AnoMechMultiplayer")
     {
@@ -32,6 +38,7 @@ public class MultiplayerWindow : Window, IDisposable
         SizeCondition = ImGuiCond.FirstUseEver;
         IsOpen = false;
         relayUrl = plugin.Configuration.RelayServerUrl;
+        relayToken = plugin.Configuration.RelayAccessToken;
         // ObjectTable.LocalPlayer is main-thread-only, but Dalamud constructs plugins
         // off-thread -- prefill lazily in Draw() instead, once.
     }
@@ -145,6 +152,30 @@ public class MultiplayerWindow : Window, IDisposable
                     ? "Enter your relay's address, e.g. relay.example.com or 203.0.113.5:7890"
                     : "Doesn't look like a valid relay address.");
         }
+        // Re-checked once per distinct valid URL (not every frame/keystroke) via a plain HTTP
+        // GET, no token needed to ask -- see RelayClient.FetchInfoAsync. Unreachable/old-relay
+        // failures default to "no token needed" rather than blocking the form on it.
+        else if (relayInfoCheckedForUrl != relayUrl)
+        {
+            relayInfoCheckedForUrl = relayUrl;
+            relayRequiresToken = null;
+            var urlSnapshot = relayUrl;
+            _ = RelayClient.FetchInfoAsync(urlSnapshot).ContinueWith(t =>
+            {
+                if (t.Result is { } info)
+                    Plugin.Framework.Run(() => { if (relayInfoCheckedForUrl == urlSnapshot) relayRequiresToken = info.RequiresToken; });
+            });
+        }
+
+        if (relayRequiresToken == true)
+        {
+            ImGui.SetNextItemWidth(300);
+            if (ImGui.InputText("Relay password##relayToken", ref relayToken, 128, ImGuiInputTextFlags.Password))
+            {
+                plugin.Configuration.RelayAccessToken = relayToken;
+                plugin.Configuration.Save();
+            }
+        }
 
         ImGui.SetNextItemWidth(200);
         ImGui.InputText("Display name", ref displayName, 64);
@@ -160,8 +191,10 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), endReason);
         }
 
+        var missingRequiredToken = relayRequiresToken == true && string.IsNullOrEmpty(relayToken);
+
         ImGui.Spacing();
-        ImGui.BeginDisabled(!validUrl);
+        ImGui.BeginDisabled(!validUrl || missingRequiredToken);
         if (ImGui.Button("Host new session"))
         {
             mp.DisplayName = displayName;
@@ -173,7 +206,7 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.SetNextItemWidth(140);
         ImGui.InputText("##joincode", ref joinCode, 16, ImGuiInputTextFlags.CharsUppercase);
         ImGui.SameLine();
-        ImGui.BeginDisabled(!validUrl || string.IsNullOrWhiteSpace(joinCode));
+        ImGui.BeginDisabled(!validUrl || missingRequiredToken || string.IsNullOrWhiteSpace(joinCode));
         if (ImGui.Button("Join session"))
         {
             mp.DisplayName = displayName;
