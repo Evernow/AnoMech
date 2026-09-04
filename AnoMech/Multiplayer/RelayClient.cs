@@ -14,6 +14,13 @@ using AnoMech.Core;
 
 namespace AnoMech.Multiplayer;
 
+// Thrown when the relay explicitly rejects a connection with a WS close frame right after the
+// upgrade (see ReadGreetingAsync) -- almost always "session not found" because the relay
+// restarted and forgot every room. Distinct from a transient/network failure: retrying the
+// exact same session code will never succeed, so a caller (see MultiplayerManager's reconnect
+// loop) should stop and tell the user, not keep backing off forever.
+internal sealed class RelaySessionRejectedException(string reason) : Exception(reason);
+
 // Thin ClientWebSocket wrapper talking to AnoMech.Relay (see Relay/README.md). The relay
 // only forwards opaque frames; message meaning lives in MpMessage/Protocol.cs. The frame's
 // WebSocket message type doubles as the compression flag: Text = raw UTF-8 JSON, Binary =
@@ -222,6 +229,7 @@ public sealed class RelayClient : IDisposable
     private async Task<string?> ReadGreetingAsync()
     {
         var buffer = new byte[1024];
+        WebSocketReceiveResult result;
         try
         {
             var receiveTask = socket.ReceiveAsync(buffer, cts.Token);
@@ -230,14 +238,34 @@ public sealed class RelayClient : IDisposable
                 DiagnosticLog.Warn("[RelayClient] No greeting from the relay within timeout -- assuming an old relay with no advertised capabilities.");
                 return null;
             }
-            var result = await receiveTask.ConfigureAwait(false);
+            result = await receiveTask.ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            DiagnosticLog.Warn($"[RelayClient] Failed to read the relay's greeting: {e.Message} -- assuming an old relay with no advertised capabilities.");
+            return null;
+        }
+
+        // The relay accepts the WS upgrade BEFORE it validates the session code (see
+        // Program.cs's HandleConnectionAsync -- TryJoin/TryCreateSession run after
+        // AcceptWebSocketAsync, not before), so a rejected /session/<code> or /host arrives
+        // HERE as a close frame, not as malformed JSON. Most commonly this means the relay
+        // itself restarted and no longer has any memory of the session at all -- a real,
+        // permanent rejection, not "an old relay with no greeting." Surfacing it distinctly
+        // (rather than falling into the same catch-all as a genuine JSON parse failure) is
+        // what lets the reconnect loop tell "give up and say so" apart from "keep retrying."
+        if (result.MessageType == WebSocketMessageType.Close)
+            throw new RelaySessionRejectedException(socket.CloseStatusDescription ?? "the relay closed the connection");
+
+        try
+        {
             var greeting = JsonSerializer.Deserialize<RelayGreeting>(buffer.AsSpan(0, result.Count), JsonOptions);
             if (greeting is null) return null;
             RelayCapabilities = greeting.Capabilities is { } caps ? new HashSet<string>(caps) : new HashSet<string>();
             DiagnosticLog.Info($"[RelayClient] Relay version {greeting.RelayVersion}, capabilities: [{string.Join(", ", RelayCapabilities)}].");
             return greeting.SessionCode;
         }
-        catch (Exception e)
+        catch (JsonException e)
         {
             DiagnosticLog.Warn($"[RelayClient] Failed to read the relay's greeting: {e.Message} -- assuming an old relay with no advertised capabilities.");
             return null;

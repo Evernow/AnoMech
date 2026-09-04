@@ -400,9 +400,35 @@ public sealed partial class MultiplayerManager : IDisposable
 
             var client = new RelayClient();
             WireRelay(client);
+            // Captured directly, not via OnDisconnectedOffThread -- that handler ignores this
+            // client until it's actually installed as `relay` (see its own ReferenceEquals
+            // guard), so it's the wrong place to learn WHY this particular attempt failed.
+            Exception? failure = null;
+            client.Disconnected += e => failure = e;
             await client.ConnectAsync(relayUrl, sessionCode, relayAccessToken).ConfigureAwait(false);
             var connected = client.IsConnected;
             DiagnosticLog.Info($"[Multiplayer] Reconnect attempt {ReconnectAttempt + 1}: {(connected ? "succeeded" : "failed")}.");
+
+            if (!connected && failure is RelaySessionRejectedException rejected)
+            {
+                // The relay is reachable and has explicitly said this session doesn't exist --
+                // most likely it restarted and forgot every room. Retrying the same code can
+                // never succeed, so stop looping (this used to retry every 15s forever with
+                // nothing to show for it -- see AnoMech-DamageDebug transcripts) and tell the
+                // user plainly instead of leaving them staring at "Reconnect attempt N" forever.
+                client.Dispose();
+                DiagnosticLog.Warn($"[Multiplayer] Giving up on session {sessionCode} -- relay says: {rejected.Message}.");
+                var wasHost = IsHost;
+                _ = Plugin.Framework.Run(() =>
+                {
+                    LeaveSessionInternal(notifyOthers: false);
+                    SessionEndReason = wasHost
+                        ? $"The relay lost this session ({rejected.Message}) -- start a new one."
+                        : $"The relay lost this session ({rejected.Message}) -- ask the host to start a new one.";
+                    LobbyChanged?.Invoke();
+                });
+                return;
+            }
 
             _ = Plugin.Framework.Run(() => FinishReconnectAttempt(client, connected, token));
             if (connected) return;
