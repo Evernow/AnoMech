@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
@@ -6,6 +7,7 @@ using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 
 namespace AnoMech.Relay;
 
@@ -118,6 +120,12 @@ internal static class Program
     private sealed class Room
     {
         public readonly List<WebSocket> Peers = new();
+        // Guards this room's own Peers/LastActivityUtc only -- NOT the Sessions table below.
+        // One lock per room (not one relay-wide lock) so unrelated sessions never contend with
+        // each other on join/leave/broadcast; only two operations touching the SAME session
+        // ever serialize against one another. See TryJoin/Leave for why Sessions removal also
+        // has to happen while holding this lock, not the table's own (lock-free) operations.
+        public readonly object Lock = new();
         // Whoever created the room, tagged onto every broadcast from them (see
         // BroadcastAsync) so a receiving client can tell a real host message from a joined
         // peer forging one.
@@ -125,8 +133,7 @@ internal static class Program
         public DateTime LastActivityUtc = DateTime.UtcNow;
     }
 
-    private static readonly Dictionary<string, Room> Sessions = new();
-    private static readonly object SessionsLock = new();
+    private static readonly ConcurrentDictionary<string, Room> Sessions = new();
 
     // Per-IP abuse tracking, separate lock since it's touched on a different cadence
     // (every connection/join attempt) than the session table.
@@ -223,6 +230,9 @@ internal static class Program
             var logDir = GetArg(args, "--log-dir") ?? Path.Combine(AppContext.BaseDirectory, "logs");
             var maxLogBytes = long.TryParse(GetArg(args, "--log-max-bytes"), out var mlb) ? mlb : 5L * 1024 * 1024 * 1024;
             RelayLog.Configure(logDir, maxLogBytes);
+            // Log writes are buffered and flushed roughly once a second (see RelayLog) -- catch
+            // a graceful shutdown (systemd stop, Ctrl+C) so the last stretch isn't silently lost.
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => RelayLog.FlushOnShutdown();
             RelayLog.Info($"[AnoMech.Relay] Logging to {logDir} (compressed, capped at {maxLogBytes / (1024.0 * 1024 * 1024):F1} GB). " +
                            "Use --session-log <code> to read back one session's lines.");
         }
@@ -606,45 +616,53 @@ internal static class Program
     }
 
     // Peer-join only -- a code nobody actually hosted is rejected immediately instead of
-    // silently vivifying an empty room.
+    // silently vivifying an empty room. Loops rather than a single TryGetValue+lock because
+    // Leave() can retire (empty + remove) this exact room between the lookup and acquiring its
+    // lock; the re-check inside the lock catches that race and retries against whatever's
+    // actually current instead of joining a room that's already been thrown away.
     private static bool TryJoin(string sessionCode, WebSocket socket, out string reason)
     {
-        lock (SessionsLock)
+        while (true)
         {
             if (!Sessions.TryGetValue(sessionCode, out var room))
             {
                 reason = "session not found";
                 return false;
             }
-            if (room.Peers.Count >= MaxPeersPerSession)
+            lock (room.Lock)
             {
-                reason = "session full";
-                return false;
+                if (!Sessions.TryGetValue(sessionCode, out var current) || !ReferenceEquals(current, room))
+                    continue; // retired (or replaced) concurrently -- retry against the live one
+                if (room.Peers.Count >= MaxPeersPerSession)
+                {
+                    reason = "session full";
+                    return false;
+                }
+                room.Peers.Add(socket);
+                room.LastActivityUtc = DateTime.UtcNow;
+                reason = "";
+                return true;
             }
-            room.Peers.Add(socket);
-            room.LastActivityUtc = DateTime.UtcNow;
-            reason = "";
-            return true;
         }
     }
 
     private static bool TryCreateSession(WebSocket hostSocket, out string sessionCode)
     {
-        lock (SessionsLock)
+        // A soft cap now, not a hard one -- a burst of concurrent /host requests right at the
+        // ceiling could transiently overshoot it by a few. MaxTotalSessions exists to bound
+        // resource usage, not as a security invariant, so this is an acceptable trade for not
+        // needing a relay-wide lock on every session creation.
+        if (Sessions.Count >= MaxTotalSessions)
         {
-            if (Sessions.Count >= MaxTotalSessions)
-            {
-                sessionCode = "";
-                return false;
-            }
-            string code;
-            do { code = GenerateCode(); } while (Sessions.ContainsKey(code));
-            var room = new Room { HostSocket = hostSocket };
-            room.Peers.Add(hostSocket);
-            Sessions[code] = room;
-            sessionCode = code;
-            return true;
+            sessionCode = "";
+            return false;
         }
+        var room = new Room { HostSocket = hostSocket };
+        room.Peers.Add(hostSocket);
+        string code;
+        do { code = GenerateCode(); } while (!Sessions.TryAdd(code, room));
+        sessionCode = code;
+        return true;
     }
 
     private static string GenerateCode()
@@ -660,18 +678,21 @@ internal static class Program
 
     private static void Leave(string sessionCode, WebSocket socket)
     {
-        lock (SessionsLock)
+        if (!Sessions.TryGetValue(sessionCode, out var room)) return;
+        // Removal from Sessions happens while still holding this room's own lock -- the one
+        // point that has to agree with TryJoin's re-check above, so a peer can never be added
+        // to a room in the instant between it going empty and being removed from the table.
+        lock (room.Lock)
         {
-            if (!Sessions.TryGetValue(sessionCode, out var room)) return;
             room.Peers.Remove(socket);
-            if (room.Peers.Count == 0) Sessions.Remove(sessionCode);
+            if (room.Peers.Count == 0) Sessions.TryRemove(new KeyValuePair<string, Room>(sessionCode, room));
         }
     }
 
     private static int CountPeers(string sessionCode)
     {
-        lock (SessionsLock)
-            return Sessions.TryGetValue(sessionCode, out var room) ? room.Peers.Count : 0;
+        if (!Sessions.TryGetValue(sessionCode, out var room)) return 0;
+        lock (room.Lock) return room.Peers.Count;
     }
 
     private static async Task SendGreetingAsync(WebSocket socket, string? assignedSessionCode)
@@ -774,12 +795,8 @@ internal static class Program
 
     private static AdminStats BuildAdminStats()
     {
-        int sessionCount, totalPeers;
-        lock (SessionsLock)
-        {
-            sessionCount = Sessions.Count;
-            totalPeers = Sessions.Values.Sum(r => r.Peers.Count);
-        }
+        var sessionCount = Sessions.Count;
+        var totalPeers = Sessions.Values.Sum(r => { lock (r.Lock) return r.Peers.Count; });
         int ipCount, lockoutCount;
         lock (AbuseLock)
         {
@@ -809,13 +826,16 @@ internal static class Program
         {
             await Task.Delay(ReapInterval);
             List<(string Code, List<WebSocket> Peers)> dead = new();
-            lock (SessionsLock)
+            // Enumerating a ConcurrentDictionary while calling TryRemove on it is safe (unlike
+            // a plain Dictionary) -- no snapshot copy needed first.
+            var cutoff = DateTime.UtcNow - IdleTimeout;
+            foreach (var (code, room) in Sessions)
             {
-                var cutoff = DateTime.UtcNow - IdleTimeout;
-                foreach (var (code, room) in Sessions.Where(kv => kv.Value.LastActivityUtc < cutoff).ToList())
+                lock (room.Lock)
                 {
+                    if (room.LastActivityUtc >= cutoff) continue;
                     dead.Add((code, new List<WebSocket>(room.Peers)));
-                    Sessions.Remove(code);
+                    Sessions.TryRemove(new KeyValuePair<string, Room>(code, room));
                 }
             }
             foreach (var (code, peers) in dead)
@@ -865,11 +885,13 @@ internal static class Program
     // shape (see the Detail call in HandleConnectionAsync) without needing its own session lookup.
     private static async Task<int> BroadcastAsync(string sessionCode, WebSocket sender, byte[] bytes, WebSocketMessageType type)
     {
+        if (!Sessions.TryGetValue(sessionCode, out var room)) return 0;
         List<WebSocket> targets;
         bool isFromHost;
-        lock (SessionsLock)
+        // Only THIS room's lock, not a relay-wide one -- unrelated sessions broadcasting at the
+        // same time never contend with each other here, only two sends to the same session would.
+        lock (room.Lock)
         {
-            if (!Sessions.TryGetValue(sessionCode, out var room)) return 0;
             room.LastActivityUtc = DateTime.UtcNow;
             isFromHost = ReferenceEquals(sender, room.HostSocket);
             targets = room.Peers.Where(p => !ReferenceEquals(p, sender) && p.State == WebSocketState.Open).ToList();
@@ -886,8 +908,14 @@ internal static class Program
         Interlocked.Increment(ref totalMessagesBroadcast);
         Interlocked.Add(ref totalBytesBroadcast, tagged.Length * (long)targets.Count);
 
+        // One shared CancellationTokenSource for the whole fan-out instead of one per target --
+        // every send below starts at essentially the same instant (WhenAll launches them all
+        // before awaiting), so a shared deadline is functionally identical to a per-target one
+        // while costing O(1) timer/CTS allocations per broadcast instead of O(peers). At
+        // hundreds of sessions this adds up fast otherwise (see README's Security notes).
+        using var cts = new CancellationTokenSource(SendTimeout);
         // Parallel, not sequential -- one slow peer must not delay delivery to everyone else.
-        await Task.WhenAll(targets.Select(target => SendOneAsync(target, tagged, type)));
+        await Task.WhenAll(targets.Select(target => SendOneAsync(target, tagged, type, cts.Token)));
         return targets.Count;
     }
 
@@ -895,12 +923,11 @@ internal static class Program
     // cancelled send can leave a half-written frame in the OS buffer, and reusing the
     // connection risks interleaving a fresh frame with that leftover -- corrupting the
     // stream from then on. Abort lets both sides' own receive loops notice and clean up.
-    private static async Task SendOneAsync(WebSocket target, byte[] bytes, WebSocketMessageType type)
+    private static async Task SendOneAsync(WebSocket target, byte[] bytes, WebSocketMessageType type, CancellationToken timeout)
     {
-        using var cts = new CancellationTokenSource(SendTimeout);
         try
         {
-            await target.SendAsync(bytes, type, endOfMessage: true, cts.Token);
+            await target.SendAsync(bytes, type, endOfMessage: true, timeout);
         }
         catch (OperationCanceledException)
         {
@@ -1008,7 +1035,6 @@ internal static class RelayLog
 {
     private static string? logDir;
     private static long maxTotalBytes;
-    private static readonly object FileLock = new();
     private static StreamWriter? activeWriter;
     private static string? activeFilePath;
     private static long activeBytesWritten;
@@ -1018,12 +1044,52 @@ internal static class RelayLog
     // budget, and keeps each rotation's compression work modest.
     private const long RotateThresholdBytes = 64 * 1024 * 1024;
 
+    // Producers (Info/Warn/Detail, called from every connection's own async flow) only ever
+    // enqueue a string -- no lock, no disk I/O, on that path. A single background task is the
+    // only thing that ever touches the file, so it needs no locking either. At hundreds of
+    // sessions all broadcasting, this is what keeps logging from becoming the actual bottleneck
+    // (it used to be a synchronous, AutoFlush=true write under one relay-wide lock, shared by
+    // literally every connection).
+    // Bounded, not unbounded: a stuck/full disk should drop log lines rather than let the queue
+    // grow without limit and eventually pressure the process's own memory. Capacity is generous
+    // relative to realistic burst rates -- dropping is the rare, "something's already wrong" case.
+    private static readonly Channel<string> Queue = Channel.CreateBounded<string>(
+        new BoundedChannelOptions(20_000) { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.DropWrite });
+    private static long droppedLines;
+
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
+    private static DateTime lastFlushUtc = DateTime.UtcNow;
+
     public static void Configure(string directory, long maxBytes)
     {
         logDir = directory;
         maxTotalBytes = maxBytes;
         Directory.CreateDirectory(logDir);
         OpenNewActiveFile();
+        _ = RunWriterLoopAsync();
+    }
+
+    // The only place that touches activeWriter/activeBytesWritten/rotation/compression --
+    // single-reader by construction (see Queue above), so none of that needs its own lock.
+    private static async Task RunWriterLoopAsync()
+    {
+        await foreach (var line in Queue.Reader.ReadAllAsync())
+        {
+            activeWriter!.WriteLine(line);
+            activeBytesWritten += line.Length + 2;
+
+            // Batches flushes instead of one disk write per line (what AutoFlush did) --
+            // still bounds how stale the file can be to ~1s, without paying a syscall per
+            // message broadcast under real load.
+            if (DateTime.UtcNow - lastFlushUtc >= FlushInterval)
+            {
+                activeWriter.Flush();
+                lastFlushUtc = DateTime.UtcNow;
+            }
+
+            if (activeBytesWritten >= RotateThresholdBytes)
+                Rotate();
+        }
     }
 
     private static void OpenNewActiveFile()
@@ -1033,7 +1099,7 @@ internal static class RelayLog
         // --session-log can open and read the still-active segment while the relay keeps
         // writing to it, instead of hitting a sharing-violation IOException.
         var stream = new FileStream(activeFilePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
-        activeWriter = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+        activeWriter = new StreamWriter(stream, Encoding.UTF8);
         activeBytesWritten = 0;
     }
 
@@ -1059,23 +1125,28 @@ internal static class RelayLog
     {
         if (logDir == null) return; // file logging disabled (--no-file-log) -- console-only.
         var line = $"{DateTime.UtcNow:O} [{level}] {message}";
-        lock (FileLock)
-        {
-            activeWriter!.WriteLine(line);
-            activeBytesWritten += line.Length + 2;
-            if (activeBytesWritten >= RotateThresholdBytes)
-                Rotate();
-        }
+        if (!Queue.Writer.TryWrite(line))
+            Interlocked.Increment(ref droppedLines);
     }
 
-    // Caller already holds FileLock.
+    // Called from the writer loop only.
     private static void Rotate()
     {
         activeWriter!.Dispose();
         var finished = activeFilePath!;
         OpenNewActiveFile();
+        var dropped = Interlocked.Exchange(ref droppedLines, 0);
+        if (dropped > 0) activeWriter!.WriteLine($"{DateTime.UtcNow:O} [WARN] {dropped} log line(s) dropped -- write queue was full.");
         CompressAndDelete(finished);
         EnforceCap();
+    }
+
+    // Best-effort flush for a graceful shutdown (see Main's ProcessExit hook) -- anything still
+    // sitting in the queue at the instant of a hard kill is lost either way, same tradeoff any
+    // buffered logger makes.
+    public static void FlushOnShutdown()
+    {
+        try { activeWriter?.Flush(); } catch { /* best effort */ }
     }
 
     private static void CompressAndDelete(string path)
