@@ -246,7 +246,7 @@ anomech-relay --port 7890 --token <shared-secret> --admin-token <a-different-sec
   | `--max-peers-per-session` | 8 | Peers in one room |
   | `--max-connections-per-ip` | 64 | Live sockets from one source address at once, across every room. Sized with slack for CGNAT/mobile carriers sharing one IP across many real users — a public relay sees much more of this than a friend-only one, so don't set it too tight (see [Security notes](#security-notes)) |
   | `--max-message-bytes` | 1048576 (1 MiB) | One logical message's size |
-  | `--max-messages-per-second` | 100 | Messages from one connection before it gets cut off — well above any legitimate send rate |
+  | `--max-messages-per-second` | 5000 | Messages from one connection before it gets cut off — well above any legitimate send rate |
   | `--max-fragments-per-message` | 2000 | Fragments allowed while assembling one message, independent of its byte size — bounds someone deliberately sending many tiny frames to burn CPU rather than a large one |
   | `--max-failed-joins` | 10 | Failed attempts per address before a 5-minute lockout — shared across session-code guesses, wrong `--token`, and wrong `--admin-token` alike |
   | `--log-dir` | `logs/` next to the executable | Where compressed logs are written — see [Logging](#logging) |

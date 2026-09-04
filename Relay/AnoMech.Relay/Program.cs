@@ -49,7 +49,7 @@ internal static class Program
     // Per-connection message rate cap -- well above any legitimate send rate (position/
     // snapshot updates top out in the tens of Hz), but bounds a connection sending far faster
     // than any real client would (packet flooding / gameplay-command-spam class of abuse).
-    private static int MaxMessagesPerSecond = 100;
+    private static int MaxMessagesPerSecond = 5000;
 
     // Fragments allowed while assembling ONE message, independent of MaxMessageBytes -- a
     // real client's sends arrive as whatever chunk size the OS socket buffer gives, nowhere
