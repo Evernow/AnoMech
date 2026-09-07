@@ -1,11 +1,8 @@
 using System;
-using System.Collections.Generic;
+using AnoMech.Core.Native;
 using Dalamud.Hooking;
 using FFXIVClientStructs.FFXIV.Client.Game.Event;
 using FFXIVClientStructs.FFXIV.Client.Game.InstanceContent;
-using FFXIVClientStructs.FFXIV.Client.LayoutEngine;
-using FFXIVClientStructs.FFXIV.Client.LayoutEngine.Group;
-using FFXIVClientStructs.FFXIV.Client.LayoutEngine.Node;
 
 namespace AnoMech.Core.Map;
 
@@ -125,75 +122,9 @@ internal sealed unsafe class MapEffects : IDisposable
 
     private static string Format(ContentDirector.MapEffectItem item) => $"LayoutId=0x{item.LayoutId:X} State=0x{item.State:X} Flags=0x{item.Flags:X}";
 
-    private static string ReadSharedGroupInstanceState(uint layoutId)
-    {
-        var world = LayoutWorld.Instance();
-        if (world == null) return "LayoutWorld null";
-        var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
-        if (instance == null) return "GetLayoutInstance returned null (no such SharedGroup instance on this client)";
-        var sg = (SharedGroupLayoutInstance*)instance;
-        // HavePrimary/IsPrimaryLoaded/IsPrimaryReady only say the object exists and finished
-        // loading -- they say nothing about whether the engine actually considers it active or
-        // draws it. IsActive (ILayoutInstance.Flags3 bit4) and WantToBeActive() are the real
-        // activation state; GetGraphics() returning null despite IsPrimaryReady=True would mean
-        // the renderable scene object was never actually created, which no prior check here
-        // could have caught.
-        var graphics = instance->GetGraphics();
-        var graphics2 = instance->GetGraphics2();
-        // Every static field above (State/Flags/readiness/IsActive/WantToBeActive) has come back
-        // identical between host and guest across multiple test pairs despite the guest's arena
-        // staying visually wrong -- so the remaining gap has to be in something none of those
-        // fields represent: whether the reveal/hide is an ANIMATED transition (via this object's
-        // own timeline) that has to actually play frame-by-frame to become visible, as opposed to
-        // an instant property flip. TimelineObject null would mean this SGB has no timeline data
-        // at all; IsTimelinePlaying(PlayingTimelineIndex) false despite a just-issued "show" call
-        // would mean the state was set but the animation that visually reveals it never started.
-        var timelinePlaying = sg->IsTimelinePlaying(sg->PlayingTimelineIndex);
-        // Graphics/Graphics2 on the top-level SharedGroupLayoutInstance read null even on the
-        // host where the arena renders fine -- the actual renderable mesh belongs to the CHILD
-        // instances nested in Instances (a prefab's placed BgParts etc.), which no check above
-        // has ever looked at. If a child's own HavePrimary/IsPrimaryLoaded/Graphics diverges
-        // between host and guest despite the parent SharedGroup matching exactly, that's the
-        // real gap -- the parent can report full success while an individual child silently
-        // fails to load/render.
-        // Capped at 6 previously -- index 0x0 (the big early container piece) has 14 children
-        // and none of the first 6 were the actual BgPart geometry type, while 4 of the 6 were
-        // themselves nested SharedGroups whose own children were never inspected. Raised to 16
-        // (matches the engine's own FixedSizeArray16 convention elsewhere) and now recurses one
-        // level into any SharedGroup child, since that nested level is exactly where this
-        // container's real geometry pieces most likely live.
-        var childCount = sg->Instances.Instances.Count;
-        var childSummaries = new List<string>();
-        for (var i = 0; i < childCount && i < 16; i++)
-        {
-            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
-            var childInstance = child != null ? child->Instance : null;
-            childSummaries.Add($"[{i}]={FormatChild(childInstance, depth: 1)}");
-        }
-        return $"HavePrimary={instance->HavePrimary()} IsPrimaryLoaded={instance->IsPrimaryLoaded()} IsPrimaryReady={instance->IsPrimaryReady()} "
-             + $"IsActive={instance->IsActive} WantToBeActive={instance->WantToBeActive()} Graphics=0x{(nint)graphics:X} Graphics2=0x{(nint)graphics2:X} "
-             + $"TimelineObject=0x{(nint)sg->TimelineObject:X} PlayingTimelineIndex=0x{sg->PlayingTimelineIndex:X} IsTimelinePlaying={timelinePlaying} "
-             + $"PrefabFlags1=0x{sg->PrefabFlags1:X} PrefabFlags2=0x{sg->PrefabFlags2:X} ChildCount={childCount} Children=[{string.Join("; ", childSummaries)}]";
-    }
-
-    private static string FormatChild(ILayoutInstance* childInstance, int depth)
-    {
-        if (childInstance == null) return "null";
-        var childGraphics = childInstance->GetGraphics();
-        var summary = $"Type={childInstance->Id.Type} HavePrimary={childInstance->HavePrimary()} "
-            + $"IsPrimaryLoaded={childInstance->IsPrimaryLoaded()} IsActive={childInstance->IsActive} Graphics=0x{(nint)childGraphics:X}";
-        if (depth <= 0 || childInstance->Id.Type != InstanceType.SharedGroup) return summary;
-        var nested = (SharedGroupLayoutInstance*)childInstance;
-        var nestedCount = nested->Instances.Instances.Count;
-        var nestedSummaries = new List<string>();
-        for (var i = 0; i < nestedCount && i < 16; i++)
-        {
-            var nestedChild = (ChildNodeInstance*)nested->Instances.Instances[i].Value;
-            var nestedInstance = nestedChild != null ? nestedChild->Instance : null;
-            nestedSummaries.Add($"[{i}]={FormatChild(nestedInstance, depth: depth - 1)}");
-        }
-        return $"{summary} NestedChildCount={nestedCount} NestedChildren=[{string.Join("; ", nestedSummaries)}]";
-    }
+    // Extracted to AnoMech.Core.Native.LayoutInstanceDiagnostics -- SimEventObject needs the
+    // identical check (see its own doc comment), so this is no longer MapEffects-specific.
+    private static string ReadSharedGroupInstanceState(uint layoutId) => LayoutInstanceDiagnostics.Describe(layoutId);
 
     public void Dispose()
     {

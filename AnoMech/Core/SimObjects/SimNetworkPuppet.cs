@@ -139,7 +139,19 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
         }
     }
 
-    public void Knockback(Vector3 source, float distance, float speed) => Movement.Knockback(source, distance, speed);
+    // Knockback on this puppet only moves the host's local cosmetic copy -- it never reaches
+    // the peer's own real character (whose position this puppet mirrors FROM, not the other
+    // way around). MultiplayerManager polls this to broadcast a KnockbackMessage telling the
+    // owning peer to apply it to their real character.
+    public (Vector3 Source, float Distance, float Speed)? PendingNetworkKnockback { get; private set; }
+
+    public void Knockback(Vector3 source, float distance, float speed)
+    {
+        Movement.Knockback(source, distance, speed);
+        PendingNetworkKnockback = (source, distance, speed);
+    }
+
+    public void ClearPendingNetworkKnockback() => PendingNetworkKnockback = null;
 
     public void OnKilled()
     {

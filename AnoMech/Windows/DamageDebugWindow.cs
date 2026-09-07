@@ -177,17 +177,11 @@ internal sealed class DamageDebugWindow : Window, IDisposable
         DumpToFile();
     }
 
-    // Writes the AOE that just killed someone to a plain-text file next to the
-    // plugin DLL -- a screenshot of the heatmap isn't always practical to share, but
-    // a text file is. Re-derives the Action sheet's own shape fields (CastType/
-    // EffectRange/XAxisModifier) the same way CharacterFind.InsideActionAoe does, and
-    // re-runs the SAME query against every party member (dead ones included, via
-    // AllMembers -- Find/ActiveMembers would already exclude whoever this query just
-    // killed) so the dump shows exactly who was inside the shape. Also called
-    // periodically by Game.Tick (see PeriodicDumpInterval) so the file reflects
-    // near-live state even on a run where nobody dies -- a visually-observed
-    // problem ("the bot clipped the party") needs the same trace a death would
-    // have gotten, and waiting for an actual kill isn't always an option.
+    // Records a party/AOE state snapshot into DiagnosticLog's persistent log. Re-derives the
+    // Action sheet's own shape fields the same way CharacterFind.InsideActionAoe does, and
+    // re-runs the same query against every party member (dead ones included, via AllMembers)
+    // so the snapshot shows who was inside the shape. Also called periodically by Game.Tick so
+    // near-live state is captured even on a run where nobody dies.
     internal void DumpToFile()
     {
         try
@@ -274,34 +268,11 @@ internal sealed class DamageDebugWindow : Window, IDisposable
                 }
             sb.AppendLine();
 
-            // Folds in whatever's been logged through DiagnosticLog this run (moves, AOE
-            // resolves, casts, deaths, status changes, plus scenario-specific tracing) --
-            // so a bug report is one file instead of this dump plus a separately pasted
-            // Dalamud log.
-            var diag = AnoMech.Core.DiagnosticLog.Snapshot();
-            sb.AppendLine($"Diagnostic log this run ({diag.Count} lines):");
-            if (diag.Count == 0)
-                sb.AppendLine("  (none captured)");
-            else
-                foreach (var line in diag)
-                    sb.AppendLine($"  {line}");
-
-            // Earlier runs this session (see DiagnosticLog.ArchivedHistory) -- appended
-            // after the live section above so the file keeps every run instead of a
-            // scenario switch silently discarding whatever the previous one logged.
-            var archived = AnoMech.Core.DiagnosticLog.ArchivedHistory();
-            if (archived.Length > 0)
-            {
-                sb.AppendLine();
-                sb.AppendLine("=== Earlier runs this session ===");
-                sb.Append(archived);
-            }
-
-            var dir = Plugin.PluginInterface.AssemblyLocation.DirectoryName;
-            if (dir == null) return;
-            var path = Path.Combine(dir, "AnoMech-DamageDebug.txt");
-            File.WriteAllText(path, sb.ToString());
-            Plugin.Log.Information($"[DamageDebugWindow] Wrote damage debug dump to {path}");
+            // Routed into DiagnosticLog's own persistent log (see LogSnapshot) instead of a
+            // second file -- per-tick log lines are already written there continuously, so a
+            // bug report is one file either way, and every snapshot this produces is now kept,
+            // not just the latest.
+            AnoMech.Core.DiagnosticLog.LogSnapshot("Damage Debug Snapshot", sb.ToString());
         }
         catch (Exception ex)
         {

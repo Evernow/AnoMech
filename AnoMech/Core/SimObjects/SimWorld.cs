@@ -126,12 +126,21 @@ public sealed class SimWorld : ISimObject, IDisposable
     public bool IsOutsideArena(Vector3 local)
         => children.OfType<SimArenaBoundary>().FirstOrDefault()?.IsOutside(local) ?? false;
 
+    // Host -> everyone: a scenario's event timeline is host-only, so without this a peer never
+    // spawns this VFX -- an omen isn't a SimObject the snapshot sync walks, and it's not a
+    // native MapEffect/DirectorUpdate either. MultiplayerManager subscribes only while host,
+    // so a peer's own replayed SpawnOmen call doesn't re-fire and loop.
+    public event Action<string, Placement, Vector3, float>? OmenSpawned;
+
     // Spawns a standalone AOE telegraph (omen StaticVfx) that auto-expires after
     // `durationSeconds` and is cleaned up on world reset. `placement` is scenario-local
     // (like the rest of the SimXxx API); SimOmen lifts it to world coords. `scale`
     // follows SimOmen's convention: scale.X = halfWidth, scale.Z = length for rect omens.
     public void SpawnOmen(string path, Placement placement, Vector3 scale, float durationSeconds)
-        => children.Add(new SimOmen(Coordinates, path, placement, scale, durationSeconds));
+    {
+        children.Add(new SimOmen(Coordinates, path, placement, scale, durationSeconds));
+        OmenSpawned?.Invoke(path, placement, scale, durationSeconds);
+    }
 
     // Change the active weather mid-scenario. weatherId is a Weather-sheet row;
     // transition is the fade-in time in seconds. A scenario's default weather

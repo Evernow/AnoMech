@@ -70,7 +70,7 @@ public sealed class Game : IDisposable
     private readonly OpcodeUpdater opcodeUpdater;
 
 #if DEBUG
-    // Keeps AnoMech-DamageDebug.txt reflecting near-live state through Tick, not
+    // Keeps a near-live damage-debug snapshot flowing into DiagnosticLog through Tick, not
     // just the one auto-freeze on first death -- a run where nobody dies but
     // something still visibly went wrong needs the same trace available. Ticks
     // unconditionally (see the Tick() call site) so it also covers everything
@@ -220,9 +220,20 @@ public sealed class Game : IDisposable
         // check too (TeleportPlayerToSpawnIfOutsideArena no-ops with no boundary).
         if (!isPeer)
         {
-            zone.Run(World);
-            phase.Run(World);
-            scenario.Run(World, selectedAi);
+            // Log-and-rethrow only -- changes no behavior, just makes an exception here
+            // (previously invisible to our own log, only reaching Dalamud's handler) show up
+            // with a "why".
+            try
+            {
+                zone.Run(World);
+                phase.Run(World);
+                scenario.Run(World, selectedAi);
+            }
+            catch (Exception e)
+            {
+                AnoMech.Core.DiagnosticLog.Warn($"[Game.RunScenarioInternal] zone/phase/scenario.Run threw -- scenario load aborted here: {e}");
+                throw;
+            }
         }
         // Outside the isPeer guard above: RunInstanceEvents carries no RNG/AI/
         // DamageSolver dependency, so both host and peer schedule it locally
@@ -252,7 +263,11 @@ public sealed class Game : IDisposable
         Plugin.ChatGui.Print(new XivChatEntry
         {
             Type = XivChatType.SystemMessage,
-            Message = new SeStringBuilder().AddText($"[AnoMech] Starting: {FullName(scenario)}{(solo ? " (Solo)" : "")}").Build(),
+            // networkRoles null, not solo -- solo only means "no AI strat selected" (still
+            // used for CreateParty below), but a peer always passes selectedAi: null even
+            // though it's in a multiplayer session, so that flag showed "(Solo)" for every
+            // client regardless of session state.
+            Message = new SeStringBuilder().AddText($"[AnoMech] Starting: {FullName(scenario)}{(networkRoles is null ? " (Solo)" : "")}").Build(),
         });
     }
 
@@ -305,21 +320,23 @@ public sealed class Game : IDisposable
             activeScenario.Tick(deltaSeconds, scenarioElapsed);
         }
 #if DEBUG
-        // Unconditional -- previously gated on (activeScenario != null ||
-        // peerScenarioRunning), which stops dumping the instant Reset/a natural
-        // finish clears either flag. That silently froze the file at whatever it
-        // last looked like mid-fight: a Reset+Leave repro's own Leave, the
-        // resulting EndMessage broadcast, and a peer's reaction to it all landed
-        // safely in DiagnosticLog's buffer (see its own doc comment) but never
-        // once reached disk, because nothing was left to trigger a write after
-        // the run ended. Ticking always means a dump is at most PeriodicDumpInterval
-        // stale no matter what just happened, including everything downstream of
-        // a run ending.
-        periodicDumpTimer += deltaSeconds;
-        if (periodicDumpTimer >= PeriodicDumpInterval)
+        // Gated on activeScenario (host/solo) or IsRunning (peer) -- previously unconditional so
+        // activity right after a run ended wouldn't be missed, but LogSnapshot now feeds the
+        // same persistent log every other call already reaches, so that's covered anyway. Left
+        // unconditional, this spammed an empty snapshot every 3s while idle, drowning out the
+        // size-capped log.
+        if (activeScenario != null || (Plugin.MultiplayerInstance?.IsRunning ?? false))
+        {
+            periodicDumpTimer += deltaSeconds;
+            if (periodicDumpTimer >= PeriodicDumpInterval)
+            {
+                periodicDumpTimer = 0f;
+                AnoMech.Windows.DamageDebugWindow.Instance?.DumpToFile();
+            }
+        }
+        else
         {
             periodicDumpTimer = 0f;
-            AnoMech.Windows.DamageDebugWindow.Instance?.DumpToFile();
         }
 #endif
     }
@@ -448,6 +465,9 @@ public sealed class Game : IDisposable
     // Resets the encounter first, then reverts the zone — Reset stays in-zone.
     public void Leave()
     {
+        // Leaving a session always gets its own finalized log segment, regardless of size,
+        // instead of bleeding into whatever run starts next.
+        AnoMech.Core.DiagnosticLog.RotateNow();
         Plugin.Framework.Run(() =>
         {
             ResetInternal();

@@ -2,19 +2,22 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
+using AnoMech.Multiplayer;
 using static AnoMech.Scenarios.Top.TopConstants;
 
 namespace AnoMech.Scenarios.Top.P5Delta;
 
-public sealed class TopP5DeltaScenario : IScenario
+public sealed class TopP5DeltaScenario : IMultiplayerReplayable
 {
     public string Name => "Delta";
     public IPhase Phase => TopZone.P5;
+    public bool SupportsMultiplayer => true;
     public void DrawSettings() => settingsWindow.Draw();
     private readonly TopP5DeltaSettingsWindow settingsWindow = new();
 
@@ -26,6 +29,14 @@ public sealed class TopP5DeltaScenario : IScenario
     private SimWorld world = null!;
     private SimParty party = null!;
     private readonly Random rng = new();
+
+    // Exposed so MultiplayerManager can broadcast the AI-relevant subset after a host Start --
+    // see UmadP3BlackHoleScenario.LastState. BeyondDefenseTarget resolves later (t=35.3s);
+    // LastState aliasing `state` is what lets BuildMidRunUpdateMessage pick that change up.
+    public TopP5DeltaState? LastState { get; private set; }
+
+    // Edge-triggers BuildMidRunUpdateMessage -- see IMultiplayerReplayable.BuildMidRunUpdateMessage.
+    private PartyRole? lastBroadcastBeyondDefenseTarget;
 
     private SimEnemy? omega;
     private SimEnemy? beetle;
@@ -44,6 +55,7 @@ public sealed class TopP5DeltaScenario : IScenario
         world = worldParam;
         party = worldParam.Party;
         state = new TopP5DeltaState(settingsWindow.Overrides, party.PlayerRole);
+        LastState = state;
         if (selectedAi is { } idx && idx < AiStrats.Count)
             ((IScenarioAi<TopP5DeltaState>)AiStrats[idx]).Run(state, world);
         topUtils = new TopUtils(world);
@@ -376,7 +388,8 @@ public sealed class TopP5DeltaScenario : IScenario
 
     private void ResolveBeyondDefenseAoe()
     {
-        var mainTarget = party.Get(state.BeyondDefenseTarget);
+        if (state.BeyondDefenseTarget is not { } beyondDefenseTarget) return;
+        var mainTarget = party.Get(beyondDefenseTarget);
         if (mainTarget is null) return;
 
         foreach (var hit in party.Find.InsideCircle(mainTarget.Position, Geometry.BeyondDefenseAoeRadius))
@@ -607,4 +620,41 @@ public sealed class TopP5DeltaScenario : IScenario
     private void EyeStartCharging()  => world.Map.AddEffect(0x00800040, state.EyeSpawn.EffectIndex);
     private void EyeDoneCharging()  => world.Map.AddEffect(0x10000001, state.EyeSpawn.EffectIndex);
     private void EyeDespawn()    => world.Map.AddEffect(0x00000008, state.EyeSpawn.EffectIndex);
+
+    public MpMessage? BuildReplayStateMessage()
+        => LastState is { } s ? new TopP5DeltaAiReplayStateMessage(
+            s.TetherOrder.ToArray(), s.FistColors.ToArray(), s.PlayerMonitorIndex,
+            s.PlayerMonitorSide == Side.Left, s.OmegaMonitorSide == Side.Left,
+            s.EyeSpawn == NorthSouth.North, s.SwivelCannonSide == Side.Left,
+            s.ArmHandedness.Select(side => side == Side.Left).ToArray(),
+            s.FarWorldRole, s.NearWorldRole, s.FarWorldTetherIndex)
+        : null;
+
+    public object? StartReplay(MpMessage message, int aiIndex, PartyRole myRole, SimWorld replayWorld)
+    {
+        if (message is not TopP5DeltaAiReplayStateMessage msg) return null;
+        // BeyondDefenseTarget starts null here, guaranteed set by ApplyMidRunUpdate before the
+        // Ai reads it (t=35.3s < 36.2s).
+        var shadowState = TopP5DeltaState.FromNetworkReplay(
+            msg.TetherOrder, msg.FistColors, msg.PlayerMonitorIndex,
+            msg.PlayerMonitorSideIsLeft, msg.OmegaMonitorSideIsLeft, msg.EyeSpawnIsNorth,
+            msg.SwivelCannonSideIsLeft, msg.ArmHandednessIsLeft, msg.FarWorldRole,
+            msg.NearWorldRole, msg.FarWorldTetherIndex);
+        ((IScenarioAi<TopP5DeltaState>)AiStrats[aiIndex]).Run(shadowState, replayWorld);
+        return shadowState;
+    }
+
+    public MpMessage? BuildMidRunUpdateMessage()
+    {
+        if (LastState?.BeyondDefenseTarget is not { } target || lastBroadcastBeyondDefenseTarget == target) return null;
+        lastBroadcastBeyondDefenseTarget = target;
+        DiagnosticLog.Info($"[Multiplayer] Host: broadcasting P5 Delta BeyondDefenseTarget update -- {target}.");
+        return new TopP5DeltaBeyondDefenseUpdateMessage(target);
+    }
+
+    public void ApplyMidRunUpdate(object shadowStateObj, MpMessage message)
+    {
+        if (shadowStateObj is TopP5DeltaState shadowState && message is TopP5DeltaBeyondDefenseUpdateMessage update)
+            shadowState.BeyondDefenseTarget = update.BeyondDefenseTarget;
+    }
 }

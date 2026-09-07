@@ -14,11 +14,6 @@ using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
-using AnoMech.Scenarios.Umad.P2Forsaken;
-using AnoMech.Scenarios.Umad.P3BlackHole;
-using AnoMech.Scenarios.Umad.P4KefkaSays;
-using AnoMech.Scenarios.Umad.P5Exaflares;
-using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Multiplayer;
 
@@ -35,19 +30,21 @@ public sealed partial class MultiplayerManager
     {
         var world = Plugin.GameInstance.World;
 
-        // UMAD P2 only. UmadP2ForsakenScenario.ReapplyLockons reassigns state.Lockons
-        // dynamically as towers resolve, host-only, so a peer's replay-start snapshot goes
-        // stale the first time that happens -- re-broadcast whenever it actually changes.
-        if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is UmadP2ForsakenScenario { LastState: { } p2State })
-        {
-            var lockonsKey = string.Join(",", p2State.Lockons.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}"));
-            if (hostLastBroadcastP2Lockons != lockonsKey)
+        // Lets any scenario re-sync something it only resolves mid-run -- see
+        // IMultiplayerReplayable.BuildMidRunUpdateMessage. Logging content is the implementer's job.
+        if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable
+            && replayable.BuildMidRunUpdateMessage() is { } midRunUpdateMsg)
+            _ = relay!.SendAsync(midRunUpdateMsg);
+
+        // Generic (not scenario-specific): any puppet knocked back by any scenario's
+        // world.Party.Knockback/direct ISimPartyMember.Knockback call needs its owning peer told
+        // explicitly -- see SimNetworkPuppet.PendingNetworkKnockback's doc comment.
+        foreach (var role in Enum.GetValues<PartyRole>())
+            if (world.Party.Get(role) is SimNetworkPuppet { PendingNetworkKnockback: { } kb } puppet)
             {
-                hostLastBroadcastP2Lockons = lockonsKey;
-                DiagnosticLog.Info($"[Multiplayer] Host: broadcasting P2 Lockons update -- [{lockonsKey}].");
-                _ = relay!.SendAsync(new P2LockonsUpdateMessage(new Dictionary<PartyRole, uint>(p2State.Lockons)));
+                _ = relay!.SendAsync(new KnockbackMessage(role, kb.Source.X, kb.Source.Y, kb.Source.Z, kb.Distance, kb.Speed));
+                puppet.ClearPendingNetworkKnockback();
             }
-        }
 
         var liveEnemies = world.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
         foreach (var stale in hostEnemyNetIds.Keys.Where(e => !liveEnemies.Contains(e)).ToList())
@@ -57,6 +54,7 @@ public sealed partial class MultiplayerManager
             hostEnemyLastLoggedModelState.Remove(stale);
             hostEnemyLastLoggedStatuses.Remove(stale);
             hostEnemyLastLoggedAnimationTimeline.Remove(stale);
+            hostEnemyLastLoggedAnimationState.Remove(stale);
         }
 
         var enemies = new List<EnemyState>(liveEnemies.Count);
@@ -88,13 +86,20 @@ public sealed partial class MultiplayerManager
             var newLockonVfxIds = enemy.DrainPendingLockonVfxIds();
             if (newLockonVfxIds.Count > 0)
                 DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
+            if (enemy.AnimationState is { } animState
+                && (!hostEnemyLastLoggedAnimationState.TryGetValue(enemy, out var lastStateSeq) || lastStateSeq != enemy.AnimationStateSeq))
+            {
+                hostEnemyLastLoggedAnimationState[enemy] = enemy.AnimationStateSeq;
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationState -> ({animState.Arg2},{animState.Arg3}) (seq {enemy.AnimationStateSeq}).");
+            }
             var (castTargetEnemyNetId, castTargetRole) = ResolveTargetId(world, enemy.CastTargetId);
             var (instantTargetEnemyNetId, instantTargetRole) = ResolveTargetId(world, enemy.LastInstantCastTargetId);
             enemies.Add(new EnemyState(
-                netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, cfg.Targetable, enemy.EnemyListMode,
+                netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, enemy.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
                 statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList(),
                 enemy.AnimationTimelineId, enemy.AnimationTimelineSeq, newLockonVfxIds,
+                enemy.AnimationState?.Arg2, enemy.AnimationState?.Arg3, enemy.AnimationStateSeq,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
                 enemy.IsCasting, enemy.CastSeq, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
                 enemy.CastTargetLocation?.X, enemy.CastTargetLocation?.Y, enemy.CastTargetLocation?.Z,
@@ -143,7 +148,7 @@ public sealed partial class MultiplayerManager
             }
             eventObjects.Add(new EventObjectState(
                 netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
-                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation));
+                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation, eo.LayoutId));
         }
 
         return relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, eventObjects));
@@ -216,6 +221,11 @@ public sealed partial class MultiplayerManager
 
     private void OnPartyMemberKilledHost(PartyRole role, string cause)
         => _ = relay?.SendAsync(new RoleKilledMessage(role, cause));
+
+    private void OnOmenSpawnedHost(string path, Placement placement, Vector3 scale, float durationSeconds)
+        => _ = relay?.SendAsync(new SpawnOmenMessage(
+            path, placement.Position.X, placement.Position.Y, placement.Position.Z, placement.Rotation,
+            scale.X, scale.Y, scale.Z, durationSeconds));
 
     // True once a claimed peer hasn't been heard from for PeerStaleTimeoutMs -- host reads
     // its own ground truth, a peer reads the last value relayed via PeerStatusMessage.

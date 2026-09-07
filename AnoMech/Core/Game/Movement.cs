@@ -269,7 +269,9 @@ internal class Movement(SimCharacter parent)
     //     loop the pose forever (the original "knockback stuck" bug).
     protected void StartAnim()
     {
-        parent.PlayActionTimeline(timelineId, baseOverride: timelineBaseOverride ? timelineId : (ushort)0);
+        // Native entry point, not the virtual PlayActionTimeline -- SimEnemy overrides that to
+        // track/broadcast scenario cues, and movement-driven start/stop must never go through it.
+        parent.PlayActionTimelineNative(timelineId, baseOverride: timelineBaseOverride ? timelineId : (ushort)0);
         animActive = true;
     }
 

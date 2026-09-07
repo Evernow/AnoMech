@@ -14,11 +14,6 @@ using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
-using AnoMech.Scenarios.Umad.P2Forsaken;
-using AnoMech.Scenarios.Umad.P3BlackHole;
-using AnoMech.Scenarios.Umad.P4KefkaSays;
-using AnoMech.Scenarios.Umad.P5Exaflares;
-using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Multiplayer;
 
@@ -34,11 +29,6 @@ namespace AnoMech.Multiplayer;
 // background thread) is marshalled onto it via Plugin.Framework.Run first.
 public sealed partial class MultiplayerManager : IDisposable
 {
-    // Mirrors UmadP5ExaflaresScenario.FrameGapCapSeconds -- guards a peer's P5 debug-bot
-    // replay (Tick()'s peer branch) against a pause/loading-stall frame firing every queued
-    // timeline event at once.
-    private const float P5ReplayFrameGapCapSeconds = 0.25f;
-
     private RelayClient? relay;
     private bool running;
 
@@ -53,10 +43,8 @@ public sealed partial class MultiplayerManager : IDisposable
     // individual gain/loss/stack-change line instead of one "the whole set changed" summary.
     private readonly Dictionary<SimEnemy, Dictionary<ushort, ushort>> hostEnemyLastLoggedStatuses = new();
     private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationTimeline = new();
+    private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationState = new();
     private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> hostRoleLastLoggedStatuses = new();
-    // Host-only, edge-triggered against UmadP2ForsakenState.Lockons -- see
-    // P2LockonsUpdateMessage for why this needs its own re-syncable channel.
-    private string? hostLastBroadcastP2Lockons;
 
     private readonly Dictionary<SimEventObject, int> hostEventObjectNetIds = new();
     private int nextEventObjectNetId;
@@ -70,6 +58,7 @@ public sealed partial class MultiplayerManager : IDisposable
     private readonly Dictionary<int, byte> peerEnemyModelState = new();
     private readonly Dictionary<int, Dictionary<ushort, ushort>> peerEnemyLastLoggedStatuses = new();
     private readonly Dictionary<int, int> peerEnemyAnimationTimeline = new();
+    private readonly Dictionary<int, int> peerEnemyAnimationState = new();
     // Peer-only: see EnemyState.LastInstantCastSeq/CastSeq for why instant and telegraphed
     // casts each need their own dedup counter instead of the IsCasting rising edge.
     private readonly Dictionary<int, int> peerEnemyLastInstantCastSeq = new();
@@ -133,8 +122,7 @@ public sealed partial class MultiplayerManager : IDisposable
     private bool debugBotControlled;
     public bool DebugBotControlled => debugBotControlled;
 
-    // Host-only: whether AiReplayStateMessage already went out this run -- edge-triggered
-    // against UmadP3BlackHoleScenario.LastState.
+    // Host-only: whether this run's replay-state message already went out.
     private bool aiReplayStateSent;
 
     // Host-only: BroadcastRunEnded's EndMessage is fire-and-forget -- these track resends
@@ -150,18 +138,14 @@ public sealed partial class MultiplayerManager : IDisposable
     // still null and wrongly broadcast an end-of-run right after a real start.
     private bool hostScenarioStarted;
 
-    // Peer-only: host's broadcast AI-replay values, buffered until peerEnteredInstance (order
-    // vs. the host broadcast isn't guaranteed). Kept around after replay starts so
-    // OnWorldSnapshotReceived can keep resolving ScenarioObjects from newly-seen enemies.
-    private AiReplayStateMessage? pendingAiReplayState;
-    private UmadP3BlackHoleState? debugShadowState;
-    // Per-scenario siblings of the two fields above -- only one is ever non-null per run.
-    private P2AiReplayStateMessage? pendingP2AiReplayState;
-    private UmadP2ForsakenState? debugShadowStateP2;
-    private P4AiReplayStateMessage? pendingP4AiReplayState;
-    private UmadP4KefkaSaysState? debugShadowStateP4;
-    private P5AiReplayStateMessage? pendingP5AiReplayState;
-    private UmadP5ExaflaresState? debugShadowStateP5;
+    // Peer-only: host's broadcast replay-state message, buffered until peerEnteredInstance
+    // (order vs. the host broadcast isn't guaranteed). debugShadowStateGeneric stays around
+    // after replay starts so OnWorldSnapshotReceived can keep refreshing it (see
+    // IMultiplayerReplayable.RefreshLiveHandles). Shared by every multiplayer scenario instead
+    // of a field pair each -- the concrete type is opaque here, only the owning scenario's own
+    // interface methods ever cast it back.
+    private MpMessage? pendingGenericReplayState;
+    private object? debugShadowStateGeneric;
     private bool debugBotReplayStarted;
 
     public bool SetDebugBotControlled(bool value)
@@ -317,6 +301,7 @@ public sealed partial class MultiplayerManager : IDisposable
         ReconnectAttempt = 0;
         disconnectedSinceMs = null;
         if (IsHost) Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
+        if (IsHost) Plugin.GameInstance.World.OmenSpawned -= OnOmenSpawnedHost;
 
         // Notify so peers don't sit stuck waiting on a session that's already over (see
         // SessionEndedMessage). Defer Dispose() until the send completes, or it usually
@@ -338,6 +323,7 @@ public sealed partial class MultiplayerManager : IDisposable
         hostEnemyLastLoggedModelState.Clear();
         hostEnemyLastLoggedStatuses.Clear();
         hostEnemyLastLoggedAnimationTimeline.Clear();
+        hostEnemyLastLoggedAnimationState.Clear();
         hostRoleLastLoggedStatuses.Clear();
         hostTetherNetIds.Clear();
         hostEventObjectNetIds.Clear();
@@ -345,6 +331,7 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
+        peerEnemyAnimationState.Clear();
         peerEnemyLastInstantCastSeq.Clear();
         peerEnemyLastCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();
@@ -694,6 +681,7 @@ public sealed partial class MultiplayerManager : IDisposable
         hostEnemyLastLoggedModelState.Clear();
         hostEnemyLastLoggedStatuses.Clear();
         hostEnemyLastLoggedAnimationTimeline.Clear();
+        hostEnemyLastLoggedAnimationState.Clear();
         hostRoleLastLoggedStatuses.Clear();
         hostTetherNetIds.Clear();
         hostEventObjectNetIds.Clear();
@@ -709,6 +697,7 @@ public sealed partial class MultiplayerManager : IDisposable
             if (peerId != MyPeerId)
                 peerLastSeenMs[peerId] = nowMs;
         Plugin.GameInstance.PartyMemberKilled += OnPartyMemberKilledHost;
+        Plugin.GameInstance.World.OmenSpawned += OnOmenSpawnedHost;
         Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, Session.SelectedAi, Session.SelectedWaymark, networkRoles);
         // RunScenarioAsHost's scenario.Run already scheduled the chosen Ai's full
         // choreography against every role including the host's own; this flag is what stops
@@ -747,6 +736,7 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEnemyModelState.Clear();
         peerEnemyLastLoggedStatuses.Clear();
         peerEnemyAnimationTimeline.Clear();
+        peerEnemyAnimationState.Clear();
         peerEnemyLastInstantCastSeq.Clear();
         peerEnemyLastCastSeq.Clear();
         peerRoleLastLoggedStatuses.Clear();

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text.Json.Serialization;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
+using AnoMech.Scenarios.Top;
 using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 
@@ -24,6 +25,8 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(WorldSnapshotMessage), "snapshot")]
 [JsonDerivedType(typeof(RolesSnapshotMessage), "rolesSnapshot")]
 [JsonDerivedType(typeof(RoleKilledMessage), "killed")]
+[JsonDerivedType(typeof(KnockbackMessage), "knockback")]
+[JsonDerivedType(typeof(SpawnOmenMessage), "spawnOmen")]
 [JsonDerivedType(typeof(EndMessage), "end")]
 [JsonDerivedType(typeof(PingMessage), "ping")]
 [JsonDerivedType(typeof(PongMessage), "pong")]
@@ -39,6 +42,14 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(SetWeatherMessage), "setWeather")]
 [JsonDerivedType(typeof(P4AiReplayStateMessage), "p4AiReplayState")]
 [JsonDerivedType(typeof(P5AiReplayStateMessage), "p5AiReplayState")]
+[JsonDerivedType(typeof(TopP6WaveCannon2AiReplayStateMessage), "topP6Wc2AiReplayState")]
+[JsonDerivedType(typeof(TopP2PartySynergyAiReplayStateMessage), "topP2PsAiReplayState")]
+[JsonDerivedType(typeof(TopP5SigmaAiReplayStateMessage), "topP5SigmaAiReplayState")]
+[JsonDerivedType(typeof(TopP5OmegaAiReplayStateMessage), "topP5OmegaAiReplayState")]
+[JsonDerivedType(typeof(UltimatePredationAiReplayStateMessage), "ultimatePredationAiReplayState")]
+[JsonDerivedType(typeof(TopP5DeltaAiReplayStateMessage), "topP5DeltaAiReplayState")]
+[JsonDerivedType(typeof(TopP5DeltaBeyondDefenseUpdateMessage), "topP5DeltaBeyondDefenseUpdate")]
+[JsonDerivedType(typeof(TopP5OmegaHelloWorld2UpdateMessage), "topP5OmegaHelloWorld2Update")]
 [JsonDerivedType(typeof(SelfMitigationMessage), "selfMitigation")]
 [JsonDerivedType(typeof(PeerAppliedEnemyStatusMessage), "peerAppliedEnemyStatus")]
 [JsonDerivedType(typeof(PeerAppliedRoleStatusMessage), "peerAppliedRoleStatus")]
@@ -50,6 +61,15 @@ public abstract record MpMessage;
 // host-authoritative state. Best-effort -- a relay predating "senderIdentity" can't attest to
 // this at all, so the tag defaults to trusted then (see RelayClient.SupportsSenderIdentity).
 internal interface IHostOnlyMessage;
+
+// Marker for a scenario's initial replay-state broadcast (every *AiReplayStateMessage type
+// implements this) -- lets MultiplayerManager.Dispatch.cs route any of them with one generic
+// case instead of one per scenario. See IMultiplayerReplayable.
+internal interface IScenarioReplayStateMessage : IHostOnlyMessage;
+
+// Same idea, for a scenario's optional mid-run re-sync message -- see
+// IMultiplayerReplayable.BuildMidRunUpdateMessage.
+internal interface IScenarioMidRunUpdateMessage : IHostOnlyMessage;
 
 // Peer -> host, sent once right after connecting to register a display name before any role
 // is claimed. Version/Checksum identify the sender's plugin build so the host can catch a
@@ -113,6 +133,7 @@ public sealed record EnemyState(
     EnemyListMode EnemyList, uint ModelCharaId, float Scale, float HitboxRadius,
     byte? InitialModeAttributeFlags, bool Visible, byte ModelState,
     IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, int AnimationTimelineSeq, IReadOnlyList<uint> NewLockonVfxIds,
+    int? AnimationStateArg2, int? AnimationStateArg3, int AnimationStateSeq,
     float X, float Y, float Z, float Rotation,
     bool IsCasting, int CastSeq, uint CastActionId, float CastSeconds, float CastOmenDelay,
     float? CastTargetX, float? CastTargetY, float? CastTargetZ,
@@ -136,9 +157,13 @@ public sealed record RoleState(
 
 // One SimEventObject (or SimTower) as the host has it. Without this message type, event
 // objects don't replicate at all -- the enemy sampler only ever walks SimEnemy.
+// LayoutId drives which SharedGroup the engine attaches for this EObj (see
+// EventObjectSpawnConfig.LayoutId) -- without it, a peer's reconstructed config defaulted to
+// LayoutId 0 and requested the wrong SharedGroup. Root cause of an Ultimate Predation arena
+// piece staying invisible on a peer, previously misread as a streaming race.
 public sealed record EventObjectState(
     int NetId, uint EObjId, ushort TimelineState, ushort CurrentState,
-    float X, float Y, float Z, float Rotation);
+    float X, float Y, float Z, float Rotation, uint LayoutId);
 
 // Host -> everyone, at SnapshotSendRate. Full-state, so a dropped frame is one tick of
 // staleness, not a permanently wrong reconstruction.
@@ -153,6 +178,15 @@ public sealed record RolesSnapshotMessage(List<RoleState> Roles) : MpMessage, IH
 // Host -> everyone, one per Game.PartyMemberKilled. The recipient calls Game.Kill on whatever
 // currently occupies that role locally.
 public sealed record RoleKilledMessage(PartyRole Role, string Cause) : MpMessage, IHostOnlyMessage;
+
+// Host -> everyone, one per SimNetworkPuppet.Knockback (polled via PendingNetworkKnockback --
+// see its doc comment). Recipient applies the same Knockback to whatever occupies that role
+// locally, same as RoleKilledMessage.
+public sealed record KnockbackMessage(PartyRole Role, float SourceX, float SourceY, float SourceZ, float Distance, float Speed) : MpMessage, IHostOnlyMessage;
+
+// Host -> everyone, one per SimWorld.OmenSpawned -- a peer has no other way to see a
+// scenario's manually-spawned AOE telegraphs. Recipient replays the identical SpawnOmen call.
+public sealed record SpawnOmenMessage(string Path, float X, float Y, float Z, float Rotation, float ScaleX, float ScaleY, float ScaleZ, float DurationSeconds) : MpMessage, IHostOnlyMessage;
 
 // Host -> everyone, sent whenever the host's run ends for any reason. ReturnedToInn
 // distinguishes Reset() (stays in-zone) from Leave()/a natural finish (unloads to the inn) --
@@ -192,20 +226,20 @@ public sealed record LeaveRequestMessage(Guid PeerId) : MpMessage;
 public sealed record AiReplayStateMessage(
     PartyRole[] Roles, PartyRole[] StackTargets, uint[] SlapAttacks,
     float[] KefkaPositionRadians, uint ImplosionAttack,
-    ThunderIIIAssignment ThunderSet1, ThunderIIIAssignment ThunderSet2) : MpMessage, IHostOnlyMessage;
+    ThunderIIIAssignment ThunderSet1, ThunderIIIAssignment ThunderSet2) : MpMessage, IScenarioReplayStateMessage;
 
 // P2 Forsaken's version of AiReplayStateMessage. Unlike P3, carries the state's entire public
 // surface rather than a curated subset -- every field is a plain value, and P2 has 7 debug-bot
 // Ai variants, so there's no single "what does the Ai read" answer to trim against.
 public sealed record P2AiReplayStateMessage(
-    EndAttack[] EndAttacks, float NewNorthRadians, int Rotation, Dictionary<PartyRole, uint> Lockons) : MpMessage, IHostOnlyMessage;
+    EndAttack[] EndAttacks, float NewNorthRadians, int Rotation, Dictionary<PartyRole, uint> Lockons) : MpMessage, IScenarioReplayStateMessage;
 
 // P2AiReplayStateMessage.Lockons is a one-time snapshot, but UmadP2ForsakenScenario
 // .ReapplyLockons reassigns it dynamically as towers resolve (host-only). Without a way to
 // re-sync it, a peer's stale replay lookup can miss and throw inside EventScheduler.Tick,
 // permanently breaking every later scheduled move. Host -> everyone, sent whenever
 // ReapplyLockons actually changes something.
-public sealed record P2LockonsUpdateMessage(Dictionary<PartyRole, uint> Lockons) : MpMessage, IHostOnlyMessage;
+public sealed record P2LockonsUpdateMessage(Dictionary<PartyRole, uint> Lockons) : MpMessage, IScenarioMidRunUpdateMessage;
 
 // Host -> everyone, mirroring MapController.AddEffect/DirectorUpdate 1:1. Scenarios call these
 // directly from their own event schedule (host-only) to drive native, client-local instance
@@ -219,18 +253,77 @@ public sealed record MapDirectorUpdateMessage(
 // arena-transform lighting cues, not just initial spawn weather.
 public sealed record SetWeatherMessage(byte WeatherId, float Transition) : MpMessage, IHostOnlyMessage;
 
-// P4 Kefka Says' version of AiReplayStateMessage. Carries only the subset UmadP4KefkaSaysAi
-// reads (see UmadP4KefkaSaysState.FromNetworkReplay) -- MysteryCast reduced to its three
-// scalar fields, ChaosMystery.Cast reconstructed from a fixed constant per element.
+// Carries only the subset UmadP4KefkaSaysAi reads (see UmadP4KefkaSaysState.FromNetworkReplay)
+// -- MysteryCast reduced to its three scalar fields, ChaosMystery.Cast reconstructed from a
+// fixed constant per element.
 public sealed record P4AiReplayStateMessage(
     int[] MysteryBlizzardOffset, int[] MysteryLightningOffset, float[] MysteryLightningOrientation,
     bool Wave1First, PartyRole[] Wave1, bool Wave1True, PartyRole[] Wave2, bool Wave2True,
     bool InfernoIsTrue, bool TsunamiIsTrue, PartyRole[] Wave3, bool[] Wounds,
-    bool Antilight0IsWhite, float NeoExdeathDirectionRadians) : MpMessage, IHostOnlyMessage;
+    bool Antilight0IsWhite, float NeoExdeathDirectionRadians) : MpMessage, IScenarioReplayStateMessage;
 
-// P5 Exaflares' version of AiReplayStateMessage. UmadP5ExaflaresState's entire meaningful
-// surface is LeftOrder/RightOrder -- Timeline/SpreadTick are plumbing the peer builds locally.
-public sealed record P5AiReplayStateMessage(int[] LeftOrder, int[] RightOrder) : MpMessage, IHostOnlyMessage;
+// UmadP5ExaflaresState's entire meaningful surface is LeftOrder/RightOrder -- Timeline/
+// SpreadTick are plumbing the peer builds locally.
+public sealed record P5AiReplayStateMessage(int[] LeftOrder, int[] RightOrder) : MpMessage, IScenarioReplayStateMessage;
+
+// TopP6WaveCannon2Ai's entire read set is InFirst -- ProteanOrder/WildChargeTarget only feed
+// the scenario's own (host-only) damage resolution.
+public sealed record TopP6WaveCannon2AiReplayStateMessage(bool InFirst) : MpMessage, IScenarioReplayStateMessage;
+
+// Carries the entire TopP2PartySynergyState surface -- the Ai reads all of it. GlitchType
+// carries a Predicate<SimTether> (not JSON-friendly); both it and OmegaAttack are instead
+// carried as a bool identifying which named static instance was chosen.
+public sealed record TopP2PartySynergyAiReplayStateMessage(
+    PartyRole[] Order, PartyRole[] Stacks, float NewNorthARadians, float NewNorthBRadians,
+    float AttackDirRadians, bool GlitchIsFar, bool AttackMIsSword, bool AttackFIsStaff) : MpMessage, IScenarioReplayStateMessage;
+
+// Carries the subset TopP5SigmaAi reads -- WaveCannonTargets/Towers aren't read, omitted.
+// GlitchType/OmegaAttack/Rotation carried as bools identifying which named static instance
+// was chosen (see TopP5SigmaState.FromNetworkReplay).
+public sealed record TopP5SigmaAiReplayStateMessage(
+    PartyRole[] Order, PartyRole[] DynamisTargets, PartyRole[] HelloWorldTargets, PartyRole[] HandBait,
+    float NewNorthARadians, float NewNorthBRadians, bool TowerNorthFlipped, bool GlitchIsFar,
+    bool SpinnerIsClockwise, bool OmegaFIsStaff, int FirstMissing, int SecondMissing) : MpMessage, IScenarioReplayStateMessage;
+
+// Carries the subset TopP5OmegaAi reads. OmegaAttack has no delegate field, so it round-trips
+// through JSON directly; MonitorSide is carried as a bool identifying which named static
+// instance was chosen. MonitorTargets is the host's already-resolved pick (see
+// TopP5OmegaState.MonitorTargets), not re-derived on a peer.
+public sealed record TopP5OmegaAiReplayStateMessage(
+    PartyRole[] HelloWorldTargets, PartyRole[] DoubleDynamicTargets, PartyRole[] MonitorTargets, float[] AttackDirectionsRadians,
+    OmegaAttack[] OmegaAttacks, float BettleSpawnDirectionRadians, bool FirstWaveCannonFront,
+    bool MonitorIsLeft) : MpMessage, IScenarioReplayStateMessage;
+
+// HelloWorld2 carries no value at run start -- the host only resolves it live, at t=46s
+// (a status-stack read + shuffle). Sent once, right then, same pattern as
+// TopP5DeltaBeyondDefenseUpdateMessage.
+public sealed record TopP5OmegaHelloWorld2UpdateMessage(PartyRole[] Roles) : MpMessage, IScenarioMidRunUpdateMessage;
+
+// Carries the subset TopP5DeltaAi reads. Side/NorthSouth have private constructors (two named
+// static instances each, no delegate), carried as bools. BeyondDefenseTarget isn't included --
+// the host doesn't resolve it until t=35.3s, well after run start -- see
+// TopP5DeltaBeyondDefenseUpdateMessage for the follow-up that carries it.
+public sealed record TopP5DeltaAiReplayStateMessage(
+    PartyRole[] TetherOrder, uint[] FistColors, int PlayerMonitorIndex, bool PlayerMonitorSideIsLeft,
+    bool OmegaMonitorSideIsLeft, bool EyeSpawnIsNorth, bool SwivelCannonSideIsLeft, bool[] ArmHandednessIsLeft,
+    PartyRole FarWorldRole, PartyRole NearWorldRole, int FarWorldTetherIndex) : MpMessage, IScenarioReplayStateMessage;
+
+// BeyondDefenseTarget carries no value at run start -- the host only resolves it live, at
+// t=35.3s (TopP5DeltaScenario.FireBeyondDefenseAoe). Sent once, right then, mirroring Umad P2
+// Forsaken's P2LockonsUpdateMessage.
+public sealed record TopP5DeltaBeyondDefenseUpdateMessage(PartyRole BeyondDefenseTarget) : MpMessage, IScenarioMidRunUpdateMessage;
+
+// Carries the four boss placements, plus the three positions the Ai's live tie-break RNG
+// resolved on the host (see ResolvedSafeCardinal) -- without those, a peer's replayed Ai would
+// re-roll and could land on a different-but-valid safe spot than the host's bots.
+public sealed record UltimatePredationAiReplayStateMessage(
+    float GarudaX, float GarudaY, float GarudaZ, float GarudaRotation,
+    float TitanX, float TitanY, float TitanZ, float TitanRotation,
+    float IfritX, float IfritY, float IfritZ, float IfritRotation,
+    float UltimaX, float UltimaY, float UltimaZ, float UltimaRotation,
+    float SafeCardinalX, float SafeCardinalY, float SafeCardinalZ, float SafeCardinalRotation,
+    float SafeFirstSetX, float SafeFirstSetY, float SafeFirstSetZ, float SafeFirstSetRotation,
+    float SafeSecondSetX, float SafeSecondSetY, float SafeSecondSetZ, float SafeSecondSetRotation) : MpMessage, IScenarioReplayStateMessage;
 
 // Peer -> host, event-driven. Reports which tracked mitigation status ids are active on the
 // sender's own real character -- a real Rampart/invuln press never touches the host's puppet

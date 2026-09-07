@@ -72,6 +72,8 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
+        // First, so every subsequent construction step's own logging is captured from the start.
+        Core.DiagnosticLog.Initialize();
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Config = Configuration;
 
@@ -163,6 +165,10 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.RemoveHandler(CommandName);
         CommandManager.RemoveHandler(CommandAlias);
+
+        // Last, so it captures every other subsystem's own teardown logging, then flushes and
+        // closes the active log file before the DLL unloads (an update reload included).
+        Core.DiagnosticLog.Shutdown();
     }
 
     private unsafe void OnFrameworkUpdate(IFramework framework)

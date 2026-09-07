@@ -169,14 +169,24 @@ public sealed unsafe class SimEnemy : SimNpc
         var remainingWindow = MathF.Max(estimatedNetworkUpdateInterval - timeSinceLastNetworkUpdate, MinNetworkPacingWindowSeconds);
         var step = MathF.Max(dist / remainingWindow, NetworkCatchUpSpeed) * deltaSeconds;
         var nextRotation = MathUtil.StepRotation(Rotation, networkTargetRotation, NetworkAngularCatchUpSpeed * deltaSeconds);
-        if (dist > NetworkSnapThreshold || dist <= step)
+        if (dist > NetworkSnapThreshold)
+        {
+            // A scripted teleport/reposition -- logged since position updates otherwise ride
+            // silently in every snapshot with no edge-triggered trace, unlike
+            // ModelState/AnimationTimeline/Statuses.
+            DiagnosticLog.Info($"[SimEnemy.TickNetworkPosition] {DisplayName} (BNpcBase {BNpcBaseId}) snapped {dist:F1}y (> {NetworkSnapThreshold}y threshold): {basePos} -> {target}.");
+            SetPosition(new Placement(target, nextRotation));
+        }
+        else if (dist <= step)
             SetPosition(new Placement(target, nextRotation));
         else
             SetPosition(new Placement(basePos + delta / dist * step, nextRotation));
 
         if (networkMoving && !networkInterpAnimActive)
         {
-            PlayActionTimeline(NetworkRunTimelineId, baseOverride: NetworkRunTimelineId);
+            // Native entry point, not the tracked virtual PlayActionTimeline -- this is the
+            // peer's own movement-smoothing re-triggering the run cycle, not a scenario cue.
+            PlayActionTimelineNative(NetworkRunTimelineId, baseOverride: NetworkRunTimelineId);
             networkInterpAnimActive = true;
         }
         else if (!networkMoving && networkInterpAnimActive)
@@ -196,6 +206,11 @@ public sealed unsafe class SimEnemy : SimNpc
     private bool desiredVisible = true;
     private bool currentVisible = true;
     private bool loggedInitialVisibility;
+
+    // Last value passed to SetTargetable, read by MultiplayerManager's host-side sampler --
+    // SpawnConfig.Targetable is only the spawn-time default, never a later call's value.
+    private bool desiredTargetable;
+    public bool Targetable => desiredTargetable;
 
     // Diagnostic-only: EnableDraw/DrawObject.IsVisible only gate the draw object itself,
     // not whether CharacterBase's per-slot equipment/body models finished streaming in --
@@ -404,6 +419,7 @@ public sealed unsafe class SimEnemy : SimNpc
     /// </param>
     public void SetTargetable(bool targetable)
     {
+        desiredTargetable = targetable;
         var chara = BattleCharaPtr;
         if (chara == null) return;
         if (targetable)
@@ -456,29 +472,46 @@ public sealed unsafe class SimEnemy : SimNpc
 
     public void SetVisible(bool visible) => desiredVisible = visible;
 
-    // Read side of PlayAnimationTimeline -- MultiplayerManager samples this so a
-    // scenario's discrete, one-shot animation cues (Kefka's WarpOut/Spawn teleport,
-    // etc.) replicate to peers. A byte-for-byte sibling of ModelState/edge-triggered
-    // application, not the inherited PlayActionTimeline: that base method is also
-    // what Movement uses internally to drive the locomotion run-cycle every time this
-    // enemy starts/stops moving (see Movement.StartAnim), and TickNetworkPosition
-    // above independently re-triggers that same run-cycle on a peer while smoothing
-    // toward a broadcast position -- tracking/replicating every PlayActionTimeline
-    // call indiscriminately would make those two "who's driving the animation right
-    // now" mechanisms fight each other every movement tick. PlayAnimationTimeline is
-    // therefore a separate, deliberate method scenarios call ONLY for a real
-    // scenario-authored animation cue, never used by Movement.
+    // MultiplayerManager samples this so a scenario's one-shot animation cues (Kefka's
+    // WarpOut/Spawn teleport, etc.) replicate to peers -- edge-triggered like ModelState. Set
+    // by the PlayActionTimeline override below, not by Movement, which drives the locomotion
+    // run cycle via PlayActionTimelineNative directly -- broadcasting every movement tick would
+    // spam the network and fight the peer's own movement-smoothing animation.
     public ushort? AnimationTimelineId { get; private set; }
 
     // Monotonic counter, same reasoning as SimCast.CastSeq: lets a peer's edge-trigger dedup
     // tell a genuine repeat of the same timeline id apart from "unchanged".
     public int AnimationTimelineSeq { get; private set; }
 
-    public void PlayAnimationTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
+    // Overrides the untracked base so any scenario call to PlayActionTimeline is
+    // tracked/broadcast automatically. Calls the native entry point, not
+    // base.PlayActionTimeline, to avoid recursion.
+    public override void PlayActionTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
     {
         AnimationTimelineId = timelineId;
         AnimationTimelineSeq++;
-        PlayActionTimeline(timelineId, loopId, baseOverride);
+        PlayActionTimelineNative(timelineId, loopId, baseOverride);
+    }
+
+    // Compatibility alias for existing call sites -- identical behavior now that it's tracked too.
+    public void PlayAnimationTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
+        => PlayActionTimeline(timelineId, loopId, baseOverride);
+
+    // Same reasoning as AnimationTimelineId/CastSeq, for a raw TimelineContainerPointers.
+    // SetAnimationState call -- a direct native write with no replication path of its own (a
+    // scenario calling it directly, e.g. Awaken's Woken-status wing pose on Ultima, never
+    // reached a peer). Tracked here so MultiplayerManager can sample/replay it the same
+    // edge-triggered way as AnimationTimelineSeq.
+    public (int Arg2, int Arg3)? AnimationState { get; private set; }
+    public int AnimationStateSeq { get; private set; }
+
+    public void SetAnimationState(int arg2, int arg3)
+    {
+        AnimationState = (arg2, arg3);
+        AnimationStateSeq++;
+        var chara = BattleCharaPtr;
+        if (chara == null) return;
+        TimelineContainerPointers.SetAnimationState(&chara->Timeline, arg2, arg3);
     }
 
     // Follow itself moved up to SimCharacter (a party member needs to call it too now -- see
@@ -562,9 +595,14 @@ public sealed unsafe class SimEnemy : SimNpc
     public override void Tick(float deltaSeconds)
     {
         base.Tick(deltaSeconds);
+        // TickNetworkPosition before ReconcileVisibility -- a peer's puppet must catch up to any
+        // pending position snap before visibility is reconciled, or a tick where "become
+        // visible" and "position update" don't land together shows the model at its stale
+        // position. No-op for host/solo enemies -- it no-ops without ApplyNetworkPosition ever
+        // having been called.
+        TickNetworkPosition(deltaSeconds);
         ReconcileVisibility();
         cast.Tick(deltaSeconds);
-        TickNetworkPosition(deltaSeconds);
 
         if (!slotCheckDone && desiredVisible)
         {

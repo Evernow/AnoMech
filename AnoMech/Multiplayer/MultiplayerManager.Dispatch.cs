@@ -14,11 +14,6 @@ using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
-using AnoMech.Scenarios.Umad.P2Forsaken;
-using AnoMech.Scenarios.Umad.P3BlackHole;
-using AnoMech.Scenarios.Umad.P4KefkaSays;
-using AnoMech.Scenarios.Umad.P5Exaflares;
-using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Multiplayer;
 
@@ -103,7 +98,7 @@ public sealed partial class MultiplayerManager
         // sync with the `when !IsHost` cases below. SessionEndedMessage excluded: any peer
         // can send it, so it isn't reliably a host message.
         if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage or RolesSnapshotMessage
-            or RoleKilledMessage or EndMessage or PingMessage or PeerStatusMessage
+            or RoleKilledMessage or KnockbackMessage or SpawnOmenMessage or EndMessage or PingMessage or PeerStatusMessage
             or AiReplayStateMessage or P2AiReplayStateMessage or P4AiReplayStateMessage or P5AiReplayStateMessage)
         {
             lastHostMessageMs = Environment.TickCount64;
@@ -225,6 +220,12 @@ public sealed partial class MultiplayerManager
             case RoleKilledMessage killed when !IsHost:
                 OnRoleKilledReceived(killed);
                 break;
+            case KnockbackMessage kb when !IsHost:
+                OnKnockbackReceived(kb);
+                break;
+            case SpawnOmenMessage omen when !IsHost:
+                OnSpawnOmenReceived(omen);
+                break;
             case EndMessage end when !IsHost:
                 OnEndReceived(end);
                 break;
@@ -269,22 +270,6 @@ public sealed partial class MultiplayerManager
                 // requesting peer's own Leave button waits forever for a response.
                 BroadcastRunEnded(returnedToInn: true);
                 break;
-            case AiReplayStateMessage state when !IsHost:
-                pendingAiReplayState = state;
-                TryStartDebugBotReplay();
-                break;
-            case P2AiReplayStateMessage p2State when !IsHost:
-                pendingP2AiReplayState = p2State;
-                TryStartDebugBotReplay();
-                break;
-            // Re-syncs the one field in P2AiReplayStateMessage's snapshot that changes
-            // mid-fight -- see P2LockonsUpdateMessage. Dropped if the shadow state doesn't
-            // exist yet: only happens if this raced ahead of replay starting, in which case
-            // the initial snapshot already carries the same value.
-            case P2LockonsUpdateMessage lockonsUpdate when !IsHost:
-                if (debugShadowStateP2 is { } p2Shadow)
-                    p2Shadow.Lockons = lockonsUpdate.Lockons;
-                break;
             // Pure replays of the host-side call. Can't loop into a re-broadcast: the
             // SubscribeMapEventsOnce handlers gate on IsHost, so a peer's own local
             // AddEffect/DirectorUpdate call is a no-op there.
@@ -302,13 +287,18 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info($"[Multiplayer] Peer: applying SetWeather weatherId={weather.WeatherId} transition={weather.Transition}.");
                 Plugin.GameInstance.World.Map.SetWeather(weather.WeatherId, weather.Transition);
                 break;
-            case P4AiReplayStateMessage p4State when !IsHost:
-                pendingP4AiReplayState = p4State;
+            // Any scenario implementing IMultiplayerReplayable routes through these two
+            // generic cases instead of adding a sibling pair here -- see that interface.
+            case MpMessage genericMsg when !IsHost && genericMsg is IScenarioReplayStateMessage:
+                pendingGenericReplayState = genericMsg;
                 TryStartDebugBotReplay();
                 break;
-            case P5AiReplayStateMessage p5State when !IsHost:
-                pendingP5AiReplayState = p5State;
-                TryStartDebugBotReplay();
+            // Dropped if no shadow state exists yet -- only if this raced ahead of replay
+            // starting, in which case nothing needs the update yet either.
+            case MpMessage midRunUpdate when !IsHost && midRunUpdate is IScenarioMidRunUpdateMessage:
+                if (debugShadowStateGeneric != null
+                    && Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable)
+                    replayable.ApplyMidRunUpdate(debugShadowStateGeneric, midRunUpdate);
                 break;
         }
     }

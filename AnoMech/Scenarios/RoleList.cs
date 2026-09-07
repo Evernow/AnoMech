@@ -115,6 +115,26 @@ public class RoleList
         return new RoleList(party, picked);
     }
 
+    // Same pick-without-replacement as the parameterless overload, but from a caller-supplied
+    // Rng instead of this class's own unseeded static one. The static overload draws
+    // independently on every client replaying an Ai.Run, so each can pick differently -- use
+    // the State's own seeded Rng and resolve once in the State constructor, then broadcast
+    // the result.
+    public RoleList Random(Rng rng, int count, params PartyRole[] except)
+    {
+        var exceptSet = new HashSet<PartyRole>(except);
+        var pool = list.Where(r => !exceptSet.Contains(r)).ToList();
+        var picked = new List<PartyRole>(count);
+        while (picked.Count < count && pool.Count > 0)
+        {
+            var idx = rng.NextInt(pool.Count);
+            picked.Add(pool[idx]);
+            pool.RemoveAt(idx);
+        }
+
+        return new RoleList(party, picked);
+    }
+
 
     public List<TResult?> ForEachPair<TResult>(Func<int, SimCharacter, SimCharacter, TResult> func)
     {

@@ -38,6 +38,10 @@ public sealed unsafe class SimCast : ISimObject
     private float animationLock;
     private float remainingAnimationLock;
 
+    // Set by NativeCast, consumed by the next NativeActionEffect on this caster -- distinguishes
+    // "this is the resolve of the telegraph I just started" from "no telegraph behind this".
+    private bool pendingNativeResolve;
+
     public bool IsCasting => parent.BattleCharaPtr != null && parent.BattleCharaPtr->CastInfo.IsCasting;
 
     public uint ActionId { get; private set; }
@@ -242,6 +246,19 @@ public sealed unsafe class SimCast : ISimObject
         };
 
         PacketDispatcherPointers.HandleActorCastPacket(parent.GameObjectId.ObjectId, &actorCastPacket);
+
+        // A caller going through NativeCast directly gets none of Start()'s bookkeeping --
+        // CastSeq never bumps, so a peer's edge-triggered replay never sees this cast.
+        // `casting` stays false deliberately: the caller schedules its own separate
+        // NativeActionEffect for the resolve (see pendingNativeResolve below), so Tick()'s
+        // auto-resolve must stay off or the host fires the release twice.
+        ActionId = actionId;
+        total = castTime;
+        this.omenDelay = omenDelay;
+        targetLocation = position;
+        this.targetId = targetId;
+        CastSeq++;
+        pendingNativeResolve = true;
     }
 
     public void NativeActionEffect(uint actionId, float animationLock, ushort spellId, byte animationVariaton, ActionType actionType, byte flags, float? rotation = null, Vector3? position = null, GameObjectId? animationTargetId = null, GameObjectId? actionTargetId = null, GameObjectId? ballistaId = null)
@@ -295,6 +312,22 @@ public sealed unsafe class SimCast : ISimObject
             );
 
         remainingAnimationLock = animationLock;
+
+        // Pending flag set: this is the resolve of the telegraph just started -- CastSeq
+        // already covers replaying it, so skip LastInstantCastSeq. Not set: no telegraph
+        // behind this (e.g. a standalone effect like Viscous Aetheroplasm) -- give it the
+        // same bookkeeping Start()'s instant branch (castTime <= 0) gives a real Cast() call.
+        if (pendingNativeResolve)
+        {
+            pendingNativeResolve = false;
+        }
+        else
+        {
+            LastInstantCastActionId = actionId;
+            LastInstantCastTargetLocation = position;
+            LastInstantCastTargetId = animationTargetId ?? actionTargetId;
+            LastInstantCastSeq++;
+        }
     }
 
     public void Tick(float deltaSeconds)

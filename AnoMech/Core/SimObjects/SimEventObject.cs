@@ -1,4 +1,5 @@
 using AnoMech.Core.Game;
+using AnoMech.Core.Native;
 using AnoMech.Helpers;
 using AnoMech.Pointers;
 using FFXIVClientStructs.FFXIV.Client.Game.Event;
@@ -97,6 +98,14 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     private readonly Coordinates coordinates;
     private readonly ushort visibleState;
     private readonly float lifetime;
+    private readonly uint layoutId;
+
+    // Same native asset-streaming race as SimEnemy's own model-slot check (LogModelSlotState) --
+    // the SharedGroupLayoutInstance behind this EObj's LayoutId can stay mid-load on a client
+    // after C#-visible bookkeeping already looks correct. Checked at the same +1/+5/+210-frame
+    // checkpoints so a dump shows whether (and when) it actually finishes.
+    private int loadCheckFrames;
+    private bool loadCheckDone;
 
     public uint EObjRowId { get; }
     public string DisplayName => $"EObj 0x{EObjRowId:X}";
@@ -118,6 +127,11 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     // per-instance "visible" state value SetVisible(true) resolves to for this EObj.
     public ushort VisibleState => visibleState;
 
+    // Read side for MultiplayerManager -- drives which SharedGroup the engine attaches for
+    // this EObj (see EventObjectSpawnConfig.LayoutId); without it a peer's reconstructed
+    // config silently defaults to 0.
+    public uint LayoutId => layoutId;
+
     // Read side of SetState -- MultiplayerManager samples this so a scenario's (or
     // SimTower's proximity-driven) state changes replicate to peers. SimEventObjects
     // render via the LayoutEngine SharedGroup, not GameObject.DrawObject, so there is
@@ -129,14 +143,17 @@ public unsafe class SimEventObject : ISimObject, IPositioned
 
     private float lifetimeElapsed { get; set; } = 0;
 
-    protected SimEventObject(int slot, GameObject* obj, Coordinates coordinates, uint eObjRowId, ushort visibleState, float lifetime)
+    protected SimEventObject(int slot, GameObject* obj, Coordinates coordinates, uint eObjRowId, ushort visibleState, float lifetime, uint layoutId)
     {
         this.slot = slot;
         this.obj = obj;
         this.coordinates = coordinates;
         this.visibleState = visibleState;
         this.lifetime = lifetime;
+        this.layoutId = layoutId;
         EObjRowId = eObjRowId;
+        // No LayoutId means nothing to check -- skip the checkpoints entirely.
+        loadCheckDone = layoutId == 0;
     }
 
     internal static SimEventObject? Spawn(EventObjectSpawnConfig config, Coordinates coordinates, EventScheduler events)
@@ -148,7 +165,7 @@ public unsafe class SimEventObject : ISimObject, IPositioned
             return null;
         }
 
-        var eObj = new SimEventObject(slot, eObjPtr, coordinates, config.EObjId, config.TimelineState, config.Lifetime);
+        var eObj = new SimEventObject(slot, eObjPtr, coordinates, config.EObjId, config.TimelineState, config.Lifetime, config.LayoutId);
 
         if (!config.SpawnVisible && config.TimelineState != 0)
         {
@@ -195,6 +212,11 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     // VisibleState and 0 (the engine default / "hidden" for gated SGs).
     public void SetVisible(bool visible) => SetState(visible ? visibleState : (ushort)0);
 
+    // Logs the full native load state at each checkpoint so a dump shows progression, not
+    // just a final snapshot.
+    private void LogLoadState(string label)
+        => DiagnosticLog.Info($"[SimEventObject.LogLoadState] {DisplayName} (LayoutId 0x{layoutId:X}) {label}: {LayoutInstanceDiagnostics.Describe(layoutId)}.");
+
     public virtual void Tick(float deltaSeconds)
     {
         // Re-sync stored Position/Rotation from native — catches any
@@ -208,6 +230,18 @@ public unsafe class SimEventObject : ISimObject, IPositioned
 
         Position = coordinates.ToLocal(obj->Position);
         Rotation = obj->Rotation;
+
+        if (!loadCheckDone)
+        {
+            loadCheckFrames++;
+            if (loadCheckFrames == 1) LogLoadState("+1 frame");
+            else if (loadCheckFrames == 5) LogLoadState("+5 frames");
+            else if (loadCheckFrames == 210)
+            {
+                LogLoadState("+210 frames (~3.5s)");
+                loadCheckDone = true;
+            }
+        }
 
         if (lifetime > 0)
         {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
@@ -24,6 +25,13 @@ public sealed class AiManager
     private const ushort SprintStatusId = 50;
     private const int SprintStatusParam = 30;
     private const float DefaultJitter = 0.3f;
+    // Move's deadline math schedules departure so a RunSpeed walk finishes exactly at
+    // arrivalTime -- zero real margin by design. A move needing speed within a hair of
+    // RunSpeed has nothing left for real execution overhead, and arrives short (confirmed via
+    // a P4 Kefka Says log: 6.47y/s needed vs RunSpeed=6.5 landed ~1.8y short of its safe spot).
+    // Treating arrivalTime as this much earlier buys back margin -- can only make arrival
+    // earlier, never later.
+    private const float MoveDeadlineSafetyMargin = 0.25f;
 
     private readonly SimWorld world;
     private readonly Random rng = new();
@@ -52,6 +60,10 @@ public sealed class AiManager
         world.Events.Add(time, () =>
         {
             var move = positions();
+            // Diagnostic only -- flags two roles landing on (near-)identical spots within
+            // this same Move call, which should never happen but has been observed
+            // coinciding with a wipe. Doesn't change who goes where.
+            var seenTargets = new List<(string Role, Vector3 Target)>();
             for (int i = 0; i < 8; i++)
             {
                 if (move[i] is not { } local) continue;
@@ -59,6 +71,12 @@ public sealed class AiManager
                 if (member == null || !member.IsAlive()) continue;
                 var target = Jitter(new Vector3(local.X, 0f, local.Y), jitter);
                 var role = (member as ISimPartyMember)?.Role.ToString() ?? $"slot{i}";
+                foreach (var (seenRole, seenTarget) in seenTargets)
+                {
+                    if (Vector3.Distance(target, seenTarget) < 1f)
+                        AnoMech.Core.DiagnosticLog.Warn($"[AiManager] Move@{time:F1}: {role} and {seenRole} both targeting ({target.X:F1},{target.Z:F1}) -- collision.");
+                }
+                seenTargets.Add((role, target));
                 var dx = target.X - member.Position.X;
                 var dz = target.Z - member.Position.Z;
                 var dist = MathF.Sqrt(dx * dx + dz * dz);
@@ -79,7 +97,7 @@ public sealed class AiManager
                     continue;
                 }
 
-                var available = deadline - time;
+                var available = deadline - time - MoveDeadlineSafetyMargin;
                 var neededSpeed = available > 0f ? dist / available : float.PositiveInfinity;
 
                 if (neededSpeed > RunSpeed && neededSpeed <= SprintSpeed)
@@ -116,7 +134,11 @@ public sealed class AiManager
         world.Events.Add(time, () =>
         {
             Markings.ClearAll();
-            foreach (var (role, sign) in mapping())
+            var marks = mapping();
+            // Diagnostic only -- nothing else records which role got which sign, so this is
+            // otherwise invisible in a log.
+            AnoMech.Core.DiagnosticLog.Info($"[AiManager] Automarker@{time:F1}: [{string.Join(", ", marks.Select(kv => $"{kv.Key}={kv.Value}"))}].");
+            foreach (var (role, sign) in marks)
                 if (world.Party.Get(role) is { } member && member.IsAlive())
                     Markings.Set(sign, member.GameObjectId);
         });

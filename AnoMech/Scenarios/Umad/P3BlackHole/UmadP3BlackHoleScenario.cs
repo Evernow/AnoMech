@@ -14,11 +14,12 @@ using AnoMech.Core.Game.Geometry;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
+using AnoMech.Multiplayer;
 using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Scenarios.Umad.P3BlackHole;
 
-public sealed class UmadP3BlackHoleScenario : IScenario
+public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
 {
     public string Name => "Black Hole";
     public IPhase Phase => UmadZone.P3;
@@ -912,5 +913,60 @@ public sealed class UmadP3BlackHoleScenario : IScenario
         world.Events.Add(159.63f, () => party.Get(PartyRole.MeleeDpsB)?.RemoveStatus(StatusId.MagicVulnerabilityUp));
         // [159.63s] 30|B7D|Magic Vulnerability Up|0.00|400040E8|Chaos|100AC8F1|CasterDps|00|227550|44|8ea67f20190b40b7
         world.Events.Add(159.63f, () => party.Get(PartyRole.CasterDps)?.RemoveStatus(StatusId.MagicVulnerabilityUp));
+    }
+
+    // Host -> everyone, once per run. Carries the subset UmadP3BlackHoleAi reads
+    // (FromNetworkReplay). ThunderSet1/2 are the exception: a bot-controlled peer needs the
+    // host's real plan, not FromNetworkReplay's default fallback, to self-apply the right kit.
+    public MpMessage? BuildReplayStateMessage()
+        => LastState is { } s ? new AiReplayStateMessage(
+            s.Roles.List, s.StackTargets.List, s.SlapAttacks.ToArray(),
+            s.KefkaPosition.Select(d => d.RadiansFromNorth).ToArray(), s.ImplosionAttack,
+            s.ThunderSet1, s.ThunderSet2)
+        : null;
+
+    public object? StartReplay(MpMessage message, int aiIndex, PartyRole myRole, SimWorld replayWorld)
+    {
+        if (message is not AiReplayStateMessage msg) return null;
+        var shadowState = UmadP3BlackHoleState.FromNetworkReplay(
+            replayWorld, msg.Roles, msg.StackTargets, msg.SlapAttacks, msg.KefkaPositionRadians, msg.ImplosionAttack,
+            msg.ThunderSet1, msg.ThunderSet2);
+        ((IScenarioAi<UmadP3BlackHoleState>)AiStrats[aiIndex]).Run(shadowState, replayWorld);
+        SchedulePeerThunderMitigation(shadowState, replayWorld, myRole);
+        return shadowState;
+    }
+
+    // Applies the host's Thunder III Share kit to this peer's own character at RunThunder's
+    // resolve times -- that logic never runs on a peer (Ai.Run above only positions), so
+    // without this a Share-planned hit applied nothing. AddStatus writes through
+    // StatusManager, so the existing self-report poller picks it up. Skips InvulnsBoth -- a
+    // real invuln covers it.
+    private static void SchedulePeerThunderMitigation(UmadP3BlackHoleState state, SimWorld world, PartyRole myRole)
+    {
+        void ApplyIfMine(float time, ThunderIIIAssignment plan)
+        {
+            if (plan is not (ThunderIIIAssignment.ShareMtFirst or ThunderIIIAssignment.ShareOtFirst)) return;
+            var (first, second) = ThunderIIIPlanning.Roles(plan);
+            if (first != myRole && second != myRole) return;
+            world.Events.Add(time, () =>
+            {
+                if (world.Party.Player is { } player)
+                    ApplyThunderShareKit(player);
+            });
+        }
+        ApplyIfMine(38f, state.ThunderSet1);
+        ApplyIfMine(43.5f, state.ThunderSet1);
+        ApplyIfMine(79f, state.ThunderSet2);
+        ApplyIfMine(84.9f, state.ThunderSet2);
+    }
+
+    // Chaos/Exdeath might not be replicated yet when StartReplay first ran -- keep retrying.
+    // (Black-hole obstacle-avoidance rebuild stays unconditional in PeerSnapshot.cs -- see its
+    // own comment.)
+    public void RefreshLiveHandles(object shadowStateObj, IReadOnlyDictionary<int, SimEnemy> peerEnemies)
+    {
+        if (shadowStateObj is not UmadP3BlackHoleState shadowState) return;
+        shadowState.ScenarioObjects.Chaos ??= peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.ChaosP3);
+        shadowState.ScenarioObjects.Exdeath ??= peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.Exdeath);
     }
 }

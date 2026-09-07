@@ -14,10 +14,7 @@ using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
-using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
-using AnoMech.Scenarios.Umad.P4KefkaSays;
-using AnoMech.Scenarios.Umad.P5Exaflares;
 using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Multiplayer;
@@ -133,6 +130,10 @@ public sealed partial class MultiplayerManager
             // teleported here -- a hard SetPosition every snapshot made movement stutter.
             enemy.ApplyNetworkPosition(new Vector3(e.X, e.Y, e.Z), e.Rotation);
             enemy.SetVisible(e.Visible);
+            // Reconciled every snapshot like SetVisible, not edge-triggered like SetModelState
+            // -- without this only the spawn-time config's Targetable value ever reached a
+            // peer, and a later host-side SetTargetable toggle mid-mechanic never applied.
+            enemy.SetTargetable(e.Targetable);
             // Re-issued only on change -- SetModelState's native rebuild flickers the model.
             if (!peerEnemyModelState.TryGetValue(e.NetId, out var lastModelState) || lastModelState != e.ModelState)
             {
@@ -214,6 +215,15 @@ public sealed partial class MultiplayerManager
                 foreach (var lockonId in e.NewLockonVfxIds)
                     enemy.AttachLockonVfx(lockonId, persistent: false);
             }
+            // Edge-triggered like AnimationTimelineId above -- see SimEnemy.AnimationState's own
+            // doc comment for why this needs its own replication path at all.
+            if (e.AnimationStateArg2 is { } arg2 && e.AnimationStateArg3 is { } arg3
+                && (!peerEnemyAnimationState.TryGetValue(e.NetId, out var lastStateSeq) || lastStateSeq != e.AnimationStateSeq))
+            {
+                peerEnemyAnimationState[e.NetId] = e.AnimationStateSeq;
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationState -> ({arg2},{arg3}) (seq {e.AnimationStateSeq}).");
+                enemy.SetAnimationState(arg2, arg3);
+            }
         }
         foreach (var staleId in peerEnemies.Keys.Where(id => !seenEnemyIds.Contains(id)).ToList())
         {
@@ -223,13 +233,16 @@ public sealed partial class MultiplayerManager
             peerEnemyModelState.Remove(staleId);
             peerEnemyLastLoggedStatuses.Remove(staleId);
             peerEnemyAnimationTimeline.Remove(staleId);
+            peerEnemyAnimationState.Remove(staleId);
             peerEnemyLastInstantCastSeq.Remove(staleId);
             peerEnemyLastCastSeq.Remove(staleId);
         }
 
         // UMAD P3 only (harmless no-op elsewhere). A peer never runs Run_BlackHoleObstacles,
         // so without this a debug-bot peer's MoveTo has no avoidance data and can cut through
-        // a black hole -- rebuilt from peerEnemies so it can't drift from the host.
+        // a black hole -- rebuilt from peerEnemies so it can't drift from the host. Deliberately
+        // unconditional (unlike RefreshLiveHandles below), matching this block's
+        // pre-IMultiplayerReplayable behavior.
         world.Obstacles.Clear();
         var localPlayer = Plugin.GameInstance.World.Party.Player;
         foreach (var (netId, bh) in peerEnemies.Where(kvp => kvp.Value.BNpcBaseId == BNpcBaseId.BlackHole))
@@ -242,13 +255,10 @@ public sealed partial class MultiplayerManager
                     $"[Multiplayer] Peer: local position ({localPlayer.Position.X:F2},{localPlayer.Position.Z:F2}) is {MathF.Sqrt(distSq):F2}y from black hole NetId {netId} at ({bh.Position.X:F2},{bh.Position.Z:F2}).");
         }
 
-        // Debug-bot replay: Chaos/Exdeath might not have been replicated yet when
-        // TryStartDebugBotReplay first resolved them -- keep retrying every snapshot.
-        if (debugShadowState is { } shadow)
-        {
-            shadow.ScenarioObjects.Chaos ??= peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.ChaosP3);
-            shadow.ScenarioObjects.Exdeath ??= peerEnemies.Values.FirstOrDefault(e => e.BNpcBaseId == BNpcBaseId.Exdeath);
-        }
+        // See IMultiplayerReplayable.RefreshLiveHandles.
+        if (debugShadowStateGeneric != null
+            && Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable)
+            replayable.RefreshLiveHandles(debugShadowStateGeneric, peerEnemies);
 
         var seenTetherIds = new HashSet<int>();
         foreach (var t in snap.Tethers)
@@ -293,6 +303,7 @@ public sealed partial class MultiplayerManager
                     Placement = new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation),
                     TimelineState = o.TimelineState,
                     SpawnVisible = true,
+                    LayoutId = o.LayoutId,
                 };
                 DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
                 eo = world.SpawnEventObject(config);
@@ -397,6 +408,23 @@ public sealed partial class MultiplayerManager
             Plugin.GameInstance.Kill(member, msg.Cause);
         else
             DiagnosticLog.Debug($"[Multiplayer] RoleKilled for {msg.Role} but that slot isn't an ISimPartyMember locally -- dropping.");
+    }
+
+    private void OnKnockbackReceived(KnockbackMessage msg)
+    {
+        if (IsHost) return;
+        if (Plugin.GameInstance.World.Party.Get(msg.Role) is ISimPartyMember member)
+            member.Knockback(new Vector3(msg.SourceX, msg.SourceY, msg.SourceZ), msg.Distance, msg.Speed);
+        else
+            DiagnosticLog.Debug($"[Multiplayer] Knockback for {msg.Role} but that slot isn't an ISimPartyMember locally -- dropping.");
+    }
+
+    private void OnSpawnOmenReceived(SpawnOmenMessage msg)
+    {
+        if (IsHost) return;
+        Plugin.GameInstance.World.SpawnOmen(
+            msg.Path, new Placement(new Vector3(msg.X, msg.Y, msg.Z), msg.Rotation),
+            new Vector3(msg.ScaleX, msg.ScaleY, msg.ScaleZ), msg.DurationSeconds);
     }
 
     private void OnEndReceived(EndMessage msg)

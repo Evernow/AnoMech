@@ -14,11 +14,6 @@ using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
-using AnoMech.Scenarios.Umad.P2Forsaken;
-using AnoMech.Scenarios.Umad.P3BlackHole;
-using AnoMech.Scenarios.Umad.P4KefkaSays;
-using AnoMech.Scenarios.Umad.P5Exaflares;
-using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Multiplayer;
 
@@ -35,6 +30,7 @@ public sealed partial class MultiplayerManager
         running = false;
         DebugBotControl.Enabled = false; // mirrors StopDebugBotReplay's peer-side reset
         Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
+        Plugin.GameInstance.World.OmenSpawned -= OnOmenSpawnedHost;
         Session.Started = false; // otherwise the Start button (gated on !Started) stays dead
     }
 
@@ -219,15 +215,10 @@ public sealed partial class MultiplayerManager
                 if (!peerEnteredInstance) DiagnosticLog.Info("[Multiplayer] Peer's deferred zone entry completed -- now sending SelfPose.");
                 peerEnteredInstance = true;
                 TryStartDebugBotReplay(); // idempotent, guarded internally on debugBotReplayStarted
-                // P5 only: a peer never runs IScenario.Tick, so nothing else drives
-                // debugShadowStateP5.Timeline. Mirrors UmadP5ExaflaresScenario.Tick's two
-                // calls, with the same frame-gap cap against a hitch/alt-tab frame dumping
-                // every queued event at once.
-                if (debugShadowStateP5 is { } p5Shadow && deltaSeconds > 0f && deltaSeconds <= P5ReplayFrameGapCapSeconds)
-                {
-                    p5Shadow.Timeline.Tick(deltaSeconds);
-                    p5Shadow.SpreadTick?.Invoke(deltaSeconds);
-                }
+                // See IMultiplayerReplayable.TickReplay.
+                if (debugShadowStateGeneric != null && deltaSeconds > 0f
+                    && Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable)
+                    replayable.TickReplay(debugShadowStateGeneric, deltaSeconds);
             }
             else if (peerEnteredInstance)
             {

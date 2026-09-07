@@ -242,7 +242,16 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     // Other Subsystem
     // -------------------------
     
-    public void PlayActionTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
+    // Virtual so SimEnemy can override it to also track/broadcast the call (see its own doc
+    // comment on the override) -- every other subclass gets this exact, untracked default.
+    public virtual void PlayActionTimeline(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
+        => PlayActionTimelineNative(timelineId, loopId, baseOverride);
+
+    // The actual native call, factored out so Movement.StartAnim can call it directly instead
+    // of through the virtual PlayActionTimeline -- movement-driven start/stop must never hit
+    // SimEnemy's tracked override, or it'd spam the network and fight the peer's own
+    // movement-smoothing animation.
+    internal void PlayActionTimelineNative(ushort timelineId, ushort loopId = 0, ushort baseOverride = 0)
     {
         var chara = BattleCharaPtr;
         if (chara == null) return;

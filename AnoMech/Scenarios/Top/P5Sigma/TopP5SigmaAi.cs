@@ -24,7 +24,7 @@ public sealed class TopP5SigmaAi : IScenarioAi<TopP5SigmaState>
         state = s;
         var ai = new AiManager(world);
 
-        var handBait = state.DynamisTargets.Random(2, state.HelloWorldTargets.List);
+        var handBait = state.HandBait;
         var hWJumpsOrder = RoleList.AllExcept(world.Party, state.HelloWorldTargets.List.Concat(handBait.List).ToArray());
         markingsOrder = new(world.Party, [handBait[0], hWJumpsOrder[0], handBait[1], hWJumpsOrder[1],
                         hWJumpsOrder[2], hWJumpsOrder[3], state.HelloWorldTargets[0], state.HelloWorldTargets[1]]);
