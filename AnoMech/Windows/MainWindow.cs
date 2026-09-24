@@ -300,6 +300,7 @@ public unsafe class MainWindow : Window, IDisposable
 
     public override void Draw()
     {
+        plugin.Offline?.DrawMainWindowBar();
         var windowPos = ImGui.GetWindowPos();
         var contentTop = windowPos.Y + ImGui.GetFrameHeight();
         ScenarioPanelAnchor = new Vector2(windowPos.X, contentTop);
