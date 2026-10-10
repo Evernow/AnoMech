@@ -16,6 +16,8 @@ internal sealed unsafe class Markings : IMarkings
 {
     private const int SlotCount = 17;
 
+    private readonly PlacedSlots<GameObjectId> placed = new(SlotCount);
+
     public void Set(Sign sign, GameObjectId target)
     {
         var idx = (int)sign;
@@ -23,6 +25,7 @@ internal sealed unsafe class Markings : IMarkings
         var ctrl = MarkingController.Instance();
         if (ctrl == null) return;
         ctrl->Markers[idx] = target;
+        placed.Note(idx, target);
     }
 
     public void Clear(Sign sign)
@@ -31,14 +34,19 @@ internal sealed unsafe class Markings : IMarkings
         if (idx < 0 || idx >= SlotCount) return;
         var ctrl = MarkingController.Instance();
         if (ctrl == null) return;
-        ctrl->Markers[idx] = default;
+        ClearIfPlaced(ctrl, idx);
     }
 
-    public void ClearAll()
+    public void ClearPlaced()
     {
         var ctrl = MarkingController.Instance();
         if (ctrl == null) return;
         for (int i = 0; i < SlotCount; i++)
-            ctrl->Markers[i] = default;
+            ClearIfPlaced(ctrl, i);
+    }
+
+    private void ClearIfPlaced(MarkingController* ctrl, int idx)
+    {
+        if (placed.Release(idx, ctrl->Markers[idx])) ctrl->Markers[idx] = default;
     }
 }

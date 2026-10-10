@@ -7,5 +7,5 @@ internal sealed class FakeMarkings : IMarkings
 {
     public void Set(Sign sign, GameObjectId target) { }
     public void Clear(Sign sign) { }
-    public void ClearAll() { }
+    public void ClearPlaced() { }
 }

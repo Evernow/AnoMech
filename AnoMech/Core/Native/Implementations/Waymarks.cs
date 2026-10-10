@@ -14,6 +14,8 @@ internal sealed unsafe class Waymarks : IWaymarks
 {
     private const int SlotCount = 8;
 
+    private readonly PlacedSlots<(int X, int Y, int Z)> placed = new(SlotCount);
+
     public bool Set(WaymarkSlot slot, Vector3 position)
     {
         var idx = (int)slot;
@@ -26,14 +28,18 @@ internal sealed unsafe class Waymarks : IWaymarks
         marker.Y = (int)MathF.Round(position.Y * 1000f);
         marker.Z = (int)MathF.Round(position.Z * 1000f);
         marker.Active = true;
+        placed.Note(idx, (marker.X, marker.Y, marker.Z));
         return true;
     }
 
-    public void ClearAll()
+    public void ClearPlaced()
     {
         var controller = MarkingController.Instance();
         if (controller == null) return;
         for (int i = 0; i < SlotCount; i++)
-            controller->FieldMarkers[i].Active = false;
+        {
+            ref var marker = ref controller->FieldMarkers[i];
+            if (placed.Release(i, (marker.X, marker.Y, marker.Z))) marker.Active = false;
+        }
     }
 }

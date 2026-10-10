@@ -222,8 +222,8 @@ public sealed class SimWorld : ISimObject, IDisposable
         Party = SimParty.Empty;
         enemyList.Clear();
         Natives.PartyHud.Clear();
-        Natives.Markings.ClearAll();
-        Natives.Waymarks.ClearAll();
+        Natives.Markings.ClearPlaced();
+        Natives.Waymarks.ClearPlaced();
         Obstacles.Clear();
         ScenarioOrigin = default;
     }
