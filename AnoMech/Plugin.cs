@@ -391,4 +391,10 @@ public sealed class Plugin : IDalamudPlugin
 
     public void ToggleConfigUi() => ConfigWindow.Toggle();
     public void ToggleMainUi() => MainWindow.Toggle();
+
+    public void OpenSettings()
+    {
+        ConfigWindow.IsOpen = true;
+        ConfigWindow.BringToFront();
+    }
 }
