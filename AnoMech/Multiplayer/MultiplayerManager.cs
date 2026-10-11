@@ -203,6 +203,10 @@ public sealed partial class MultiplayerManager : IDisposable
     public string DisplayName { get; set; } = "Player";
     // Failed-connect reason for the UI; cleared on the next Host/Join.
     public string? ConnectionError { get; private set; }
+    // Servers still to try, best first, while hosting hasn't been given a code.
+    private readonly Queue<string> hostFallbacks = new();
+    // Already sent on by a relay once (RelayWire.MovedTo); a second time, the group's relays disagree.
+    private bool joinRedirected;
     // Why the session ended, when it wasn't this client's own Leave.
     public string? SessionEndReason { get; private set; }
 
@@ -235,10 +239,13 @@ public sealed partial class MultiplayerManager : IDisposable
 
     // ---- Session lifecycle ----------------------------------------------
 
-    public void HostSession(string relayUrl)
+    public void HostSession(string relayUrl) => HostSession([relayUrl]);
+
+    public void HostSession(IReadOnlyList<string> relayUrls)
     {
         LeaveSession();
-        HostSessionCore(relayUrl);
+        foreach (var url in relayUrls.Skip(1)) hostFallbacks.Enqueue(url);
+        HostSessionCore(relayUrls[0]);
     }
 
     // Null on success, otherwise why the server couldn't start.
@@ -283,7 +290,9 @@ public sealed partial class MultiplayerManager : IDisposable
         LobbyChanged?.Invoke();
     }
 
-    public void JoinSession(string relayUrl, string code)
+    public void JoinSession(string relayUrl, string code) => JoinSessionCore(relayUrl, code, redirected: false);
+
+    private void JoinSessionCore(string relayUrl, string code, bool redirected)
     {
         var normalized = code.Trim().ToUpperInvariant();
         // Rejoining the session we are already on must not announce a leave first: that message
@@ -291,6 +300,7 @@ public sealed partial class MultiplayerManager : IDisposable
         var rejoining = SessionCode == normalized && RelayUrl != null
                         && Configuration.OriginOf(RelayUrl) == Configuration.OriginOf(relayUrl);
         LeaveSessionInternal(notifyOthers: !rejoining);
+        joinRedirected = redirected;
         ConnectionError = null;
         peerSecret = RelayWire.RelayCredential(Plugin.Config.EnsurePeerSecret(), relayUrl);
         MyPeerId = RelayWire.PeerId(peerSecret);
@@ -338,6 +348,8 @@ public sealed partial class MultiplayerManager : IDisposable
         reconnecting = false;
         ReconnectAttempt = 0;
         disconnectedSinceMs = null;
+        hostFallbacks.Clear();
+        joinRedirected = false;
         if (IsHost) Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
         if (IsHost) Plugin.GameInstance.World.OmenSpawned -= OnOmenSpawnedHost;
 
