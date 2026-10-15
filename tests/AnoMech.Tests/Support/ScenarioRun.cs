@@ -40,6 +40,9 @@ internal sealed record ScenarioRunOptions
     // Writes what the sim sent to the fakes here, as a replay-timeline-shaped CSV (SimTimeline).
     public string? TimelinePath { get; init; }
 
+    // Handed what the sim sent to the fakes once the run is over.
+    public Action<SimTimeline>? Timeline { get; init; }
+
     // Edits the plugin configuration before the run.
     public Action<Configuration>? Configure { get; init; }
 }
@@ -152,6 +155,7 @@ internal sealed record ScenarioRun(
         var endTime = game.World.Events.Elapsed;
         if (options.TimelinePath is { } timelinePath)
             fake.Timeline.Write(timelinePath);
+        options.Timeline?.Invoke(fake.Timeline);
         string? artifacts = null;
         try
         {
