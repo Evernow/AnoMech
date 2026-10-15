@@ -108,7 +108,8 @@ internal sealed class FakeBattleCharas : IBattleCharas
                     + (config.InitialModeAttributeFlags is { } flags ? $" mode_attr=0x{flags:X}" : "")
                     + (config.ModelState != 0 ? $" model_state=0x{config.ModelState:X}" : "")
                     + (config.ModelScale != 0 ? $" model_scale={config.ModelScale}" : "")
-                    + (AppearanceText(config.Appearance) is { Length: > 0 } appearance ? $" appearance={appearance}" : ""));
+                    + (AppearanceText(config.Appearance) is { Length: > 0 } appearance ? $" appearance={appearance}" : ""),
+            data: new SpawnData(config, placement));
         foreach (var status in config.Statuses ?? [])
         {
             actor.Statuses[(status.StatusId, FakeCharacter.StatusSource(0xE0000000))] = new StatusSlot(status.StatusId, status.Param, 0f, 0xE0000000);
