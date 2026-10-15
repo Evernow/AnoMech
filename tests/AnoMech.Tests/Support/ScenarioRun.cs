@@ -40,8 +40,8 @@ internal sealed record ScenarioRunOptions
     // Writes what the sim sent to the fakes here, as a replay-timeline-shaped CSV (SimTimeline).
     public string? TimelinePath { get; init; }
 
-    // Handed what the sim sent to the fakes once the run is over.
-    public Action<SimTimeline>? Timeline { get; init; }
+    // Handed the run's fake game once the run is over, with all the sim gave it.
+    public Action<FakeGame>? Finished { get; init; }
 
     // Edits the plugin configuration before the run.
     public Action<Configuration>? Configure { get; init; }
@@ -122,6 +122,7 @@ internal sealed record ScenarioRun(
                 setOverrides(scenario.SettingsOverrides
                              ?? throw new InvalidOperationException($"{scenarioType.Name} has no settings overrides."));
             game.ZoneIn(scenario.Phase.Zone, SessionMode.Local);
+            Plugin.Framework.Run(() => fake.Timeline.StartRun());
             game.StartScenario(new RunScenarioParams(scenario, new LocalPartyProvider { RoleOverride = role }, strat, 0, seed));
             fake.Frame(FrameSeconds, game.Tick);
             if (game.Status < SessionStatus.Running)
@@ -155,7 +156,7 @@ internal sealed record ScenarioRun(
         var endTime = game.World.Events.Elapsed;
         if (options.TimelinePath is { } timelinePath)
             fake.Timeline.Write(timelinePath);
-        options.Timeline?.Invoke(fake.Timeline);
+        options.Finished?.Invoke(fake);
         string? artifacts = null;
         try
         {

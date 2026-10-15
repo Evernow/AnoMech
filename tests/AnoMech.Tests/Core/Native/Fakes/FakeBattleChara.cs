@@ -73,7 +73,8 @@ internal sealed class FakeBattleChara(FakeBattleCharas owner, int slot) : IBattl
             {
                 ["omen_delay"] = SimTimeline.F(cast.OmenDelay, "F1"),
                 ["ballista"] = Id(cast.Ballista) is var b and not 0 ? b.ToString("X8") : "",
-            });
+            },
+            data: cast);
         a.IsCasting = true;
         a.CastActionId = cast.ActionId;
         a.CurrentCastTime = 0f;
@@ -99,7 +100,8 @@ internal sealed class FakeBattleChara(FakeBattleCharas owner, int slot) : IBattl
                 ["knockback"] = string.Join("/", Entries(effect, KnockbackEffectType).Select(e => e.Value.ToString()).Distinct()),
                 // Not a replay column: the hits by entity id, for comparing two clients' rows.
                 ["targets"] = string.Join(" ", (effect.Targets ?? []).Select(t => Id(t.Id).ToString("X8"))),
-            });
+            },
+            data: effect);
         owner.RecordEffect(sequence, EntityId, effect.ActionId);
         if (Actor is { } caster)
             foreach (var target in effect.Targets ?? [])
@@ -205,11 +207,11 @@ internal sealed class FakeBattleChara(FakeBattleCharas owner, int slot) : IBattl
     }
 
     private void Record(string kind, string id = "", string name = "", uint target = 0, Vector3? position = null, float? rotation = null,
-        string detail = "", string p = "", IReadOnlyDictionary<string, string>? extra = null)
+        string detail = "", string p = "", IReadOnlyDictionary<string, string>? extra = null, object? data = null)
     {
         if (Actor is not { } a) return;
         owner.Timeline.Add(kind, a.EntityId, a.Name, id, name, target, target == 0 ? "" : owner.Find(target)?.Name ?? "",
-            position, rotation, detail, p, extra);
+            position, rotation, detail, p, extra, data);
     }
 
     private static string ActionName(uint actionId) => Natives.Data.Action(actionId)?.Name ?? "";
