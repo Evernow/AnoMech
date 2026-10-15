@@ -32,7 +32,7 @@ public sealed class ScenarioSession
     private const float MistakeMarkCooldownSeconds = 1f;
 
     // Bardam's Mettle's Success/Failure marks (Checkmark/X): unnamed actions whose AnimationEnd
-    // gimmick timeline plays the mark on the target.
+    // gimmick timeline plays the mark on the target. Every player in the party gets the run's.
     public const uint MechanicSuccessActionId = 9450;
     public const uint MechanicFailureActionId = 9451;
 
@@ -188,7 +188,7 @@ public sealed class ScenarioSession
         if (deathOccurred) return;
         var clean = lastMistakeElapsed is null;
         if (clean && Plugin.Config.EnableMechanicResultMarks)
-            world.Party.Player?.PlayAction(MechanicSuccessActionId, animationLock: 0f);
+            foreach (var player in world.Party.Players()) player.PlayAction(MechanicSuccessActionId, animationLock: 0f);
         Finished?.Invoke(clean);
     }
 
@@ -204,7 +204,7 @@ public sealed class ScenarioSession
         {
             lastMistakeElapsed = elapsed;
             if (Plugin.Config.EnableMechanicResultMarks)
-                world.Party.Player?.PlayAction(MechanicFailureActionId, animationLock: 0f);
+                foreach (var player in world.Party.Players()) player.PlayAction(MechanicFailureActionId, animationLock: 0f);
         }
     }
 
