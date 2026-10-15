@@ -1,7 +1,6 @@
 using System.Reflection;
 using AnoMech.Core.Game;
 using AnoMech.Multiplayer;
-using AnoMech.Scenarios;
 
 namespace AnoMech.Tests;
 
@@ -15,21 +14,12 @@ public class PacketRulesTests
     public void TheRulesCoverExactlyWhatTheSimSendsOrNames()
     {
         var sent = new Dictionary<(string Packet, uint Category), string>();
-        foreach (var scenario in ScenarioCatalog.Create().Scenarios)
-        for (var strat = 0; strat < scenario.AiStrats.Count; strat++)
+        ScenarioCensus.EveryStrat((run, fake) =>
         {
-            var run = $"{scenario.FullName()} [{scenario.AiStrats[strat].Name}]";
-            ScenarioRun.Execute(scenario.GetType(), strat, 1, new ScenarioRunOptions
-            {
-                WriteArtifactsOnFailure = false,
-                Timeline = timeline =>
-                {
-                    foreach (var row in timeline.Rows)
-                        if (PacketOf(row["kind"]) is { } packet)
-                            sent.TryAdd((packet, Convert.ToUInt32(row["id"], 16)), run);
-                },
-            });
-        }
+            foreach (var row in fake.Timeline.Rows)
+                if (PacketOf(row["kind"]) is { } packet)
+                    sent.TryAdd((packet, Convert.ToUInt32(row["id"], 16)), run);
+        });
         var named = typeof(ActorControl).GetFields(BindingFlags.NonPublic | BindingFlags.Static)
             .Where(f => f.IsLiteral && f.FieldType == typeof(uint) && f.Name.EndsWith("Category"))
             .Select(f => (Name: f.Name, Category: (uint)f.GetRawConstantValue()!))
