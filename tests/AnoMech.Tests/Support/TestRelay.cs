@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using System.Text.Json;
 using AnoMech.Multiplayer;
 using AnoMech.Network;
 
@@ -157,6 +158,11 @@ internal sealed class TestRelay(int seed, Func<int, ConnectionProfile> linkFor)
     private void Forward(Connection sender, Outgoing outgoing, double at)
     {
         if (!sender.Joined || at < LinkOf(sender.Identity).UploadsDeadUntil) return;
+        if (outgoing.Control is { } control)
+        {
+            control();
+            return;
+        }
         foreach (var recipient in connections)
         {
             if (ReferenceEquals(recipient, sender) || !recipient.Joined) continue;
@@ -194,10 +200,12 @@ internal sealed class TestRelay(int seed, Func<int, ConnectionProfile> linkFor)
         return true;
     }
 
-    private sealed class Outgoing(Carried carried, byte[] body, bool compressed, double sentAt)
+    // Carried is null for a relayControl, which the relay acts on (Control) rather than forwards.
+    private sealed class Outgoing(Carried? carried, byte[] body, bool compressed, double sentAt, Action? control = null)
     {
-        public readonly Carried Carried = carried;
-        public MpMessage Message => Carried.Message;
+        public readonly Carried? Carried = carried;
+        public readonly Action? Control = control;
+        public MpMessage Message => Carried!.Message;
         public readonly double SentAt = sentAt;
         public readonly byte[] Body = body;
         public readonly bool Compressed = compressed;
@@ -219,7 +227,7 @@ internal sealed class TestRelay(int seed, Func<int, ConnectionProfile> linkFor)
         private Outgoing? writing;
         private int buffered;
         private double uploadCredit, uploadShare = 1, nextSwing, downloadFreeAt, lastArrival;
-        private bool disconnectPending;
+        private bool disconnectPending, closing;
 
         public readonly Guid Identity;
         public readonly uint Id;
@@ -293,12 +301,25 @@ internal sealed class TestRelay(int seed, Func<int, ConnectionProfile> linkFor)
             return outgoing.Completion.Task;
         }
 
+        // In order behind what the host sent before it, as the relay reads the host's link.
         public Task ModerateAsync(string operation, Guid peerId)
         {
-            if (!IsHost || operation is not ("kick" or "ban")) return Task.CompletedTask;
-            foreach (var target in relay.connections.Where(c => c.Identity == peerId && c.Joined))
-                target.Drop();
-            return Task.CompletedTask;
+            if (!Joined || !IsHost || operation is not ("kick" or "ban")) return Task.CompletedTask;
+            var body = JsonSerializer.SerializeToUtf8Bytes(new { t = RelayWire.ControlType, Operation = operation, PeerId = peerId });
+            var outgoing = new Outgoing(null, body, compressed: false, relay.Now, () =>
+            {
+                foreach (var target in relay.connections.Where(c => c.Identity == peerId && c.Joined)) target.CloseOnceArrived();
+            });
+            queued.Enqueue(outgoing);
+            return outgoing.Completion.Task;
+        }
+
+        // The relay's close follows what it already forwarded to the link: that still arrives,
+        // nothing sent after it does.
+        public void CloseOnceArrived()
+        {
+            closing = true;
+            if (arriving.Count == 0) Drop();
         }
 
         public void Dispose() => Joined = false;
@@ -376,6 +397,7 @@ internal sealed class TestRelay(int seed, Func<int, ConnectionProfile> linkFor)
 
         public void Arrive(Connection sender, Outgoing outgoing, double at)
         {
+            if (closing) return;
             downloadFreeAt = Math.Max(downloadFreeAt, at) + (outgoing.Body.Length + DownloadOverhead) / link.DownloadRate;
             var arrival = Math.Max(lastArrival, downloadFreeAt + link.DownloadLatency + jitter.NextDouble() * link.DownloadJitter);
             if (downloadStalls.Within(arrival) is { } stallEnd) arrival = stallEnd;
@@ -400,11 +422,12 @@ internal sealed class TestRelay(int seed, Func<int, ConnectionProfile> linkFor)
                     continue;
                 }
                 if (message == null) continue;
-                if (relay.Receiving(this, outgoing.Carried)) return;
-                relay.Delivered.Add((relay.identities.IndexOf(Identity), outgoing.Carried));
+                if (relay.Receiving(this, outgoing.Carried!)) return;
+                relay.Delivered.Add((relay.identities.IndexOf(Identity), outgoing.Carried!));
                 if (sender.IsHost) relay.MaxHostDelay = Math.Max(relay.MaxHostDelay, now - outgoing.SentAt);
                 MessageReceived?.Invoke(message, sender.IsHost, sender.Id, sender.Identity);
             }
+            if (closing && Joined && arriving.Count == 0) Drop();
         }
     }
 }
