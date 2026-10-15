@@ -116,16 +116,18 @@ internal static partial class ClientParity
                 return $"ac_target {actor} 0x{category:X} target={Name("target")} {NamedArgs(client, Value("p"), rule.ActorArg, at)}";
             }
             case "cast":
-                return $"cast {actor} {Value("id")} target={Name("target")} {Position()} rot={Value("rot")} {RelativeRotation().Replace(Value("detail"), "")} omen={Value("omen_delay")} ballista={Name("ballista")}";
+                return $"cast {actor} {Value("id")} target={Name("target")} {Position()} rot={Value("rot")} {RelativeRotation().Replace(Value("detail"), "")} omen={Value("omen_delay")} ballista={Name("ballista")} {Fields(client, row, at)}";
             case "ability":
                 var targets = string.Join(" ", Value("targets").Split(' ', StringSplitOptions.RemoveEmptyEntries)
                     .Select(t => client.NameAt(uint.Parse(t, NumberStyles.HexNumber), at)));
-                return $"ability {actor} {Value("id")} at={Name("target")} hits=[{targets}] rot={Value("rot")} lock={Value("anim_lock")} var={Value("anim_var")} damage={Value("damage_type")} knockback={Value("knockback")}";
+                return $"ability {actor} {Value("id")} at={Name("target")} hits=[{targets}] rot={Value("rot")} lock={Value("anim_lock")} var={Value("anim_var")} damage={Value("damage_type")} knockback={Value("knockback")} {Fields(client, row, at)}";
             case "impact":
                 return $"impact {actor} {Value("id")} target={Name("target")}";
             case "status_gain" or "status_lose":
                 return $"{kind} {actor} {Value("id")} source={Name("target")} {Value("detail")}";
-            case "spawn" or "eobj_spawn" or "set_pos" or "move" or "npc_knockback":
+            case "spawn" or "eobj_spawn":
+                return $"{kind} {actor} {Value("id")} {Position()} rot={Value("rot")} {Value("detail")} {Fields(client, row, at)}";
+            case "set_pos" or "move" or "npc_knockback":
                 return $"{kind} {actor} {Value("id")} {Position()} rot={Value("rot")} {Value("detail")}";
             case "enemy_list" or "despawn":
                 return $"{kind} {actor} {Value("id")} {Value("detail")}";
@@ -133,6 +135,21 @@ internal static partial class ClientParity
                 return $"{kind} {actor} {Value("id")} {Value("detail")} {Value("p")}";
         }
     }
+
+    // Only the host's: its own sim despawns the object, and only the client whose press an effect
+    // answers gets the press's sequence.
+    public static readonly string[] HostOnly = ["Lifetime", "SourceSequence"];
+
+    // Every field of what the client was given (SimTimeline.Fields), each actor named as the client
+    // names it, the host's own left out.
+    public static string Fields(TestClient client, Dictionary<string, string> row, double at)
+    {
+        var fields = ActorId().Replace(row.GetValueOrDefault("fields", ""), m => client.NameAt(uint.Parse(m.Groups[1].Value, NumberStyles.HexNumber), at));
+        return HostOnly.Aggregate(fields, (f, name) => Regex.Replace(f, $@"\b{name}=[^\s{{}}\[\],]+ ?", ""));
+    }
+
+    [GeneratedRegex(@"@([0-9A-F]{8})")]
+    private static partial Regex ActorId();
 
     // The timeline's hex argument list, with the one that names an actor named.
     private static string NamedArgs(TestClient client, string args, int entityIndex, double at)
