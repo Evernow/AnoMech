@@ -17,6 +17,8 @@ internal sealed class FakeEventObjects(SimTimeline timeline) : IEventObjects
 
     internal int Live => slots.Count(o => o is { Exists: true });
 
+    internal IEnumerable<uint> LiveEntityIds => slots.Where(o => o is { Exists: true }).Select(o => o!.EntityId);
+
     public IEventObjectProxy? Spawn(EventObjectSpawnConfig config, Placement placement)
     {
         var slot = FindFreeSlot();

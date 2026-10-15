@@ -61,6 +61,8 @@ internal sealed class FakeBattleCharas : IBattleCharas
     // Every character in the table but the local player: doppels and NPCs.
     internal int Live => slots.Count(s => s != null);
 
+    internal IEnumerable<uint> LiveEntityIds => slots.OfType<FakeCharacter>().Select(s => s.EntityId);
+
     internal void Free(int slot)
     {
         slots[slot] = null;
