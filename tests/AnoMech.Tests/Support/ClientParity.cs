@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
 using AnoMech.Core.Game.Party;
+using AnoMech.Multiplayer;
 
 namespace AnoMech.Tests;
 
@@ -17,14 +18,9 @@ internal sealed record ParityGap(string Kind, string What, double At, int Count)
 // movement, which goes out as their poses.
 internal static partial class ClientParity
 {
-    // ActorControlSelf a player's own client alone gets, and the party-wide ones every client gets
-    // for its own player.
-    private static readonly HashSet<uint> OwnSelf = [0x01, 0xED, 0x107];
-    private static readonly HashSet<uint> PartySelf = [0xB7, 0x1F9];
-    private static readonly HashSet<uint> MotionControls = [0xDC, 0xDF, 0xE1, 0xF1];
-    private const uint ZoneIn = 0xC8;
-    private const uint Marking = 0x1F6;
     private const string OwnPlayer = "own player";
+    // One without a rule reaches no peer: compared as one everyone gets, it shows as a gap.
+    private static readonly ControlRule Unruled = new(Delivery.Everyone);
 
     // How far apart the two clients may show one thing: the run's worst delivery, a resent
     // message's included, a hitch of the peer's own, its copy of a new actor arriving, and a few
@@ -105,17 +101,19 @@ internal static partial class ClientParity
             case "ac" or "ac_self":
             {
                 var category = Convert.ToUInt32(Value("id"), 16);
-                if (category == ZoneIn && seat) return null;
-                if (MotionControls.Contains(category) && player) return null;
-                if (OwnSelf.Contains(category) && player && actor != peerSeat) return null;
-                if (PartySelf.Contains(category) && actor == client.Seat.ToString()) actor = OwnPlayer;
-                return $"ac {actor} 0x{category:X} {NamedArgs(client, Value("p"), EntityArgIndex(category), at)}";
+                var rule = PacketRules.Controls.GetValueOrDefault(category) ?? Unruled;
+                if (rule.Delivery == Delivery.ZoneIn && seat) return null;
+                if (rule.Delivery == Delivery.Movement && player) return null;
+                if (rule.Delivery == Delivery.SeatOwner && player && actor != peerSeat) return null;
+                if (rule.Delivery == Delivery.EachOwnPlayer && actor == client.Seat.ToString()) actor = OwnPlayer;
+                return $"ac {actor} 0x{category:X} {NamedArgs(client, Value("p"), rule.ActorArg, at)}";
             }
             case "ac_target":
             {
                 var category = Convert.ToUInt32(Value("id"), 16);
-                if (category == Marking && actor == client.Seat.ToString()) actor = OwnPlayer;
-                return $"ac_target {actor} 0x{category:X} target={Name("target")} {NamedArgs(client, Value("p"), category == Marking ? 1 : -1, at)}";
+                var rule = PacketRules.TargetControls.GetValueOrDefault(category) ?? Unruled;
+                if (rule.Delivery == Delivery.EachOwnPlayer && actor == client.Seat.ToString()) actor = OwnPlayer;
+                return $"ac_target {actor} 0x{category:X} target={Name("target")} {NamedArgs(client, Value("p"), rule.ActorArg, at)}";
             }
             case "cast":
                 return $"cast {actor} {Value("id")} target={Name("target")} {Position()} rot={Value("rot")} {RelativeRotation().Replace(Value("detail"), "")} omen={Value("omen_delay")} ballista={Name("ballista")}";
@@ -135,14 +133,6 @@ internal static partial class ClientParity
                 return $"{kind} {actor} {Value("id")} {Value("detail")} {Value("p")}";
         }
     }
-
-    private static int EntityArgIndex(uint category) => category switch
-    {
-        0x15 or 0x23 => 2,
-        0x22 => 1,
-        0x25F or 0x1A1 => 0,
-        _ => -1,
-    };
 
     // The timeline's hex argument list, with the one that names an actor named.
     private static string NamedArgs(TestClient client, string args, int entityIndex, double at)
