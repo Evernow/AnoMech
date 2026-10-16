@@ -203,6 +203,12 @@ internal sealed class FakeBattleChara(FakeBattleCharas owner, int slot) : IBattl
                     new Vector3(Position16(arg1 >> 16), Position16(arg1 & 0xFFFF), Position16(arg2 >> 16)),
                     (arg2 & 0xFFFF) / (float)ushort.MaxValue * MathF.Tau - MathF.PI);
                 break;
+            case 0x48 when slot < 0: // limit break resolve; the client empties its gauge
+                if (Actor is { } user) user.LimitBreak = user.LimitBreak with { CurrentUnits = 0 };
+                break;
+            case 0x1F9 when slot < 0: // limit break gauge, p1 = bars, p2 = units, p3 = units per bar
+                if (Actor is { } own) own.LimitBreak = new LimitBreakBars((byte)arg1, (ushort)arg2, (ushort)arg3);
+                break;
         }
     }
 

@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
 using AnoMech.Core.Game.Party;
+using AnoMech.Core.Native.Interfaces;
+using AnoMech.Core.UserActions;
 using AnoMech.Multiplayer;
 
 namespace AnoMech.Tests;
@@ -14,8 +16,9 @@ internal sealed record ParityGap(string Kind, string What, double At, int Count)
 // What the host's game client was told against what a peer's was, row for row of their timelines
 // (SimTimeline), in each of the host's runs: every row one client got has to reach the other
 // within Slack, naming the same actors and carrying the same values. Left out is only what each client makes for itself: its
-// party's doppels and their ZoneIn, its own player's forced moves and falls, and the players'
-// movement, which goes out as their poses.
+// party's doppels and their ZoneIn, its own player's forced moves and falls, the players'
+// movement, which goes out as their poses, and what the two clients' own players press, which
+// each one's own game plays.
 //
 // What each client sets up for itself at a run's start (OwnSetup) has to be in place on the peer
 // before everything the host's client was shown after it: the host's packets reaching a client
@@ -47,8 +50,8 @@ internal static partial class ClientParity
         var slack = Slack(run);
         var players = new HashSet<string> { run.Host.Seat.ToString() };
         foreach (var p in run.Peers) players.Add(p.Seat.ToString());
-        var host = Rows(run.Host, players, peer.Seat);
-        var other = Rows(peer, players, peer.Seat);
+        var host = Rows(run.Host, players, run.Host.Seat, peer.Seat);
+        var other = Rows(peer, players, run.Host.Seat, peer.Seat);
         var otherByKey = Enumerable.Range(0, other.Count).ToLookup(i => other[i].Key);
         var matched = new bool[other.Count];
         var gaps = new List<(string Kind, string What, double At)>();
@@ -110,18 +113,18 @@ internal static partial class ClientParity
     }
 
     // peerSeat: the compared peer's, the one player whose own controls both clients have.
-    private static List<Row> Rows(TestClient client, IReadOnlySet<string> players, PartyRole peerSeat)
+    private static List<Row> Rows(TestClient client, IReadOnlySet<string> players, PartyRole hostSeat, PartyRole peerSeat)
     {
         var rows = new List<Row>();
         foreach (var row in client.Fake.Timeline.Rows)
         {
             var at = double.Parse(row["t"], CultureInfo.InvariantCulture);
-            if (Key(client, row, at, players, peerSeat.ToString()) is { } key) rows.Add(new Row(at, key, OwnSetup.Contains(row["kind"])));
+            if (Key(client, row, at, players, hostSeat.ToString(), peerSeat.ToString()) is { } key) rows.Add(new Row(at, key, OwnSetup.Contains(row["kind"])));
         }
         return rows;
     }
 
-    private static string? Key(TestClient client, Dictionary<string, string> row, double at, IReadOnlySet<string> players, string peerSeat)
+    private static string? Key(TestClient client, Dictionary<string, string> row, double at, IReadOnlySet<string> players, string hostSeat, string peerSeat)
     {
         string Name(string column) => row.GetValueOrDefault(column) is { Length: > 0 } hex ? client.NameAt(uint.Parse(hex, NumberStyles.HexNumber), at) : "nobody";
         string Value(string column) => row.GetValueOrDefault(column, "");
@@ -138,6 +141,8 @@ internal static partial class ClientParity
             case "afflictions":
                 return null;
             case "set_pos" or "move" or "npc_knockback" or "forced_follow" or "forced_stop" when player:
+                return null;
+            case "cast" or "ability" when (actor == hostSeat || actor == peerSeat) && PressedByAPlayer(Value("id")):
                 return null;
             case "ac" or "ac_self":
             {
@@ -176,6 +181,11 @@ internal static partial class ClientParity
                 return $"{kind} {actor} {Value("id")} {Value("detail")} {Value("p")}";
         }
     }
+
+    // A job's action or a limit break: only a player presses one.
+    private static bool PressedByAPlayer(string id)
+        => uint.TryParse(id, CultureInfo.InvariantCulture, out var actionId) && Natives.Data.Action(actionId) is { } action
+           && (action.IsPlayerAction || LimitBreakHandler.IsLimitBreak(actionId));
 
     // Only the host's: its own sim despawns the object, and only the client whose press an effect
     // answers gets the press's sequence.
