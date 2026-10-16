@@ -123,6 +123,12 @@ internal sealed class PacketRecorder
         if (Recording) pending.Add(shownBy is { } seat ? packet with { ShownBy = seat } : packet);
     }
 
+    // Every peer answers it, whatever is being shown.
+    public void RecordViewRequest(uint id)
+    {
+        if (Recording) pending.Add(new ViewRequestPacket(id));
+    }
+
     // What `show` sends is the seat's own action, which its client showed already: tagged so that
     // client skips it, and kept off the host's own player.
     public void ShownBy(PartyRole seat, Action show)

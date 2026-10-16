@@ -65,6 +65,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(PeerAppliedRoleStatusMessage), "peerAppliedRoleStatus")]
 [JsonDerivedType(typeof(KickMessage), "kick")]
 [JsonDerivedType(typeof(ActedMessage), "acted")]
+[JsonDerivedType(typeof(ViewReportMessage), "viewReport")]
 [JsonDerivedType(typeof(StreamStateMessage), "streamState")]
 [JsonDerivedType(typeof(StreamGapMessage), "streamGap")]
 [JsonDerivedType(typeof(StreamLostMessage), "streamLost")]
@@ -146,9 +147,8 @@ public sealed record LobbyStateMessage(
     List<Guid>? DebugBots = null) : MpMessage, IHostOnlyMessage;
 
 // The host's event clock when the message left. A peer starts its run from it instead of from
-// zero, which would leave it behind by the host's load time plus the travel time. FrameSeconds is
-// the host's average frame, part of the lead the peer takes on top.
-public sealed record RunClockState(float EventClock, float FrameSeconds);
+// zero, which would leave it behind by the host's load time plus the travel time.
+public sealed record RunClockState(float EventClock);
 
 public sealed record ClaimRoleMessage(Guid PeerId, PartyRole Role) : MpMessage, IPeerMessage;
 public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage, IPeerMessage;
@@ -187,8 +187,9 @@ public sealed record RolesSnapshotMessage(List<RoleState> Roles) : MpMessage, IH
 public sealed record RoleKilledMessage(PartyRole Role, string Cause) : MpMessage, IHostOnlyMessage;
 
 // One per knockback on a SimNetworkPuppet, applied to whoever holds that role locally. Row: the
-// Knockback sheet row, whose ActionEffect entry that seat's own client applies itself.
-public sealed record KnockbackMessage(PartyRole Role, float SourceX, float SourceY, float SourceZ, uint Row) : MpMessage, IHostOnlyMessage;
+// Knockback sheet row, whose ActionEffect entry that seat's own client applies itself. Late: the
+// seat was judged after the ActionEffect went out, so it carried no entry to apply.
+public sealed record KnockbackMessage(PartyRole Role, float SourceX, float SourceY, float SourceZ, uint Row, bool Late = false) : MpMessage, IHostOnlyMessage;
 
 // The other forced movements a scenario applies to a party member, each from the matching
 // ForcedMove on a SimNetworkPuppet. Push takes DurationSeconds when > 0, else Distance / Speed;
@@ -353,3 +354,7 @@ public sealed record PeerAppliedRoleStatusMessage(Guid PeerId, List<PartyRole> R
 // Peer -> host: a step of this player's own action (IUserActions.Acted), which the host shows on
 // the peer's seat for the rest of the party. Target names an actor as a GamePacket does.
 public sealed record ActedMessage(Guid PeerId, PlayerActionStep Step, ActionType ActionType, uint ActionId, uint Target, float CastSeconds) : MpMessage, IPeerMessage;
+
+// Peer -> host: where this player stood as their screen played the host's ViewRequestPacket, the
+// host's resolve they are judged by. Behind their earlier presses, which so count.
+public sealed record ViewReportMessage(Guid PeerId, uint Request, float X, float Y, float Z, float Rotation) : MpMessage, IPeerMessage;

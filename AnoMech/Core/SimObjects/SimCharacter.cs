@@ -75,8 +75,13 @@ public abstract class SimCharacter : ISimObject, IPositioned
 
     // What mechanics and the AI read, like the server's position; CharacterMotion says where each
     // kind of character gets it.
-    public Vector3 Position => Motion.Position;
-    public float Rotation => Motion.Rotation;
+    public Vector3 Position => judgedAt?.Position ?? Motion.Position;
+    public float Rotation => judgedAt?.Rotation ?? Motion.Rotation;
+
+    private Placement? judgedAt;
+
+    // Where a resolve judging off its moment has this character (Judgments).
+    internal void JudgeAt(Placement? at) => judgedAt = at;
 
     // Yalms (XZ) between Position and the model at the start of the last tick.
     public float ModelDivergence => Motion.ModelDivergence;
@@ -129,9 +134,10 @@ public abstract class SimCharacter : ISimObject, IPositioned
     // the ActionEffect.
     // Sim: player - nothing (the client slides itself from the entry), or 0xE1 for Direction 6;
     // bot - ActorMove slide with flag 0x08; NPC - the NPC knockback packet.
-    public void Knockback(Vector3 source, uint knockbackRow)
+    // inActionEffect: false for one judged after the hit's ActionEffect went out without its entry.
+    public void Knockback(Vector3 source, uint knockbackRow, bool inActionEffect = true)
     {
-        if (Natives.Data.Knockback(knockbackRow) is { } row) Force(new ForcedMove.Knockback(source, row));
+        if (Natives.Data.Knockback(knockbackRow) is { } row) Force(new ForcedMove.Knockback(source, row, inActionEffect));
     }
 
     // Replay: ActorControlSelf 0xE1 to the pushed player with no Knockback entry in the

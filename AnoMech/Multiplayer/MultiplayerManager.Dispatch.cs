@@ -198,6 +198,9 @@ public sealed partial class MultiplayerManager
                 peerLastSeenMs[pose.PeerId] = NowMs;
                 OnSelfPoseReceived(pose);
                 break;
+            case ViewReportMessage report when IsHost:
+                OnViewReported(report);
+                break;
             case PongMessage pong when IsHost:
                 peerLastSeenMs[pong.PeerId] = NowMs;
                 peerLatencyMs[pong.PeerId] = PingClockMs() - pong.SentAtMs;
@@ -269,13 +272,19 @@ public sealed partial class MultiplayerManager
                         DiagnosticLog.Warn($"[Multiplayer] Host: {who} reported status {applied.StatusId} on role {role}, but that slot is empty -- dropping.");
                         continue;
                     }
-                    if (sprint) SprintHandler.Apply(member, duration);
-                    else
+                    void Apply()
                     {
-                        // A re-press replaces the status, as it does on the peer; AddStatus alone would stack it.
-                        member.RemoveStatus(applied.StatusId);
-                        member.AddStatusParam(applied.StatusId, applied.Param, duration);
+                        if (sprint) SprintHandler.Apply(member, duration);
+                        else
+                        {
+                            // A re-press replaces the status, as it does on the peer; AddStatus alone would stack it.
+                            member.RemoveStatus(applied.StatusId);
+                            member.AddStatusParam(applied.StatusId, applied.Param, duration);
+                        }
                     }
+                    // Their own press was on their screen before any hit still waiting on their report.
+                    if (role == reporter) Plugin.Game.World.Judgments.OwnPress(member, Apply);
+                    else Apply();
                     DiagnosticLog.Info($"[Multiplayer] Host: applied {who}'s reported status {applied.StatusId} (duration={duration:F1}) to role {role}.");
                 }
                 break;

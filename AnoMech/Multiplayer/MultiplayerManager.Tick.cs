@@ -73,6 +73,7 @@ public sealed partial class MultiplayerManager
     {
         if (gameEventsSubscribed) return;
         gameEventsSubscribed = true;
+        Plugin.Game.World.Judgments.Views = this;
         Plugin.Game.InstanceExited += OnInstanceExited;
         Natives.UserActions.Acted += OnActed;
         Plugin.Game.World.Announced += text =>
@@ -147,8 +148,6 @@ public sealed partial class MultiplayerManager
 
     public void Tick(float deltaSeconds)
     {
-        if (deltaSeconds is > 0f and < MaxFrameSampleSeconds)
-            averageFrameSeconds += (deltaSeconds - averageFrameSeconds) * FrameSmoothing;
         sincePacketSend += deltaSeconds;
         StampEventClock();
         SubscribeGameEventsOnce();

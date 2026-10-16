@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using AnoMech.Core.Game;
 using AnoMech.Core.Native.Interfaces;
 using AnoMech.Core.SimObjects;
+using AnoMech.Core.UserActions;
 
 namespace AnoMech.Core.EnemyActions;
 
@@ -30,6 +31,14 @@ public sealed class EnemyActionContext
     private readonly float releaseDelay;
 
     public EnemyAction Action { get; }
+    // The resolve's moment, on the run clock.
+    internal float At { get; init; }
+    // Each member's statuses at their own moment of a resolve that waited on someone (Judgments).
+    internal IReadOnlyDictionary<SimCharacter, List<HeldStatus>>? Held { get; init; }
+    // Judged once the ActionEffect was out, which so showed none of this.
+    internal bool AfterActionEffect { get; init; }
+    // How long past the moment this is judged.
+    internal float Late { get; init; }
     // An enemy, or a party member using an action through SimParty.Act.
     public SimCharacter Caster { get; }
     public SimCharacter? Target { get; }
@@ -81,12 +90,15 @@ public sealed class EnemyActionContext
     // Applied now, so effects after this one see it, and shown to the client, from the caster, with
     // the ActionEffect. delayToEffectResult: shown only with the EffectResult at TimingSpec.DamageDelay.
     // Either way the full duration runs from when it shows. entryParam goes in the ActionEffect's gain entry.
+    // Judged past its moment, it has run since then, and one already over by now is never applied.
     public void AddStatus(SimCharacter who, ushort statusId, float duration = 0f, int stacks = 1, bool delayToEffectResult = false,
         byte entryParam = 0)
     {
         var revealAt = delayToEffectResult ? MathF.Max(Action.Timing.DamageDelay, releaseDelay) : releaseDelay;
         var delay = duration > 0f ? revealAt : 0f;
-        if (who.AddStatus(statusId, duration + delay, stacks, broadcastAddEvent: false, hidden: revealAt > 0f) is not { Slot: >= 0 } status) return;
+        var left = duration > 0f ? duration + delay - Late : 0f;
+        if (duration > 0f && left <= 0f) return;
+        if (who.AddStatus(statusId, left, stacks, broadcastAddEvent: AfterActionEffect, hidden: revealAt > Late) is not { Slot: >= 0 } status) return;
         status.ShownAsFrom(Caster);
         Outcome(who).StatusGains.Add((statusId, entryParam));
         if (status.Hidden) hiddenStatuses.Add((status, revealAt));
@@ -98,6 +110,17 @@ public sealed class EnemyActionContext
     // Runs once every effect has applied and the deaths due now have been dealt, so a follow-up
     // cast can't claim this action's kills.
     public void AfterResolve(System.Action run) => afterResolve.Add(run);
+
+    // As the judgment reads them: those held at the target's own moment.
+    internal IReadOnlyList<HeldStatus> StatusesOf(SimCharacter who)
+        => Held?.TryGetValue(who, out var held) == true ? held : HeldStatus.Of(who);
+
+    // A shield a hit counted is gone for the rest of this resolve too.
+    internal void SpendShields(SimCharacter who)
+    {
+        Mitigation.SpendShields(who);
+        if (Held?.TryGetValue(who, out var held) == true) held.RemoveAll(s => Mitigation.IsShieldStatus(s.StatusId));
+    }
 
     internal IReadOnlyCollection<TargetOutcome> Outcomes => outcomes.Values;
     internal IReadOnlyList<System.Action> AfterResolveActions => afterResolve;

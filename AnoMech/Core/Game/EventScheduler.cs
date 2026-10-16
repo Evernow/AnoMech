@@ -44,8 +44,11 @@ public sealed class EventScheduler
     // The caller's file:line rides along to the fire log, so a trace line leads back to the
     // timeline entry. Wrappers that schedule on their caller's behalf forward their own caller info.
     public void Add(float offset, Action action, [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
+        => At(elapsed + MathF.Max(0f, offset), action, file, line);
+
+    // At a run time rather than an offset from now; one already past fires on the next Tick.
+    public void At(float time, Action action, [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
     {
-        var time = elapsed + MathF.Max(0f, offset);
         var index = entries.FindIndex(e => e.Time > time);
         var entry = new Entry(time, action, $"{Path.GetFileName(file)}:{line}");
         if (index < 0) entries.Add(entry);

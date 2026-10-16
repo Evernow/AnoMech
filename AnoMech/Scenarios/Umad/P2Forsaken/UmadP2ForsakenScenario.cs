@@ -184,14 +184,20 @@ public sealed class UmadP2ForsakenScenario : IMultiplayerReplayable
         world.Events.Add(start, () =>
         {
             if (enemy1 == null || enemy2 == null) return;
-            var soakers1 = enemy1.Cast(UmadActions.ThePathOfLight).Hits.Select(h => h.Who).ToList();
-            var soakers2 = enemy2.Cast(UmadActions.ThePathOfLight).Hits.Select(h => h.Who).ToList();
-            if (soakers1.Count != 2 || soakers2.Count != 2) return;
-            ResolveTower(soakers1[0], 0);
-            ResolveTower(soakers1[1], 1);
-            ResolveTower(soakers2[0], 2);
-            ResolveTower(soakers2[1], 3);
-            world.Events.Add(0.6f, () => ReapplyLockons([soakers1[0], soakers1[1], soakers2[0], soakers2[1]], index));
+            var tower1 = enemy1.Cast(UmadActions.ThePathOfLight);
+            var tower2 = enemy2.Cast(UmadActions.ThePathOfLight);
+            // A soaker a peer plays is judged on their own client's report, a round trip on.
+            tower1.WhenJudged(_ => tower2.WhenJudged(_ =>
+            {
+                var soakers1 = tower1.Hits.Select(h => h.Who).ToList();
+                var soakers2 = tower2.Hits.Select(h => h.Who).ToList();
+                if (soakers1.Count != 2 || soakers2.Count != 2) return;
+                ResolveTower(soakers1[0], 0, start);
+                ResolveTower(soakers1[1], 1, start);
+                ResolveTower(soakers2[0], 2, start);
+                ResolveTower(soakers2[1], 3, start);
+                world.Events.At(start + 0.6f, () => ReapplyLockons([soakers1[0], soakers1[1], soakers2[0], soakers2[1]], index));
+            }));
         });
     }
     
@@ -227,10 +233,10 @@ public sealed class UmadP2ForsakenScenario : IMultiplayerReplayable
        DiagnosticLog.Info($"Lockons reassignment {s}");
     }
     
-    private void ResolveTower(SimCharacter character, int index)
+    private void ResolveTower(SimCharacter character, int index, float start)
     {
         var lockon = state.Lockons[((ISimPartyMember)character).Role];
-        world.Events.Add(0.6f, () =>
+        world.Events.At(start + 0.6f, () =>
         {
             var helper = towerHelper[index];
             switch (lockon)

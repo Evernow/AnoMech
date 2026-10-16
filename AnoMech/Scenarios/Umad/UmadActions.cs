@@ -557,6 +557,8 @@ public static class UmadActions
 
     private sealed class NothingnessEffect : IEnemyActionEffect
     {
+        public EffectScope Scope => EffectScope.PerTarget;
+
         public void Apply(EnemyActionContext ctx, IReadOnlyList<SimCharacter> hits)
         {
             foreach (var target in hits)

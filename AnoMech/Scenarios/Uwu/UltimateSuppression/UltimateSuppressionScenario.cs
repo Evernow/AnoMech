@@ -407,10 +407,17 @@ public class UltimateSuppressionScenario : IMultiplayerReplayable
 
         world.Events.Add(22.60f, () => razorPlumesCircling = 0f);
 
+        // A song on someone a peer plays is judged on their own client's report, a round trip on.
         world.Events.Add(23.57f, () =>
         {
-            if (state.ChiradaMistralSong?.Hits is [var chiradaHit, ..]) dummies[11]?.Cast(Actions.GreatWhirlwind, chiradaHit.At);
-            if (state.SuparnaMistralSong?.Hits is [var suparnaHit, ..]) dummies[12]?.Cast(Actions.GreatWhirlwind, suparnaHit.At);
+            state.ChiradaMistralSong?.WhenJudged(song =>
+            {
+                if (song.Hits is [var chiradaHit, ..]) dummies[11]?.Cast(Actions.GreatWhirlwind, chiradaHit.At);
+            });
+            state.SuparnaMistralSong?.WhenJudged(song =>
+            {
+                if (song.Hits is [var suparnaHit, ..]) dummies[12]?.Cast(Actions.GreatWhirlwind, suparnaHit.At);
+            });
         });
 
         world.Events.Add(24.47f, () => garuda?.PlayActionTimeline(ActionTimelineId.WarpStart2));

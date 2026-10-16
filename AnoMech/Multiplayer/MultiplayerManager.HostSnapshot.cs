@@ -19,7 +19,7 @@ public sealed partial class MultiplayerManager
         switch (move)
         {
             case ForcedMove.Knockback kb:
-                return new KnockbackMessage(role, kb.From.X, kb.From.Y, kb.From.Z, kb.Row.Id);
+                return new KnockbackMessage(role, kb.From.X, kb.From.Y, kb.From.Z, kb.Row.Id, Late: !kb.InActionEffect);
             case ForcedMove.Push push:
                 return new PushMessage(role, push.Heading, push.Distance, 0f, push.DurationSeconds);
             case ForcedMove.Carry carry:
@@ -83,7 +83,7 @@ public sealed partial class MultiplayerManager
         ? peerLastSeenMs.TryGetValue(peerId, out var lastSeen) && NowMs - lastSeen > PeerStaleTimeoutMs
         : peerStatuses.TryGetValue(peerId, out var entry) && entry.SecondsSinceLastSeen * 1000f > PeerStaleTimeoutMs;
 
-    // TickCount64 only moves every ~15.6 ms, too coarse for the clock lead built on this ping.
+    // TickCount64 only moves every ~15.6 ms, too coarse for the latency this ping measures.
     private long PingClockMs() => Time.GetElapsedTime(0).Ticks / TimeSpan.TicksPerMillisecond;
 
     // Comfortably more than MaxBehindMs of them.

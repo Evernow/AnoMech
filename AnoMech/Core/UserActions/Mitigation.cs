@@ -102,7 +102,9 @@ public readonly record struct Mitigation(
     public static void SpendShields(SimCharacter target)
     {
         foreach (var status in target.ActiveStatusSnapshot)
-            if (ByStatusId.TryGetValue(status.StatusId, out var m) && m.IsShield)
+            if (IsShieldStatus(status.StatusId))
                 target.RemoveStatus(status.StatusId);
     }
+
+    public static bool IsShieldStatus(ushort statusId) => ByStatusId.TryGetValue(statusId, out var m) && m.IsShield;
 }

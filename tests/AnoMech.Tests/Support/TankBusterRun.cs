@@ -114,9 +114,8 @@ internal sealed class TankBusterRun
         void Seen(MitigationNeed need)
         {
             if (Plugin.Multiplayer is not { IsHost: true } || need.Target is not ISimPartyMember member) return;
-            var statuses = need.Target.ActiveStatusSnapshot.Select(s => s.StatusId).ToList();
-            seen.Add(new MitigationCheck(Plugin.Game.World.Events.Elapsed, member.Role, need.ActionId, need.Kind, need.Required,
-                need.Judged, Mitigation.Effective(statuses, need.Kind), statuses));
+            seen.Add(new MitigationCheck(need.At, member.Role, need.ActionId, need.Kind, need.Required,
+                need.Judged, Mitigation.Effective(need.Statuses, need.Kind), need.Statuses));
         }
 
         PlayerSeat Seat(PartyRole role) => new(role, BotControlled: !humans.ContainsKey(role) && !bystanders.Contains(role));

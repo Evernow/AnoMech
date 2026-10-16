@@ -164,7 +164,7 @@ internal sealed class PlayerMotion : CharacterMotion, INavigated
                 if (kb.Row.Speed <= 0f) return;
                 var duration = kb.Row.Distance / kb.Row.Speed;
                 // The ActionEffect that carried the row already made the client slide its player.
-                if (kb.Row.ClientApplies) Hold(duration);
+                if (kb.Row.ClientApplies && kb.InActionEffect) Hold(duration);
                 else PushAway(kb.From, kb.Row.Distance, duration);
                 break;
             }

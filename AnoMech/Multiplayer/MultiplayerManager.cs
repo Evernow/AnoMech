@@ -7,6 +7,7 @@ using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
 using AnoMech.Core;
+using AnoMech.Core.EnemyActions;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Geometry;
@@ -27,7 +28,7 @@ namespace AnoMech.Multiplayer;
 //
 // Everything here runs on the framework thread: Tick() via OnFrameworkUpdate, and relay
 // messages are queued and drained there (see DrainPendingMessages).
-public sealed partial class MultiplayerManager : IDisposable
+public sealed partial class MultiplayerManager : IDisposable, IRemoteViews
 {
     private IRelayConnection? relay;
     private bool running;
@@ -71,10 +72,6 @@ public sealed partial class MultiplayerManager : IDisposable
     private RunClockState? hostClockAtStart;
     private long hostClockReceivedAt;
     private bool eventClockSynced;
-    // Smoothed frame time, sent in RunClockState; load hitches are left out.
-    private float averageFrameSeconds = 1f / 60f;
-    private const float MaxFrameSampleSeconds = 0.1f;
-    private const float FrameSmoothing = 0.05f;
     // The run clock advances once per frame by that frame's whole delta; a clock sent between
     // frames extrapolates from the stamp. Only while Elapsed still holds the stamped value: once
     // the clock has moved since (this frame's Game.Tick, a reset, an Advance) Elapsed is fresher.
@@ -831,7 +828,7 @@ public sealed partial class MultiplayerManager : IDisposable
     private RunClockState? HostRunClock()
     {
         if (!IsHost || !running || !hostScenarioStarted || Plugin.Game.ActiveScenario is null) return null;
-        return new RunClockState(EventClockNow(), averageFrameSeconds);
+        return new RunClockState(EventClockNow());
     }
 
     private float EventClockNow()
@@ -1093,19 +1090,18 @@ public sealed partial class MultiplayerManager : IDisposable
     }
 
     // Starting from zero would leave this run behind the host's by the host's load time plus the
-    // travel time. It also runs ahead of the host by our poses' own delay (the trip back, plus
-    // about a host frame since the host applies poses after that frame's hit checks), so the host
-    // judges our character in step with its own bots. Compared at this frame's clock stamp,
+    // travel time. It keeps the time of what this client is shown, a trip behind the host's own:
+    // the host judges our character where our screen had it, so whatever runs on this clock, a
+    // debug bot's walk, moves in step with the screen. Compared at this frame's clock stamp,
     // taken just after the Game.Tick that Events.Elapsed describes.
     private void SyncClockToHost()
     {
         if (hostClockAtStart is not { } clock || eventClockSynced) return;
         eventClockSynced = true;
         var game = Plugin.Game;
-        var (target, oneWay, poseLead) = HostClockTarget(clock, hostClockReceivedAt);
-        var advance = target - game.Events.Elapsed;
+        var advance = HostClockTarget(clock, hostClockReceivedAt) - game.Events.Elapsed;
         game.Events.Advance(advance);
-        DiagnosticLog.Info($"[Multiplayer] Peer: run clock {(advance > 0f ? $"moved up {advance * 1000f:F0} ms" : "left as is")}: the host's time plus a {poseLead * 1000f:F0} ms lead (Start sent {clock.EventClock:F3}s into the host's run, {oneWay * 1000f:F0} ms one-way, {clock.FrameSeconds * 1000f:F1} ms host frame).");
+        DiagnosticLog.Info($"[Multiplayer] Peer: run clock {(advance > 0f ? $"moved up {advance * 1000f:F0} ms" : "left as is")} to the host's as it reaches us (Start sent {clock.EventClock:F3}s into the host's run).");
     }
 
     // A Start that came late, sent again after a link drop, left this run behind the host's;
@@ -1119,22 +1115,15 @@ public sealed partial class MultiplayerManager : IDisposable
         if (pingClock is not { } ping || !eventClockSynced) return;
         pingClock = null;
         var game = Plugin.Game;
-        var advance = HostClockTarget(ping.Clock, ping.ReceivedAt).Target - game.Events.Elapsed;
+        var advance = HostClockTarget(ping.Clock, ping.ReceivedAt) - game.Events.Elapsed;
         if (advance < ClockCatchUpSeconds) return;
         game.Events.Advance(advance);
         DiagnosticLog.Info($"[Multiplayer] Peer: run clock caught up {advance * 1000f:F0} ms to the host's.");
     }
 
-    // The host's run time as this frame's stamp sees it, plus our lead (see SyncClockToHost).
-    private (float Target, float OneWay, float PoseLead) HostClockTarget(RunClockState clock, long receivedAt)
-    {
-        var hostClock = NetGuard.Clamp(clock.EventClock, 0f, 3600f);
-        var oneWay = NetGuard.Clamp(peerStatuses.GetValueOrDefault(MyPeerId)?.LatencyMs ?? 0f, 0f, 4000f) / 2000f;
-        var hostFrame = NetGuard.Clamp(clock.FrameSeconds, 0f, MaxFrameSampleSeconds);
-        var poseLead = oneWay + (hostFrame > 0f ? hostFrame : 1f / 60f);
-        var target = hostClock + oneWay + poseLead + (float)Time.GetElapsedTime(receivedAt, eventClockStampedAt).TotalSeconds;
-        return (target, oneWay, poseLead);
-    }
+    // The host's run time it sent, as this frame's stamp sees it (see SyncClockToHost).
+    private float HostClockTarget(RunClockState clock, long receivedAt)
+        => NetGuard.Clamp(clock.EventClock, 0f, 3600f) + (float)Time.GetElapsedTime(receivedAt, eventClockStampedAt).TotalSeconds;
 
     // A peer's copy of a host actor as it spawns: its entity id here, and the host's.
     internal event Action<uint, uint>? ActorReplayed;

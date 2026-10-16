@@ -184,7 +184,7 @@ public sealed class ScenarioSession
     private void UpdateMechanicResult(float deltaSeconds)
     {
         if (resultReported) return;
-        if (!world.Events.IsEmpty)
+        if (!world.Events.IsEmpty || world.Judgments.Waiting)
         {
             finishedElapsed = null;
             return;

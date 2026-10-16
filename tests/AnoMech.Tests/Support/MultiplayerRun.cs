@@ -161,7 +161,7 @@ internal sealed class MultiplayerRun
     // The inputs the fight ended before.
     public int InputsLeft => inputs.Count;
 
-    // Each run clock as the host's run ended; a peer's leads the host's by its poses' delay.
+    // Each run clock as the host's run ended; a peer's keeps the time of what it's shown, a trip behind the host's.
     public double HostClockAtEnd { get; private set; }
     public IReadOnlyList<double> PeerClocksAtEnd { get; private set; } = [];
 

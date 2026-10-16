@@ -143,49 +143,106 @@ internal sealed class EnemyActionHandler(SimCharacter caster, SimCast cast, SimW
         delivery.Sequence = cast.NativeActionEffect(
             id, action.Cast.AnimationLock, (ushort)id, animationVariation, ActionType.Action, 0,
             rotation: caster.Rotation + action.Cast.Rotation, position: aim ?? caster.Position, animationTargetId: castTarget, targets: targets);
+        delivery.Released = true;
         delivery.Confirmations = confirmations;
         if (delivery.ImpactDue) ConfirmDamage(delivery);
     }
 
+    // Who it hits is judged by Judgments, each party member at their own moment of it.
     private void Resolve(EnemyAction action, SimCharacter? target, Vector3? location, EnemyActionCast handle, Delivery delivery, float releaseDelay)
     {
-        var party = world.Party;
-        var origin = target is not null && target != caster && IsDirectional(action)
+        var moment = new Moment(world.Events.Elapsed,
+            (m, members, once) => Judge(m, action, target, location, members, once, handle, delivery, releaseDelay), handle.Judged)
+        {
+            Shared = action.Area.ExcludeCaster || action.Area.AdjustTargets is not null || action.Effects.Any(e => e.Scope == EffectScope.AllTargets),
+        };
+        var members = world.Party.ActiveMembers().ToList();
+        world.Judgments.Resolve(moment, caster, target, members, members.Append(caster).Concat(target is null ? [] : [target]).Distinct().ToList());
+    }
+
+    private Placement Origin(EnemyAction action, SimCharacter? target, Vector3? location)
+        => target is not null && target != caster && IsDirectional(action)
             ? caster.Placement().Face(target.Position)
             : target?.Placement()
               ?? (location is { } at ? new Placement(at, caster.Rotation) : caster.Placement());
-        var ctx = new EnemyActionContext(action, caster, target, origin, party, releaseDelay);
 
-        // A party member's own action never hits them.
-        IReadOnlyList<SimCharacter> hits = IsSingleTarget(action)
-            ? party.ActiveMembers().Where(m => ReferenceEquals(m, target)).ToList()
-            : AreaHits(action, origin, origin.Position == caster.Position ? caster.HitboxRadius : 0f, party)
-                .Where(h => h != caster).ToList();
-        if (action.Area.ExcludeCaster
-            && hits.MinBy(h => DistanceXZ(h.Position, caster.Position)) is { } baiter
-            && DistanceXZ(baiter.Position, caster.Position) <= ExcludeCasterThreshold)
-            hits = hits.Where(h => h != baiter).ToList();
-        if (action.Area.AdjustTargets is { } adjust) hits = adjust(ctx, hits);
-        ctx.Hits = hits;
-        if (!IsSingleTarget(action))
-            ctx.NpcHits = NpcAreaHits(action, origin, origin.Position == caster.Position ? caster.HitboxRadius : 0f);
-        var positions = hits.Select(h => h.Position).ToList();
-        DiagnosticLog.Info(
-            $"[EnemyAction] Resolve: {Natives.Data.ActionName(action.ActionId)} at ({origin.Position.X:F1},{origin.Position.Z:F1}) rot={origin.Rotation:F3} -- {hits.Count} target(s): "
-            + string.Join(", ", hits.Select(t => (t as ISimPartyMember)?.Role.ToString() ?? "?")));
+    // Who of `members` the resolve hits, and what it does to them. Off its moment, everyone stands
+    // where it had them, a remote player where their own screen did, the area on its caster and
+    // target among them, and is judged on the statuses they had then.
+    private void Judge(Moment moment, EnemyAction action, SimCharacter? target, Vector3? location, IReadOnlyList<SimCharacter> members, bool once,
+        EnemyActionCast handle, Delivery delivery, float releaseDelay)
+    {
+        var now = world.Events.Elapsed;
+        var held = members.Where(moment.Held.ContainsKey).ToDictionary(m => m, m => moment.Held[m]);
+        foreach (var (who, at) in moment.Placements) who.JudgeAt(at);
+        foreach (var (who, at) in moment.Reported) who.JudgeAt(at);
+        EnemyActionContext ctx;
+        Placement origin;
+        IReadOnlyList<SimCharacter> hits;
+        List<Vector3> positions;
+        try
+        {
+            origin = Origin(action, target, location);
+            var casterHitbox = origin.Position == caster.Position ? caster.HitboxRadius : 0f;
+            ctx = new EnemyActionContext(action, caster, target, origin, world.Party, releaseDelay)
+            {
+                At = moment.At,
+                Held = held,
+                AfterActionEffect = delivery.Released,
+                Late = now - moment.At,
+            };
+            // A party member's own action never hits them.
+            var area = IsSingleTarget(action) ? (AoeQuery?)null : AreaOf(action, origin, casterHitbox);
+            hits = area is { } query
+                ? query.Run(new CharacterFind<SimCharacter>(members.ToList())).Where(h => h != caster).ToList()
+                : members.Where(m => ReferenceEquals(m, target)).ToList();
+            if (action.Area.ExcludeCaster
+                && hits.MinBy(h => DistanceXZ(h.Position, caster.Position)) is { } baiter
+                && DistanceXZ(baiter.Position, caster.Position) <= ExcludeCasterThreshold)
+                hits = hits.Where(h => h != baiter).ToList();
+            if (action.Area.AdjustTargets is { } adjust) hits = adjust(ctx, hits);
+            ctx.Hits = hits;
+            if (once && !IsSingleTarget(action))
+                ctx.NpcHits = NpcAreaHits(action, origin, casterHitbox);
+            positions = hits.Select(h => h.Position).ToList();
+            if (now <= moment.At || hits.Count > 0)
+                DiagnosticLog.Info(
+                    $"[EnemyAction] Resolve: {Natives.Data.ActionName(action.ActionId)} at ({origin.Position.X:F1},{origin.Position.Z:F1}) rot={origin.Rotation:F3} -- {hits.Count} target(s): "
+                    + string.Join(", ", hits.Select(t => (t as ISimPartyMember)?.Role.ToString() ?? "?"))
+                    + (now > moment.At ? $" (judged {now - moment.At:F2}s on)" : ""));
 
-        foreach (var effect in action.Effects)
-            effect.Apply(ctx, hits);
+            Judged?.Invoke(new JudgedPart(action.ActionId, moment.At, members, hits, area,
+                action.Area.ExcludeCaster || action.Area.AdjustTargets is not null, caster is ISimPartyMember || target is ISimPartyMember, moment.Shared));
+
+            foreach (var effect in action.Effects)
+                if (once || effect.Scope != EffectScope.Once) effect.Apply(ctx, hits);
+        }
+        finally
+        {
+            foreach (var who in moment.Placements.Keys) who.JudgeAt(null);
+            foreach (var who in moment.Reported.Keys) who.JudgeAt(null);
+        }
         handle.Resolve(origin, hits.Select((h, i) => new EnemyActionCast.Hit(h, positions[i], ctx.IsKilled(h))).ToList());
+        Deliver(moment, action, ctx, delivery);
+    }
 
-        delivery.Outcomes = ctx.Outcomes;
+    // Timed from the moment, so a part judged late lands when it would have: what's already due
+    // goes now. What's judged once the ActionEffect is out had no entries in it, so no flytext, and
+    // a knockback its client would have slid by goes as the push the server sends instead.
+    private void Deliver(Moment moment, EnemyAction action, EnemyActionContext ctx, Delivery delivery)
+    {
+        var late = delivery.Released;
+        if (!late) delivery.Outcomes.AddRange(ctx.Outcomes);
         // Ahead of the deaths it shares a time with, so the killing hit lands on a living target.
-        if (ctx.Outcomes.Any(o => o.Damage is not null))
-            Schedule(action.Timing.DamageDelay, () => ConfirmDamage(delivery));
+        if (!late && !delivery.ConfirmScheduled && ctx.Outcomes.Any(o => o.Damage is not null))
+        {
+            delivery.ConfirmScheduled = true;
+            At(moment, action.Timing.DamageDelay, () => ConfirmDamage(delivery));
+        }
         foreach (var (status, revealAt) in ctx.HiddenStatuses)
-            Schedule(revealAt, status.Reveal);
+            At(moment, revealAt, status.Reveal);
         foreach (var (who, statusId) in ctx.ImpactRemovals)
-            Schedule(action.Timing.DamageDelay, () =>
+            At(moment, action.Timing.DamageDelay, () =>
             {
                 if (who.IsAlive()) who.RemoveStatus(statusId);
             });
@@ -195,9 +252,9 @@ internal sealed class EnemyActionHandler(SimCharacter caster, SimCast cast, SimW
             if (outcome.Push is { } push)
             {
                 // A player's client slides itself by the row; an NPC goes as far as the server lets it.
-                Schedule(push.Delay ?? action.Timing.DamageDelay, () =>
+                At(moment, push.Delay ?? action.Timing.DamageDelay, () =>
                 {
-                    if (push.KnockbackRow is { } row && who is ISimPartyMember) who.Knockback(push.From, row);
+                    if (push.KnockbackRow is { } row && who is ISimPartyMember) who.Knockback(push.From, row, inActionEffect: !late);
                     else if (push.Speed > 0f)
                     {
                         var distance = who is ISimPartyMember ? push.Distance : world.NpcPushDistance(who.Position, push.From, push.Distance);
@@ -206,7 +263,7 @@ internal sealed class EnemyActionHandler(SimCharacter caster, SimCast cast, SimW
                 });
             }
             if (outcome.Killed)
-                Schedule(action.Timing.DamageDelay, () => who.Die(action.ActionId, Explain(action.DeathExplanation, outcome.Explanation)));
+                At(moment, action.Timing.DamageDelay, () => who.Die(action.ActionId, Explain(action.DeathExplanation, outcome.Explanation)));
         }
         foreach (var run in ctx.AfterResolveActions)
             run();
@@ -217,14 +274,22 @@ internal sealed class EnemyActionHandler(SimCharacter caster, SimCast cast, SimW
     // The ActionEffect's limit; damage, knockback and the marker take three.
     private const int MaxEffectsPerTarget = 8;
 
-    private static IReadOnlyList<SimCharacter> AreaHits(EnemyAction action, Placement origin, float casterHitboxRadius, SimParty party)
+    private static AoeQuery AreaOf(EnemyAction action, Placement origin, float casterHitboxRadius)
     {
         var query = new AoeQuery(action.ActionId, origin, action.Cast.Rotation + action.Area.Rotation, action.Area.Size, action.Area.CastTypeOverride, casterHitboxRadius);
 #if DEBUG
         AnoMech.Windows.DamageDebugWindow.Instance?.Record(query);
 #endif
-        return query.Run(party.Find);
+        return query;
     }
+
+    // Every part a resolve judges, for the headless test harness. Area: null for a single target.
+    // Filtered: some of those the area caught are left out. OnPlayer: cast by or at a party member.
+    // Shared: what it does turns on who else it caught.
+    internal sealed record JudgedPart(uint ActionId, float At, IReadOnlyList<SimCharacter> Members, IReadOnlyList<SimCharacter> Hits, AoeQuery? Area,
+        bool Filtered, bool OnPlayer, bool Shared);
+
+    internal static event Action<JudgedPart>? Judged;
 
     private IReadOnlyList<SimEnemy> NpcAreaHits(EnemyAction action, Placement origin, float casterHitboxRadius)
     {
@@ -261,10 +326,12 @@ internal sealed class EnemyActionHandler(SimCharacter caster, SimCast cast, SimW
     // Resolve's outcomes, for the ActionEffect; the ActionEffect's ids, for the EffectResults.
     private sealed class Delivery
     {
-        public IReadOnlyCollection<EnemyActionContext.TargetOutcome> Outcomes = [];
+        public readonly List<EnemyActionContext.TargetOutcome> Outcomes = [];
         public uint Sequence;
         public IReadOnlyList<(SimCharacter Target, byte Index)> Confirmations = [];
         public bool ImpactDue;
+        public bool Released;
+        public bool ConfirmScheduled;
     }
 
     // Anything due now runs inline: an instant action resolves inside the Cast() call, so casts
@@ -273,5 +340,13 @@ internal sealed class EnemyActionHandler(SimCharacter caster, SimCast cast, SimW
     {
         if (delay <= 0f) run();
         else world.Events.Add(delay, run);
+    }
+
+    // `delay` past the moment, inline as Schedule once due.
+    private void At(Moment moment, float delay, Action run)
+    {
+        var time = moment.At + MathF.Max(0f, delay);
+        if (time <= world.Events.Elapsed) run();
+        else world.Events.At(time, run);
     }
 }

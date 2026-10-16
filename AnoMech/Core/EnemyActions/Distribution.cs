@@ -24,10 +24,15 @@ public abstract record Distribution
     // `index` is the target's place in `hits`, front first: nearest the origin, or furthest up a line. The reason is said of a
     // death the hit deals.
     internal abstract (Hit? Hit, string? Reason) Assign(EnemyActionContext ctx, IReadOnlyList<SimCharacter> hits, int index, SimCharacter target);
+
+    // Each target's hit depends on that target alone, not on who else it reached.
+    internal virtual bool JudgesEachAlone => false;
 }
 
 internal sealed record EachDistribution : Distribution
 {
+    internal override bool JudgesEachAlone => true;
+
     internal override (Hit? Hit, string? Reason) Assign(EnemyActionContext ctx, IReadOnlyList<SimCharacter> hits, int index, SimCharacter target) => (null, null);
 }
 
@@ -43,6 +48,8 @@ internal sealed record WildChargeDistribution(int Front, int? Min, Hit? FrontHit
 
 internal sealed record FalloffDistribution(float LethalWithin) : Distribution
 {
+    internal override bool JudgesEachAlone => true;
+
     internal override (Hit? Hit, string? Reason) Assign(EnemyActionContext ctx, IReadOnlyList<SimCharacter> hits, int index, SimCharacter target)
     {
         var dx = target.Position.X - ctx.Origin.Position.X;

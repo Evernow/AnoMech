@@ -531,11 +531,16 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     private void ShootNothingness(SimEnemy? hole, SimCharacter? target)
     {
         if (hole?.Cast(UmadActions.Nothingness, target) is not { } shot) return;
-        var spent = shot.Hits.Count(h => h.Who.HasStatus(StatusId.MeanestExistence)
-                                         && !h.Who.HasStatus(StatusId.PrimordialCrust)
-                                         && !h.Killed);
-        if (spent > 0)
-            world.Events.Add(CleanseDelayAfterSpentCrust, () => PrimodialCrustsToResolve += spent);
+        var shotAt = world.Events.Elapsed;
+        // Someone a peer plays is judged on their own client's report, a round trip on.
+        shot.WhenJudged(_ =>
+        {
+            var spent = shot.Hits.Count(h => h.Who.HasStatus(StatusId.MeanestExistence)
+                                             && !h.Who.HasStatus(StatusId.PrimordialCrust)
+                                             && !h.Killed);
+            if (spent > 0)
+                world.Events.At(shotAt + CleanseDelayAfterSpentCrust, () => PrimodialCrustsToResolve += spent);
+        });
     }
 
     private void Run_Black_Hole_40004166()

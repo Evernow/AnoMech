@@ -10,8 +10,9 @@ namespace AnoMech.Core.Game.Motion;
 internal abstract record ForcedMove
 {
     // Away from `From`, by a Knockback sheet row an ActionEffect carried. The client applies it to
-    // its own player itself, except for a row the server sends as the push packet.
-    public sealed record Knockback(Vector3 From, KnockbackRow Row) : ForcedMove;
+    // its own player itself, except for a row the server sends as the push packet, or one the
+    // ActionEffect went out without (InActionEffect false).
+    public sealed record Knockback(Vector3 From, KnockbackRow Row, bool InActionEffect = true) : ForcedMove;
 
     // A scripted push, which no Knockback row describes: the server sends it as the push packet.
     // Along a world heading (Placement.Rotation convention)...

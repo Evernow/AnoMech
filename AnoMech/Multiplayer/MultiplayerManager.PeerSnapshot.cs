@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using AnoMech.Core;
+using AnoMech.Core.EnemyActions;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
@@ -40,6 +41,13 @@ public sealed partial class MultiplayerManager
         _ = Send(new PeerAppliedRoleStatusMessage(MyPeerId, roles.ToList(), statusId, duration, param));
     }
 
+    // Where our player stands as our screen reaches the host's resolve `id`.
+    private void ReportView(uint id)
+    {
+        if (Plugin.Game.World.Party.Player is not { } player) return;
+        _ = Send(new ViewReportMessage(MyPeerId, id, player.Position.X, player.Position.Y, player.Position.Z, player.Rotation));
+    }
+
     // ---- Host: applying a peer's reported pose to their puppet -------------
 
     private void OnSelfPoseReceived(SelfPoseMessage msg)
@@ -56,6 +64,21 @@ public sealed partial class MultiplayerManager
         else
             DiagnosticLog.Debug($"[Multiplayer] SelfPose from {Session.NameOf(msg.PeerId)} ({role}) but that slot isn't a SimNetworkPuppet -- dropping.");
     }
+
+    private void OnViewReported(ViewReportMessage msg)
+    {
+        if (Session.RoleOf(msg.PeerId) is not { } role || Plugin.Game.World.Party.Get(role) is not SimNetworkPuppet puppet) return;
+        if (!NetGuard.TryPosition(msg.X, msg.Y, msg.Z, out var position)) return;
+        Plugin.Game.World.Judgments.Report(puppet, msg.Request, new Placement(position, NetGuard.Rotation(msg.Rotation)));
+    }
+
+    // A seat a peer plays, while that peer is still heard from: its own client says where its
+    // screen had it at each resolve.
+    bool IRemoteViews.Reports(SimCharacter member)
+        => IsHost && running && recorder is { Recording: true } && member is SimNetworkPuppet puppet
+           && Session.ClaimedBy.TryGetValue(puppet.Role, out var peer) && peer != MyPeerId && !IsPeerStale(peer);
+
+    void IRemoteViews.Request(uint id) => recorder?.RecordViewRequest(id);
 
     // ---- Peer: entering the host's run --------------------------------------
 
@@ -96,6 +119,7 @@ public sealed partial class MultiplayerManager
         {
             replay = new PacketReplay(peerNatives, Plugin.Game.World, myRole);
             replay.Copied += (local, host) => ActorReplayed?.Invoke(local, host);
+            replay.ViewRequested += ReportView;
         }
         earlyPackets.Clear();
         peerEnteredInstance = false;
@@ -275,12 +299,12 @@ public sealed partial class MultiplayerManager
 
     // The hit's ActionEffect already carried the knockback entry, which this client's own player
     // acts on; the forced move holds a debug bot's walk for it, or pushes for a row the client
-    // leaves to the server.
+    // leaves to the server or an entry the ActionEffect went out without.
     private void OnKnockbackReceived(KnockbackMessage msg)
     {
         if (!PeerInRun) return;
         if (!NetGuard.TryPosition(msg.SourceX, msg.SourceY, msg.SourceZ, out var source)) return;
-        OwnMember(msg.Role, "Knockback")?.Knockback(source, msg.Row);
+        OwnMember(msg.Role, "Knockback")?.Knockback(source, msg.Row, inActionEffect: !msg.Late);
     }
 
     private void OnEndReceived(EndMessage msg)

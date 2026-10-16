@@ -34,8 +34,8 @@ public class LinkInterruptionTests
     // after that.
     private const double FirstReconnect = 2.1, SecondReconnect = 6.1;
 
-    // A peer's run clock against the host's: on it, or ahead by its poses' delay.
-    private const double ClockBehind = 0.05, ClockAhead = 0.25;
+    // A peer's run clock against the host's: on it, give or take a frame or two.
+    private const double ClockBehind = 0.05, ClockAhead = 0.05;
 
     private static List<Type> Scenarios() =>
         ScenarioCatalog.Create().Scenarios.Where(s => s.SupportsMultiplayer).Select(s => s.GetType()).ToList();

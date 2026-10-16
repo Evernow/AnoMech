@@ -52,6 +52,7 @@ internal static class PacketActor
 [JsonDerivedType(typeof(HatersPacket), "haters")]
 [JsonDerivedType(typeof(WeatherPacket), "weather")]
 [JsonDerivedType(typeof(AfflictionsPacket), "afflictions")]
+[JsonDerivedType(typeof(ViewRequestPacket), "viewRequest")]
 public abstract record GamePacket
 {
     // The seat whose own client showed this already, its player's own action: that client skips it.
@@ -123,3 +124,7 @@ public sealed record WeatherPacket(byte WeatherId, float Transition, bool AfterL
 // The server's PlayerStateFlags for a seat's own client: the host computes it from the statuses
 // it holds on that seat, as SimPlayer does for the local player.
 public sealed record AfflictionsPacket(uint Actor, bool Status, bool Control) : GamePacket;
+
+// A resolve the host waits on: each peer answers, as it plays this, with where its player stands
+// (ViewReportMessage).
+public sealed record ViewRequestPacket(uint Id) : GamePacket;

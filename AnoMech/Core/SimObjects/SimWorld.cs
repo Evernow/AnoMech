@@ -4,6 +4,7 @@ using System.Linq;
 using Dalamud.Game.Text;
 using System.Numerics;
 using AnoMech.Core;
+using AnoMech.Core.EnemyActions;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Geometry;
 using AnoMech.Core.Game.Party;
@@ -69,7 +70,11 @@ public sealed class SimWorld : ISimObject, IDisposable
     {
         Events = events;
         Coordinates = new Coordinates(() => ScenarioOrigin);
+        Judgments = new Judgments(this);
     }
+
+    // Each resolve's party members, judged at their own moments of it.
+    internal Judgments Judgments { get; }
 
     // A fixed end is just the character; dynamic ends are End.Passable(...) /
     // End.FarthestPlayer(). `from` hosts the channeling VFX (drawn from → to), so
@@ -206,6 +211,7 @@ public sealed class SimWorld : ISimObject, IDisposable
     public void Tick(float deltaSeconds)
     {
         Map.Tick();
+        Judgments.Tick();
         Party.Tick(deltaSeconds);
         children.Update(deltaSeconds);
         enemyList.Tick(children.OfType<SimEnemy>(), deltaSeconds);
@@ -214,6 +220,7 @@ public sealed class SimWorld : ISimObject, IDisposable
     // The run's teardown; the party stays.
     public void Despawn()
     {
+        Judgments.Clear();
         children.Despawn();
         enemyList.Clear();
         Obstacles.Clear();

@@ -71,6 +71,9 @@ internal sealed class PacketReplay(PeerNatives natives, SimWorld world, PartyRol
     // A copy spawned here: its entity id, and the host actor it stands for.
     public event Action<uint, uint>? Copied;
 
+    // A resolve the host waits on, as this client's screen reaches it.
+    public event Action<uint>? ViewRequested;
+
     public uint HostActorOf(SimEnemy mirror)
     {
         foreach (var (actor, copy) in spawned)
@@ -110,6 +113,9 @@ internal sealed class PacketReplay(PeerNatives natives, SimWorld world, PartyRol
                 natives.RealDirector.Commence();
                 return;
             case WeatherPacket p: Weather(p); return;
+            case ViewRequestPacket p:
+                ViewRequested?.Invoke(p.Id);
+                return;
         }
 
         var actor = ActorOf(packet);
