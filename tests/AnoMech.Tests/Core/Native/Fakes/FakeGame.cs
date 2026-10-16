@@ -25,6 +25,7 @@ internal sealed class FakeGame
     private readonly FakePartyHud partyHud = new();
     private readonly FakeHaterList haterList;
     private readonly FakeLimitBreakController limitBreak;
+    private readonly FakePlayerActionState playerActionState = new();
     private readonly FakeWaymarks waymarks;
     private readonly FakeBgm bgm;
 
@@ -75,6 +76,7 @@ internal sealed class FakeGame
         Natives.HaterList = haterList;
         Natives.PlayerConditions = PlayerConditions;
         Natives.LimitBreak = limitBreak;
+        Natives.PlayerActionState = playerActionState;
         Natives.Waymarks = waymarks;
         Natives.Bgm = bgm;
         DalamudServices.Install(nameof(Plugin.Framework), Framework);
