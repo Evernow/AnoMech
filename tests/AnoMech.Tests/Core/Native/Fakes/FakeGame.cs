@@ -16,20 +16,24 @@ internal sealed class FakeGame
     public FakeLocalPlayerInput PlayerInput { get; } = new();
     public FakePlayerConditions PlayerConditions { get; }
 
-    private readonly FakeRsvFunctions rsv = new();
+    private readonly FakeRsvFunctions rsv;
     private readonly DataminingGameData data;
-    private readonly FakeActionTimelinePreload timelinePreload = new();
+    private readonly FakeActionTimelinePreload timelinePreload;
     private readonly FakeLayoutFunctions layout = new();
     private readonly FakeInstanceContentDirector director;
-    private readonly FakeRsfFunctions rsf = new();
+    private readonly FakeRsfFunctions rsf;
     private readonly FakePartyHud partyHud = new();
     private readonly FakeHaterList haterList;
     private readonly FakeLimitBreakController limitBreak = new();
-    private readonly FakeWaymarks waymarks = new();
+    private readonly FakeWaymarks waymarks;
     private readonly FakeBgm bgm;
 
     private FakeGame()
     {
+        rsv = new FakeRsvFunctions(Timeline);
+        rsf = new FakeRsfFunctions(Timeline);
+        timelinePreload = new FakeActionTimelinePreload(Timeline);
+        waymarks = new FakeWaymarks(Timeline);
         data = new DataminingGameData(rsv);
         BattleCharas = new FakeBattleCharas(Timeline);
         EventObjects = new FakeEventObjects(Timeline);
