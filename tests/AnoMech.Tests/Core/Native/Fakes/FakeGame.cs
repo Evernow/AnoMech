@@ -13,7 +13,7 @@ internal sealed class FakeGame
     public FakeZoneControl Zone { get; }
     public FakeMapEffects MapEffects { get; }
     public FakeUserActions UserActions { get; } = new();
-    public FakeLocalPlayerInput PlayerInput { get; } = new();
+    public FakeLocalPlayerInput PlayerInput { get; }
     public FakePlayerConditions PlayerConditions { get; }
 
     private readonly FakeRsvFunctions rsv;
@@ -24,7 +24,7 @@ internal sealed class FakeGame
     private readonly FakeRsfFunctions rsf;
     private readonly FakePartyHud partyHud = new();
     private readonly FakeHaterList haterList;
-    private readonly FakeLimitBreakController limitBreak = new();
+    private readonly FakeLimitBreakController limitBreak;
     private readonly FakeWaymarks waymarks;
     private readonly FakeBgm bgm;
 
@@ -39,6 +39,8 @@ internal sealed class FakeGame
         EventObjects = new FakeEventObjects(Timeline);
         MapEffects = new FakeMapEffects(Timeline);
         Zone = new FakeZoneControl(BattleCharas.Player, Timeline);
+        PlayerInput = new FakeLocalPlayerInput(BattleCharas.Player, UserActions);
+        limitBreak = new FakeLimitBreakController(BattleCharas.Player);
         PlayerConditions = new FakePlayerConditions(Timeline);
         director = new FakeInstanceContentDirector(Zone, Timeline);
         haterList = new FakeHaterList(Timeline);
@@ -79,10 +81,12 @@ internal sealed class FakeGame
     }
 
     // One client frame in the real order: Dalamud drains queued Framework.Run work, then raises
-    // Update (the plugin), then the game runs its own update (cast bars, carries, spawns).
+    // Update (the plugin, UserActions first), then the game runs its own update (cast bars,
+    // carries, spawns).
     public void Frame(float deltaSeconds, Action<float> update)
     {
         Framework.RunPending();
+        PlayerInput.Tick();
         update(deltaSeconds);
         WalkSteeredPlayer(deltaSeconds);
         BattleCharas.Tick(deltaSeconds);
