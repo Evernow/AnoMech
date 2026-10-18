@@ -91,6 +91,7 @@ internal sealed class FakeGame
         PlayerInput.Tick();
         update(deltaSeconds);
         WalkSteeredPlayer(deltaSeconds);
+        PlayerInput.Fly(deltaSeconds);
         BattleCharas.Tick(deltaSeconds);
     }
 
