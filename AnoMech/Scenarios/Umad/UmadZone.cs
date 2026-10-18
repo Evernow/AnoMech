@@ -1,7 +1,9 @@
 using System.Collections.Generic;
 using System.Numerics;
+using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Map;
+using AnoMech.Core.Native.Interfaces;
 using AnoMech.Core.SimObjects;
 
 namespace AnoMech.Scenarios.Umad;
@@ -52,7 +54,12 @@ public sealed class UmadZone : IZone
         world.Map.DirectorUpdate(0x8000000DU, 0x1U);
     }
 
-    public void RunClientSetup(SimWorld world) => UmadReplayData.Seed();
+    public void RunClientSetup(SimWorld world)
+    {
+        var before = Natives.Rsv.Describe();
+        UmadReplayData.Seed();
+        DiagnosticLog.Info($"[Rsv] Seeded the duty's strings. Before: {before}. After: {Natives.Rsv.Describe()}.");
+    }
 
     private static readonly IReadOnlyList<WaymarkLayout> Waymarks =
     [

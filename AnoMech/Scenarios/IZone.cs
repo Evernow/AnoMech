@@ -34,8 +34,8 @@ public interface IZone
 
     // Peer-safe subset of zone setup: pure client-side asset/table registration with no
     // simulation side effects (no SimArenaBoundary, no MapEffect broadcasts). Called for
-    // BOTH host and peer, same reasoning as IScenario.RunInstanceEvents -- a peer's own
-    // client needs this data (e.g. replay-derived RSV/RSF resource paths the server would
-    // normally deliver for real duty content) just as much as the host's does. Default no-op.
+    // BOTH host and peer as they enter the zone, before its load -- a peer's own client needs
+    // this data (e.g. replay-derived RSV/RSF resource paths the server would normally deliver
+    // for real duty content) just as much as the host's does. Default no-op.
     void RunClientSetup(SimWorld world) { }
 }

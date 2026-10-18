@@ -1,10 +1,15 @@
 using AnoMech.Core.Native.Implementations.Pointers;
+using AnoMech.Core.Native.Interfaces;
 using FFXIVClientStructs.FFXIV.Client.Game.Event;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.LayoutEngine;
 using FFXIVClientStructs.FFXIV.Client.Network;
 using FFXIVClientStructs.FFXIV.Client.System.String;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using System;
+using System.Collections.Generic;
 
 namespace AnoMech.Core.Native.Implementations.Interop;
 
@@ -41,9 +46,76 @@ internal static unsafe class InstanceContentDirectorHelper
         var localPlayer = Plugin.ObjectTable.LocalPlayer;
         if (localPlayer == null) return false;
 
+        if (category == BossLineCategory) LogBossLine(arg1);
         PacketDispatcher.HandleActorControlPacket(localPlayer.EntityId, DirectorUpdateCategory, director->GetEventId(),
             category, arg1, arg2, arg3, arg4, arg5, arg6, NoTarget, false);
+        if (category == BossLineCategory) WatchBattleTalk(arg1);
         return true;
+    }
+
+    // For the log: what the dialogue box makes of a boss line over its first seconds, from the
+    // HUD's queue to the box's own text.
+    private static void WatchBattleTalk(uint line)
+    {
+        LogBattleTalk(line, 0);
+        foreach (var ms in new[] { 100, 500, 2000 })
+            Plugin.Framework.RunOnTick(() => LogBattleTalk(line, ms), TimeSpan.FromMilliseconds(ms));
+    }
+
+    private static void LogBattleTalk(uint line, int afterMs)
+    {
+        var queued = new List<string>();
+        var hud = AgentHUD.Instance();
+        if (hud != null)
+            foreach (ref var talk in hud->QueuedBattleTalks)
+                if (talk.IsPending) queued.Add($"\"{talk.Name}\": \"{talk.Text}\" image {talk.Image} sound {talk.Sound}");
+        var stage = AtkStage.Instance();
+        var strings = new List<string>();
+        var array = stage == null ? null : stage->GetStringArrayData(StringArrayType.BattleTalk);
+        if (array != null)
+            for (var i = 0; i < array->Size; i++)
+                if (array->StringArray[i] is { HasValue: true } value && value.ToString() is { Length: > 0 } text)
+                    strings.Add($"{i}: \"{text}\"");
+        var shown = new List<string>();
+        var box = stage == null ? null : stage->RaptureAtkUnitManager->GetAddonByName("_BattleTalk");
+        if (box != null)
+            foreach (var node in box->UldManager.Nodes)
+                if (node.Value != null && node.Value->Type == NodeType.Text && ((AtkTextNode*)node.Value)->NodeText.ToString() is { Length: > 0 } text)
+                    shown.Add($"\"{text}\"");
+        var state = box == null ? "not set up" : box->IsVisible ? "shown" : "hidden";
+        AnoMech.Core.DiagnosticLog.Info($"[BattleTalk] Boss line 0x{line:X} +{afterMs} ms: queued [{string.Join(", ", queued)}]; strings [{string.Join(", ", strings)}]; box {state} [{string.Join(", ", shown)}].");
+    }
+
+    // A boss's line in the dialogue box: a row of the duty's own text, as the director placed it.
+    private const uint BossLineCategory = 0x80000027;
+
+    private static void LogBossLine(uint line)
+    {
+        var row = TextRowOf(line);
+        var exd = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->ExdModule;
+        var sheet = exd == null ? null : exd->GetSheetByName("InstanceContentTextData");
+        var loaded = row is { } id && sheet != null && exd->GetRowBySheetAndRowId(sheet, id) != null;
+        AnoMech.Core.DiagnosticLog.Info($"[Director] Boss line 0x{line:X}: text row {row?.ToString() ?? "unknown"} {(loaded ? "loaded" : "not loaded")}; {DescribeText()}; strings: {Natives.Rsv.Describe()}.");
+    }
+
+    // For the log: where the director looks for the duty's text, as it copied the duty's data.
+    public static string DescribeText()
+    {
+        var eventFramework = EventFramework.Instance();
+        var director = eventFramework == null ? null : eventFramework->GetInstanceContentDirector();
+        return director == null ? "no director"
+            : $"director text: objectives {director->InstanceContentTextDataObjectiveStart}..{director->InstanceContentTextDataObjectiveEnd}, "
+              + $"boss {director->InstanceContentTextDataBossStart}..{director->InstanceContentTextDataBossEnd}";
+    }
+
+    // The duty's objective text, which its lines index into.
+    private static uint? TextRowOf(uint line)
+    {
+        var world = LayoutWorld.Instance();
+        var territory = world == null || world->ActiveLayout == null ? 0u : world->ActiveLayout->TerritoryTypeId;
+        var content = Plugin.DataManager.GetExcelSheet<TerritoryType>().GetRowOrDefault(territory)?.ContentFinderCondition.ValueNullable?.Content.RowId;
+        if (content is not { } contentId) return null;
+        return Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.InstanceContent>().GetRowOrDefault(contentId)?.InstanceContentTextDataObjectiveStart.RowId + line;
     }
 
     // ActorControlSelf: p1 director id, p2 variable, p3..p8 its values.

@@ -18,4 +18,6 @@ internal sealed class FakeRsvFunctions : IRsvFunctions
     }
 
     public string Resolve(string text) => resolved.TryGetValue(text, out var value) ? value : text;
+
+    public string Describe() => $"{resolved.Count} held";
 }

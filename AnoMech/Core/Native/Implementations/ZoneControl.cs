@@ -656,6 +656,7 @@ public sealed unsafe partial class ZoneControl : IZoneControl
             Plugin.Log.Information($"[ZoneControl] ContentId={contentId}");
 
             SendDirectorControl(DirectorInitCategory, InstanceContentDirectorBase + contentId, contentId);
+            AnoMech.Core.DiagnosticLog.Info($"[ZoneControl] Director for content {contentId} created: {InstanceContentDirectorHelper.DescribeText()}.");
 
             loadedInstanceContent = contentId;
             InstanceContentDirectorHelper.SetDutyData(cfc);
