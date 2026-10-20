@@ -5,6 +5,7 @@ using AnoMech.Core.Game.Party;
 using AnoMech.Core.Native.Interfaces;
 using AnoMech.Core.SimObjects;
 using AnoMech.Scenarios.Tea.P3AlexanderPrime;
+using AnoMech.Scenarios.Tea.P4PerfectAlexander;
 using AnoMech.Scenarios.Top;
 using AnoMech.Scenarios.Umad.P1TeleTrouncing;
 using AnoMech.Scenarios.Umad.P2Forsaken;
@@ -66,6 +67,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(TeaP2BjCcAiReplayStateMessage), "teaP2BjCcAiReplayState")]
 [JsonDerivedType(typeof(TeaI2TemporalStasisAiReplayStateMessage), "teaI2TemporalStasisAiReplayState")]
 [JsonDerivedType(typeof(TeaP3AlexanderPrimeAiReplayStateMessage), "teaP3AlexanderPrimeAiReplayState")]
+[JsonDerivedType(typeof(TeaP4PerfectAlexanderAiReplayStateMessage), "teaP4PerfectAlexanderAiReplayState")]
 [JsonDerivedType(typeof(TopP5DeltaBeyondDefenseUpdateMessage), "topP5DeltaBeyondDefenseUpdate")]
 [JsonDerivedType(typeof(TopP5OmegaHelloWorld2UpdateMessage), "topP5OmegaHelloWorld2Update")]
 [JsonDerivedType(typeof(PeerAppliedEnemyStatusMessage), "peerAppliedEnemyStatus")]
@@ -331,6 +333,14 @@ public sealed record TeaP3AlexanderPrimeAiReplayStateMessage(
     P3Practice Practice, PartyRole[] OrbHolders, PartyRole RestrainingOrderTank, PartyRole RestrainingOrderDps, PartyRole SharedSentence,
     bool AlexanderPrimeNorth, int SacramentSpot, bool BruteJusticeNorthWest, bool PuddlesMirrored, PartyRole[] Numbers,
     PartyRole[] Enumerations) : MpMessage, IScenarioReplayStateMessage;
+
+// Every roll; the spreads a death leaves are re-aimed live and the peer reads them off its own
+// screen. Clones are in projection-id order, BetaClones by BetaRole.
+public sealed record TeaP4PerfectAlexanderAiReplayStateMessage(
+    P4Practice Practice, PartyRole LightBeacon, PartyRole DarkBeacon, PartyRole[] LightFollowers, bool FinalWordMotionFirst,
+    bool OpticalSpreadFirst, PartyRole[] OpticalStackTargets, PartyRole[] AlphaClones, bool AlphaFirstMotion, bool AlphaSecondMotion,
+    int AlphaSafeClone, PartyRole[] BetaClones, bool BetaOpticalStack, int BetaOpticalClone, int BetaDonutClone, int[][] JudgmentOrders,
+    PartyRole[] GraceTargets, int BotSeed) : MpMessage, IScenarioReplayStateMessage;
 
 // InFirst is TopP6WaveCannon2Ai's entire read set.
 public sealed record TopP6WaveCannon2AiReplayStateMessage(bool InFirst) : MpMessage, IScenarioReplayStateMessage;
