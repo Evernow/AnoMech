@@ -16,6 +16,7 @@ using AnoMech.Scenarios.Tea.P1LivingLiquid;
 using AnoMech.Scenarios.Tea.I1LimitCut;
 using AnoMech.Scenarios.Tea.I2TemporalStasis;
 using AnoMech.Scenarios.Tea.P2BjCc;
+using AnoMech.Scenarios.Tea.P3AlexanderPrime;
 using AnoMech.Scenarios.Top.P6WaveCannon2;
 using AnoMech.Scenarios.Ucob.P5Exaflares;
 using AnoMech.Scenarios.Umad;
@@ -101,6 +102,7 @@ public sealed class ScenarioCatalog
         new TeaI1LimitCutScenario(),
         new TeaP2BjCcScenario(),
         new TeaI2TemporalStasisScenario(),
+        new TeaP3AlexanderPrimeScenario(),
         new UltimatePredationScenario(),
         new UltimateSuppressionScenario(),
         new UcobP5ExaflaresScenario(),
