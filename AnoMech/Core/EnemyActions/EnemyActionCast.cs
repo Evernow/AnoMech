@@ -19,6 +19,9 @@ public sealed class EnemyActionCast
     // Nearest to Origin first.
     public IReadOnlyList<Hit> Hits { get; private set; } = [];
 
+    // Its resolve and release, still queued; a cancel takes them off the queue.
+    internal List<System.Action> PendingSteps { get; } = [];
+
     internal void Cancelled() => IsCancelled = true;
 
     internal void Resolve(Placement origin, IReadOnlyList<Hit> hits)
