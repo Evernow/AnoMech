@@ -63,6 +63,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(TeaP1LivingLiquidAiReplayStateMessage), "teaP1LivingLiquidAiReplayState")]
 [JsonDerivedType(typeof(TeaI1LimitCutAiReplayStateMessage), "teaI1LimitCutAiReplayState")]
 [JsonDerivedType(typeof(TeaP2BjCcAiReplayStateMessage), "teaP2BjCcAiReplayState")]
+[JsonDerivedType(typeof(TeaI2TemporalStasisAiReplayStateMessage), "teaI2TemporalStasisAiReplayState")]
 [JsonDerivedType(typeof(TopP5DeltaBeyondDefenseUpdateMessage), "topP5DeltaBeyondDefenseUpdate")]
 [JsonDerivedType(typeof(TopP5OmegaHelloWorld2UpdateMessage), "topP5OmegaHelloWorld2Update")]
 [JsonDerivedType(typeof(PeerAppliedEnemyStatusMessage), "peerAppliedEnemyStatus")]
@@ -318,6 +319,9 @@ public sealed record TeaI1LimitCutAiReplayStateMessage(PartyRole[] Numbers, int 
 public sealed record TeaP2BjCcAiReplayStateMessage(
     bool NisiOnDps, int[] Nisi, int[] Judgment, PartyRole FirstWater, PartyRole FirstLightning, int ChakramAxis,
     PartyRole[] Enumerations, PartyRole IceTank, int BotPacing) : MpMessage, IScenarioReplayStateMessage;
+
+// Debuffs: one per role in PartyRole order (StasisDebuff).
+public sealed record TeaI2TemporalStasisAiReplayStateMessage(bool BruteJusticeEast, int[] Debuffs) : MpMessage, IScenarioReplayStateMessage;
 
 // InFirst is TopP6WaveCannon2Ai's entire read set.
 public sealed record TopP6WaveCannon2AiReplayStateMessage(bool InFirst) : MpMessage, IScenarioReplayStateMessage;
