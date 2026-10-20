@@ -12,6 +12,7 @@ using AnoMech.Scenarios.Top.P2PartySynergy;
 using AnoMech.Scenarios.Top.P5Delta;
 using AnoMech.Scenarios.Top.P5Omega;
 using AnoMech.Scenarios.Top.P5Sigma;
+using AnoMech.Scenarios.Tea.P1LivingLiquid;
 using AnoMech.Scenarios.Top.P6WaveCannon2;
 using AnoMech.Scenarios.Ucob.P5Exaflares;
 using AnoMech.Scenarios.Umad;
@@ -93,6 +94,7 @@ public sealed class ScenarioCatalog
         new TopP5SigmaScenario(),
         new TopP5OmegaScenario(),
         new TopP6WaveCannon2Scenario(),
+        new TeaP1LivingLiquidScenario(),
         new UltimatePredationScenario(),
         new UltimateSuppressionScenario(),
         new UcobP5ExaflaresScenario(),
