@@ -1,0 +1,355 @@
+using System.Numerics;
+using AnoMech.Core.Game.Party;
+using AnoMech.Core.Native.Interfaces;
+using AnoMech.Scenarios;
+using AnoMech.Scenarios.Tea.I2TemporalStasis;
+using static AnoMech.Core.Game.Party.PartyRole;
+using static AnoMech.Scenarios.Tea.TeaConstants;
+using static AnoMech.Tests.NegativeRun;
+
+namespace AnoMech.Tests;
+
+// Every roll is pinned: Brute Justice east, Cruise Chaser west; House Arrest MT + PR, Restraining
+// Order OT + M1, Aggravated Assault H2 + C, nothing H1 + M2.
+//
+//    7.55  Debuffs and tethers; Temporal Stasis cast.
+//   16.70  Everyone frozen until 25.60, every other status of theirs holding its time.
+//   18.58  Plaints: Surety on each tethered pair, Severity on each Aggravated Assault.
+//   20.62  Alpha Swords on Cruise Chaser's three closest at 20.62 / 21.69 / 22.76. Brute Justice turns
+//          to his closest with the first sword's pick at 20.49 and flames once facing them (20.87 for
+//          this roll's north bait), the second 2.32s later.
+public class TeaI2TemporalStasisScenarioTests
+{
+    private static readonly (PartyRole Role, StasisDebuff Debuff)[] PinnedDebuffs =
+    [
+        (MainTank, StasisDebuff.HouseArrest), (OffTank, StasisDebuff.RestrainingOrder),
+        (RegenHealer, StasisDebuff.None), (ShieldHealer, StasisDebuff.AggravatedAssault),
+        (MeleeDpsA, StasisDebuff.RestrainingOrder), (MeleeDpsB, StasisDebuff.None),
+        (PhysRangedDps, StasisDebuff.HouseArrest), (CasterDps, StasisDebuff.AggravatedAssault),
+    ];
+
+    private static void Pin(TeaI2TemporalStasisStateOverrides o)
+    {
+        o.BruteJusticeEast = true;
+        foreach (var (role, debuff) in PinnedDebuffs) o.Debuff[role] = debuff;
+    }
+
+    private static NegativeRun<TeaI2TemporalStasisScenario> Stasis(PartyRole player)
+        => Negative<TeaI2TemporalStasisScenario>(player).Overrides<TeaI2TemporalStasisStateOverrides>(Pin);
+
+    [Test]
+    public void PinnedRollClears()
+    {
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = MeleeDpsB,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+        });
+        Assert.That(run.Passed, run.ToString);
+    }
+
+    // Picks P2's track up where the slowest real kill leaves it, 193.87s after J Kick started it.
+    [Test]
+    public void TemporalStasisPicksUpTheTrackAtTheSlowestKill()
+        => Assert.That(ScenarioCatalog.Create().Scenarios.OfType<TeaI2TemporalStasisScenario>().Single().BgmSecondsAtStart,
+            Is.EqualTo(193.87f).Within(1e-3f));
+
+    [Test]
+    public void HouseArrestPartnersApartBothDie()
+        => Stasis(PhysRangedDps)
+            .TeleportAt(15f, to: new(6f, 8f))
+            .ShouldKill(ActionId.PlaintOfSurety, MainTank, PhysRangedDps);
+
+    [Test]
+    public void RestrainingOrderPartnersTogetherBothDie()
+        => Stasis(MeleeDpsA)
+            .TeleportAt(15f, to: new(-10f, 0f))
+            .ShouldKill(ActionId.PlaintOfSurety, OffTank, MeleeDpsA);
+
+    // Plaint of Severity's vulnerabilities make the first sword lethal to its own bait; M2 behind it
+    // is in the cone.
+    [Test]
+    public void AggravatedAssaultBaitingASwordDies()
+        => Stasis(CasterDps)
+            .TeleportAt(15f, to: new(-6f, 0.5f))
+            .ShouldKill(ActionId.AlphaSwordP3, CasterDps, MeleeDpsB);
+
+    // With time stopped, Plaint of Severity's Magic Vulnerability Up still holds at the second
+    // Flarethrower; PR behind it is in the cone. MT and PR stand exactly on their spots, so C is the
+    // second closest.
+    [Test]
+    public void AggravatedAssaultBaitingTheSecondFlarethrowerDies()
+        => Stasis(CasterDps)
+            .MoveBotAt(15f, MainTank, new(6f, -1.4f))
+            .MoveBotAt(15f, PhysRangedDps, new(6f, 1.8f))
+            .TeleportAt(15f, to: new(6f, 1.6f))
+            .ShouldKill(ActionId.FlarethrowerP3, CasterDps, PhysRangedDps);
+
+    [Test]
+    public void StandingInAnotherPlayersSwordDies()
+        => Stasis(ShieldHealer)
+            .TeleportAt(15f, to: new(-6f, -8f))
+            .ShouldKill(ActionId.AlphaSwordP3, ShieldHealer);
+
+    // With every bot on its spot nobody baits both robots, so the burn is set by hand, on M2 as Cruise
+    // Chaser's second bait.
+    [Test]
+    public void ASwordOnAFlarethrowersBaitKills()
+        => Stasis(MeleeDpsB)
+            .MoveBotAt(15f, RegenHealer, new(-6f, -1.4f))
+            .TeleportAt(15f, to: new(-6f, 1.8f))
+            .At(21f, p => p.Member(MeleeDpsB)!.AddStatus(StatusId.FireResistanceDownII, 6f))
+            .ShouldKill(ActionId.AlphaSwordP3, MeleeDpsB);
+
+    // The client plays a slash along the model's facing: each sword goes out on Cruise Chaser himself
+    // after a teleport on his own spot turned the model to its bait.
+    [Test]
+    public void EachSwordFollowsCruiseChasersTurnToItsBait()
+    {
+        string? cruiseChaser = null;
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = MeleeDpsB,
+            StopAt = 23.5f,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+            Probe = p => cruiseChaser ??= p.Game.Catalog.Scenarios.OfType<TeaI2TemporalStasisScenario>().Single().LastState?.Objects.CruiseChaser
+                ?.EntityId.ToString("X8"),
+        });
+        Assert.That(run.Passed, run.ToString);
+        var rows = ((FakeBattleCharas)Natives.BattleCharas).Timeline.Rows.Where(r => r["actor"] == cruiseChaser).ToList();
+        var swords = rows.Where(r => r["kind"] == "ability" && r["id"] == ActionId.AlphaSwordP3.ToString()).ToList();
+        Assert.That(swords, Has.Count.EqualTo(3));
+        Assert.That(swords.Select(s => s["targets"]).Distinct().Count(), Is.EqualTo(3), "each sword on its own player");
+        foreach (var sword in swords)
+        {
+            var turn = rows.Take(rows.IndexOf(sword)).Last(r => r["kind"] is "set_pos" or "move");
+            Assert.Multiple(() =>
+            {
+                Assert.That(sword["target"], Is.EqualTo(cruiseChaser));
+                Assert.That(turn["kind"], Is.EqualTo("set_pos"));
+                Assert.That(Number(turn["rot"]), Is.EqualTo(Number(sword["rot"])).Within(0.011f));
+                Assert.That(Number(sword["t"]) - Number(turn["t"]), Is.EqualTo(0.13f).Within(0.02f));
+            });
+        }
+    }
+
+    // The client plays a flame along the model's facing too, but Brute Justice turns to each bait by
+    // ActorMoves, and fires on himself once facing them. MT, the closest, stands due north of him: a
+    // half turn, 0.375s at a boss's 480 degrees a second. The times land up to two frames late.
+    [Test]
+    public void EachFlarethrowerFollowsBruteJusticesTurnToItsBait()
+    {
+        var frozen = new Frozen();
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = MainTank,
+            StopAt = 24f,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+            Takeovers = [new Takeover(15f, new(6f, -1.4f))],
+            Probe = frozen.Read,
+        });
+        Assert.That(run.Passed, run.ToString);
+        var rows = ((FakeBattleCharas)Natives.BattleCharas).Timeline.Rows.Where(r => r["actor"] == frozen.BruteJustice).ToList();
+        var flames = rows.Where(r => r["kind"] == "ability" && r["id"] == ActionId.FlarethrowerP3.ToString()).ToList();
+        Assert.That(flames, Has.Count.EqualTo(2));
+        var (first, second) = (flames[0], flames[1]);
+        Assert.Multiple(() =>
+        {
+            Assert.That(flames.Select(f => f["target"]), Is.All.EqualTo(frozen.BruteJustice));
+            Assert.That(flames.Select(f => f["targets"]), Is.EqualTo(new[] { frozen.Ids[MainTank], frozen.Ids[PhysRangedDps] }));
+            Assert.That(Number(first["t"]), Is.EqualTo(20.865f).Within(2 * ScenarioRun.FrameSeconds));
+            Assert.That(Angle(Number(first["rot"]), MathF.PI), Is.LessThan(0.011f));
+            Assert.That(Number(second["t"]) - Number(first["t"]), Is.EqualTo(2.32f).Within(0.02f));
+            Assert.That(Angle(Number(second["rot"]), frozen.FacingTo(PhysRangedDps)), Is.LessThan(0.011f));
+        });
+        TurnsByActorMoves(rows, 20.49f, Number(first["t"]), 0f, Number(first["rot"]));
+        TurnsByActorMoves(rows, Number(first["t"]) + 1.9f, Number(second["t"]), Number(first["rot"]), Number(second["rot"]));
+    }
+
+    // PR in front of Brute Justice and closer than MT: the first flame needs no turn.
+    [Test]
+    public void AFlarethrowerBaitInFrontFiresWithoutATurn()
+    {
+        var frozen = new Frozen();
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = PhysRangedDps,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+            Takeovers = [new Takeover(15f, new(6f, 1f))],
+            Probe = frozen.Read,
+        });
+        Assert.That(run.Passed, run.ToString);
+        var flames = ((FakeBattleCharas)Natives.BattleCharas).Timeline.Rows
+            .Where(r => r["actor"] == frozen.BruteJustice && r["kind"] == "ability" && r["id"] == ActionId.FlarethrowerP3.ToString()).ToList();
+        Assert.That(flames, Has.Count.EqualTo(2));
+        Assert.Multiple(() =>
+        {
+            Assert.That(flames.Select(f => f["targets"]), Is.EqualTo(new[] { frozen.Ids[PhysRangedDps], frozen.Ids[MainTank] }));
+            Assert.That(Number(flames[0]["t"]), Is.EqualTo(20.65f).Within(2 * ScenarioRun.FrameSeconds));
+            Assert.That(Angle(Number(flames[0]["rot"]), 0f), Is.LessThan(0.011f));
+            Assert.That(Number(flames[1]["t"]) - Number(flames[0]["t"]), Is.EqualTo(2.32f).Within(0.02f));
+            Assert.That(Angle(Number(flames[1]["rot"]), frozen.FacingTo(MainTank)), Is.LessThan(0.011f));
+        });
+    }
+
+    // Only ActorMoves turn him in [from, until), one of them mid-turn.
+    private static void TurnsByActorMoves(List<Dictionary<string, string>> rows, float from, float until, float oldFacing, float newFacing)
+    {
+        var turns = rows.Where(r => r["kind"] is "set_pos" or "move")
+            .Where(r => Number(r["t"]) >= from && Number(r["t"]) < until).ToList();
+        var whole = Angle(oldFacing, newFacing);
+        Assert.Multiple(() =>
+        {
+            Assert.That(turns.Select(r => r["kind"]), Is.Not.Empty.And.All.EqualTo("move"), $"facing packets in [{from:F2}, {until:F2})");
+            Assert.That(turns.Select(r => Number(r["rot"])).Any(rot => Angle(oldFacing, rot) > 0.05f && Angle(rot, newFacing) > 0.05f
+                                                                      && MathF.Abs(Angle(oldFacing, rot) + Angle(rot, newFacing) - whole) < 0.02f),
+                $"an ActorMove between {oldFacing:F2} and {newFacing:F2} in [{from:F2}, {until:F2})");
+        });
+    }
+
+    // Where everyone stands once time has stopped, and who they are on the timeline.
+    private sealed class Frozen
+    {
+        public string? BruteJustice;
+        public readonly Dictionary<PartyRole, string> Ids = [];
+        private readonly Dictionary<PartyRole, Vector3> positions = [];
+        private Vector3 bruteJusticeAt;
+
+        public void Read(ScenarioProbe p)
+        {
+            if (!p.Crossed(20f)) return;
+            var robot = p.Game.Catalog.Scenarios.OfType<TeaI2TemporalStasisScenario>().Single().LastState!.Objects.BruteJustice!;
+            BruteJustice = robot.EntityId.ToString("X8");
+            bruteJusticeAt = robot.Position;
+            foreach (var role in Enum.GetValues<PartyRole>())
+            {
+                Ids[role] = p.Member(role)!.EntityId.ToString("X8");
+                positions[role] = p.Member(role)!.Position;
+            }
+        }
+
+        public float FacingTo(PartyRole role) => MathF.Atan2(positions[role].X - bruteJusticeAt.X, positions[role].Z - bruteJusticeAt.Z);
+    }
+
+    // Under Temporal Displacement every other status keeps its remaining time; its own runs on.
+    [Test]
+    public void StatusTimersHoldWhileTimeIsStopped()
+    {
+        float? casterMagic = null, casterPhysical = null, mainTankFire = null, healerMagic = null, healerPhysical = null, displacement = null, casterMagicAfter = null;
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = MeleeDpsB,
+            StopAt = 26.6f,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+            Probe = p =>
+            {
+                if (p.Crossed(25.5f))
+                {
+                    casterMagic = Remaining(p, CasterDps, StatusId.MagicVulnerabilityUp);
+                    casterPhysical = Remaining(p, CasterDps, StatusId.PhysicalVulnerabilityUp);
+                    mainTankFire = Remaining(p, MainTank, StatusId.FireResistanceDownII);
+                    healerMagic = Remaining(p, RegenHealer, StatusId.MagicVulnerabilityUp);
+                    healerPhysical = Remaining(p, RegenHealer, StatusId.PhysicalVulnerabilityUp);
+                    displacement = Remaining(p, CasterDps, StatusId.TemporalDisplacement);
+                }
+                if (p.Crossed(26.5f)) casterMagicAfter = Remaining(p, CasterDps, StatusId.MagicVulnerabilityUp);
+            },
+        });
+        Assert.That(run.Passed, run.ToString);
+        Assert.Multiple(() =>
+        {
+            Assert.That(casterMagic, Is.EqualTo(4f).Within(0.05f), "C's Magic Vulnerability Up from Plaint of Severity");
+            Assert.That(casterPhysical, Is.EqualTo(11f).Within(0.05f), "C's Physical Vulnerability Up from Plaint of Severity");
+            Assert.That(mainTankFire, Is.EqualTo(6f).Within(0.05f), "MT's Fire Resistance Down II from its Flarethrower");
+            Assert.That(healerMagic, Is.EqualTo(5f).Within(0.05f), "H1's Magic Vulnerability Up from its Alpha Sword");
+            Assert.That(healerPhysical, Is.EqualTo(5f).Within(0.05f), "H1's Physical Vulnerability Up from its Alpha Sword");
+            Assert.That(displacement, Is.EqualTo(0.2f).Within(0.05f), "Temporal Displacement's own timer");
+            Assert.That(casterMagicAfter, Is.EqualTo(3.1f).Within(0.05f), "C's Magic Vulnerability Up once time moves again");
+        });
+    }
+
+    private static float? Remaining(ScenarioProbe p, PartyRole role, ushort statusId)
+        => p.Member(role)?.ActiveStatuses.FirstOrDefault(s => s.StatusId == statusId)?.RemainingTime;
+
+    [Test]
+    public void TimeStopsAndResumesWithAOneSecondSkyChange()
+    {
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = MeleeDpsB,
+            StopAt = 26f,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+        });
+        Assert.That(run.Passed, run.ToString);
+        var weather = ((FakeBattleCharas)Natives.BattleCharas).Timeline.Rows.Where(r => r["kind"] == "weather" && Number(r["t"]) > 10f).ToList();
+        Assert.That(weather.Select(r => (r["id"], r["detail"])), Is.EqualTo(new[]
+        {
+            (Weather.BeyondTimeStopped.ToString(), "transition=1.0"),
+            (Weather.BeyondTime.ToString(), "transition=1.0"),
+        }));
+        Assert.Multiple(() =>
+        {
+            Assert.That(Number(weather[0]["t"]), Is.EqualTo(16.70f).Within(0.02f));
+            Assert.That(Number(weather[1]["t"]), Is.EqualTo(25.60f).Within(0.02f));
+        });
+    }
+
+    [Test]
+    public void TheArenaPlaysItsSlot7TimelineOnce()
+    {
+        var run = ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = MeleeDpsB,
+            StopAt = 5f,
+            Overrides = o => Pin((TeaI2TemporalStasisStateOverrides)o),
+        });
+        Assert.That(run.Passed, run.ToString);
+        var plays = ((FakeBattleCharas)Natives.BattleCharas).Timeline.Rows
+            .Where(r => r["kind"] == "map_effect" && r["id"] == "7" && r["detail"].Contains("timeline=2 ")).ToList();
+        Assert.That(plays, Has.Count.EqualTo(1));
+        Assert.That(Number(plays[0]["t"]), Is.EqualTo(1.19f).Within(0.02f));
+    }
+
+    private static float Number(string value) => float.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+
+    private static float Angle(float a, float b) => MathF.Abs(MathF.IEEERemainder(a - b, MathF.Tau));
+
+    [Test]
+    public void ReplayStateRoundTrips()
+    {
+        TeaI2TemporalStasisState? host = null;
+        TeaI2TemporalStasisState? replayed = null;
+        ScenarioRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            StopAt = 1f,
+            Probe = probe =>
+            {
+                if (!probe.Crossed(0.5f)) return;
+                var scenario = probe.Game.Catalog.Scenarios.OfType<TeaI2TemporalStasisScenario>().Single();
+                host = scenario.LastState;
+                replayed = (TeaI2TemporalStasisState?)scenario.StartReplay(scenario.BuildReplayStateMessage()!, 0, MainTank, probe.World);
+            },
+        });
+
+        Assert.That(host, Is.Not.Null);
+        Assert.That(replayed, Is.Not.Null);
+        Assert.Multiple(() =>
+        {
+            Assert.That(replayed!.Debuffs, Is.EqualTo(host!.Debuffs));
+            Assert.That(replayed.BruteJusticeEast, Is.EqualTo(host.BruteJusticeEast));
+        });
+    }
+
+    [Test]
+    public void ReplayStateRejectsBadRolls()
+    {
+        int[] good = [2, 3, 0, 1, 0, 1, 2, 3];
+        Assert.Multiple(() =>
+        {
+            Assert.That(TeaI2TemporalStasisState.FromNetworkReplay(true, good), Is.Not.Null);
+            Assert.That(TeaI2TemporalStasisState.FromNetworkReplay(true, good[..7]), Is.Null);
+            Assert.That(TeaI2TemporalStasisState.FromNetworkReplay(true, [2, 2, 0, 1, 0, 1, 2, 3]), Is.Null);
+            Assert.That(TeaI2TemporalStasisState.FromNetworkReplay(true, [2, 3, 0, 1, 0, 1, 2, 4]), Is.Null);
+        });
+    }
+}
