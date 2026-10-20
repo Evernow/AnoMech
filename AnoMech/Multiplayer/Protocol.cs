@@ -62,6 +62,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(UltimateSuppressionAiReplayStateMessage), "ultimateSuppressionAiReplayState")]
 [JsonDerivedType(typeof(TeaP1LivingLiquidAiReplayStateMessage), "teaP1LivingLiquidAiReplayState")]
 [JsonDerivedType(typeof(TeaI1LimitCutAiReplayStateMessage), "teaI1LimitCutAiReplayState")]
+[JsonDerivedType(typeof(TeaP2BjCcAiReplayStateMessage), "teaP2BjCcAiReplayState")]
 [JsonDerivedType(typeof(TopP5DeltaBeyondDefenseUpdateMessage), "topP5DeltaBeyondDefenseUpdate")]
 [JsonDerivedType(typeof(TopP5OmegaHelloWorld2UpdateMessage), "topP5OmegaHelloWorld2Update")]
 [JsonDerivedType(typeof(PeerAppliedEnemyStatusMessage), "peerAppliedEnemyStatus")]
@@ -311,6 +312,12 @@ public sealed record TeaP1LivingLiquidAiReplayStateMessage(
 
 // The numbers and the first Hawk Blaster axis; a dead number's retarget is the host's alone.
 public sealed record TeaI1LimitCutAiReplayStateMessage(PartyRole[] Numbers, int FirstBlasterAxis) : MpMessage, IScenarioReplayStateMessage;
+
+// Every roll; water's later holders are picked live and the peer reads them off its own screen.
+// Nisi and Judgment: a letter per role in PartyRole order, -1 for none.
+public sealed record TeaP2BjCcAiReplayStateMessage(
+    bool NisiOnDps, int[] Nisi, int[] Judgment, PartyRole FirstWater, PartyRole FirstLightning, int ChakramAxis,
+    PartyRole[] Enumerations, PartyRole IceTank, int BotPacing) : MpMessage, IScenarioReplayStateMessage;
 
 // InFirst is TopP6WaveCannon2Ai's entire read set.
 public sealed record TopP6WaveCannon2AiReplayStateMessage(bool InFirst) : MpMessage, IScenarioReplayStateMessage;
