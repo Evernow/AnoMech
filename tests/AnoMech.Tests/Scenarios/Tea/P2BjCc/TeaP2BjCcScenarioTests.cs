@@ -548,6 +548,164 @@ public class TeaP2BjCcScenarioTests
         });
     }
 
+    private static string[] Holding(ShownRun shown, string kind, ushort status) => shown.Of(kind, status).Select(r => r["actor"]).ToArray();
+
+    // On any roll of either strat: each nisi on the player the roll gave it at 17.95s, each Final
+    // Judgment on its player at 85.46s, and at Gavel every player's client showing the nisi their
+    // judgment asks for, with Brute Justice's line for a passed Gavel.
+    [Test]
+    public void EveryNisiAndJudgmentShowsOnItsPlayerAndGavelPasses([Values(0, 1)] int strat)
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP2BjCcState? state = null;
+            var shownAtGavel = new Dictionary<PartyRole, NisiLetter[]>();
+            var shown = ShownRun.Execute(typeof(TeaP2BjCcScenario), strat, seed, new ScenarioRunOptions
+            {
+                StopAt = 135f,
+                Probe = p =>
+                {
+                    state ??= State(p);
+                    if (!p.Crossed(133.1f)) return;
+                    foreach (var role in PerRole.All)
+                        shownAtGavel[role] = Enum.GetValues<NisiLetter>().Where(l => p.Member(role)!.ShowsStatus(StatusId.FinalDecreeNisi(l))).ToArray();
+                },
+            });
+            var what = $"seed {seed}";
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            Assert.Multiple(() =>
+            {
+                foreach (var letter in Enum.GetValues<NisiLetter>())
+                {
+                    var nisi = shown.Of("status_gain", StatusId.FinalDecreeNisi(letter)).Where(r => ShownRun.Time(r) < 18.5f).ToList();
+                    Assert.That(nisi.Select(r => r["actor"]), Is.EqualTo(state!.Nisi.Where(n => n.Value == letter).Select(n => shown.IdOf(n.Key))), $"{what}: {letter}'s first nisi");
+                    Assert.That(nisi.Select(ShownRun.Time), Is.All.EqualTo(17.95f).Within(0.05f), what);
+                    var judgments = shown.Of("status_gain", StatusId.FinalJudgment(letter)).Where(r => ShownRun.Time(r) < 86f).ToList();
+                    Assert.That(judgments.Select(r => r["actor"]), Is.EquivalentTo(state.Judgment.Where(j => j.Value == letter).Select(j => shown.IdOf(j.Key))),
+                        $"{what}: {letter}'s judgments");
+                    Assert.That(judgments.Select(ShownRun.Time), Is.All.EqualTo(85.46f).Within(0.05f), what);
+                }
+                foreach (var role in PerRole.All)
+                    Assert.That(shownAtGavel[role], Is.EqualTo(new[] { state!.Judgment[role] }), $"{what}: {role}'s nisi on their client at Gavel");
+                Assert.That(shown.Of("battle_talk").Where(r => ShownRun.Time(r) > 130f).Select(r => r["id"]), Is.EqualTo(new[] { BattleTalkId.GavelFalls.ToString() }), what);
+            });
+        }
+    }
+
+    // On any roll: the first Compressed Water on its healer and the first Compressed Lightning on its
+    // DPS at 24.11s, each with its marker.
+    [Test]
+    public void TheFirstWaterAndLightningMarkTheirHolders()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP2BjCcState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaP2BjCcScenario), 0, seed, new ScenarioRunOptions { StopAt = 25f, Probe = p => state ??= State(p) });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var markers = shown.Rows.Where(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x22").Select(r => (r["actor"], r["p"].Split(',')[0])).ToList();
+            Assert.Multiple(() =>
+            {
+                foreach (var (status, lockon, holder) in new[]
+                         {
+                             (StatusId.CompressedWater, LockonId.CompressedWater, state!.FirstWater), (StatusId.CompressedLightning, LockonId.CompressedLightning, state.FirstLightning),
+                         })
+                {
+                    Assert.That(Holding(shown, "status_gain", status), Is.EqualTo(new[] { shown.IdOf(holder) }), $"seed {seed}: {status}");
+                    Assert.That(shown.Of("status_gain", status).Select(ShownRun.Time), Is.All.EqualTo(24.11f).Within(0.05f), $"seed {seed}: {status}");
+                    Assert.That(markers, Does.Contain((shown.IdOf(holder), $"0x{lockon:X}")), $"seed {seed}: {lockon}'s marker");
+                }
+            });
+        }
+    }
+
+    private static readonly float[] ChakramBearings = [0f, 45f, 90f, 135f];
+
+    // On each axis: both Steam Chakrams stand 21.5y out either end of it, pop in at 25.17s and cast at
+    // 26.22s.
+    [Test]
+    public void TheChakramsStandOnTheirAxis([Values(0, 1, 2, 3)] int axis)
+    {
+        var shown = ShownRun.Execute(typeof(TeaP2BjCcScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            StopAt = 33f,
+            Overrides = o => ((TeaP2BjCcStateOverrides)o).ChakramAxis = axis,
+        });
+        Assert.That(shown.Run.Passed, shown.Run.ToString);
+        var chakrams = shown.Of("spawn", BNpcBaseId.SteamChakram).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(chakrams, Has.Count.EqualTo(2));
+            foreach (var end in new[] { 0f, 180f })
+            {
+                var spot = Geometry.OnCompass(ChakramBearings[axis] + end, 21.5f);
+                Assert.That(chakrams.Any(c => Vector2.Distance(new(ShownRun.Number(c, "x") - 100f, ShownRun.Number(c, "z") - 100f), Flat(spot)) < 0.05f), Is.True,
+                    $"no chakram at {spot}");
+            }
+            foreach (var chakram in chakrams)
+            {
+                Assert.That(shown.Rows.Where(r => r["actor"] == chakram["actor"] && r["kind"] == "ac" && r["id"] == "0x24").Select(ShownRun.Time),
+                    Is.EqualTo(new[] { 25.17f }).Within(0.05f), "its pop-in");
+                Assert.That(shown.Rows.Where(r => r["actor"] == chakram["actor"] && r["kind"] == "cast" && r["id"] == ActionId.EyeOfTheChakram.ToString()).Select(ShownRun.Time),
+                    Is.EqualTo(new[] { 26.22f }).Within(0.05f), "its cast");
+            }
+        });
+    }
+
+    // On any roll: the Enumeration markers on their two DPS and the ice's on its tank at 63.57s, each
+    // going off where its player stands at 68.72s.
+    [Test]
+    public void TheEnumerationsAndTheIceMarkTheirPlayers()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP2BjCcState? state = null;
+            var spots = new Dictionary<PartyRole, Vector2>();
+            var shown = ShownRun.Execute(typeof(TeaP2BjCcScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 70f,
+                Probe = p =>
+                {
+                    state ??= State(p);
+                    if (p.Crossed(68.72f))
+                        foreach (var role in PerRole.All) spots[role] = Flat(p.Member(role)!.Position);
+                },
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var markers = shown.Rows.Where(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x22").ToList();
+            List<string> Marked(uint lockon) => markers.Where(r => r["p"].StartsWith($"0x{lockon:X},")).Select(r => r["actor"]).ToList();
+            Assert.Multiple(() =>
+            {
+                Assert.That(Marked(LockonId.Enumeration), Is.EquivalentTo(state!.Enumerations.Select(shown.IdOf)), $"seed {seed}: the Enumeration markers");
+                Assert.That(Marked(LockonId.EarthMissileIce), Is.EqualTo(new[] { shown.IdOf(state.IceTank) }), $"seed {seed}: the ice marker");
+                Assert.That(markers.Where(r => r["p"].StartsWith($"0x{LockonId.Enumeration:X},") || r["p"].StartsWith($"0x{LockonId.EarthMissileIce:X},")).Select(ShownRun.Time),
+                    Is.All.EqualTo(63.57f).Within(0.05f), $"seed {seed}");
+                foreach (var role in state.Enumerations)
+                    Assert.That(shown.Of("ability", ActionId.Enumeration).Any(c => Vector2.Distance(new(ShownRun.Number(c, "x") - 100f, ShownRun.Number(c, "z") - 100f), spots[role]) < 0.05f),
+                        Is.True, $"seed {seed}: {role}'s Enumeration where they stood");
+                Assert.That(shown.Of("ability", ActionId.EarthMissileIce).SelectMany(ShownRun.Hits), Is.EqualTo(new[] { shown.IdOf(state.IceTank) }), $"seed {seed}: the ice on its tank");
+            });
+        }
+    }
+
+    // Brute Justice and Cruise Chaser never lose HP on the client; only the Plasma Shield does.
+    [Test]
+    public void OnlyThePlasmaShieldLosesHp()
+    {
+        var dropped = new HashSet<uint>();
+        var shown = ShownRun.Execute(typeof(TeaP2BjCcScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            Probe = p =>
+            {
+                var client = (FakeBattleCharas)Natives.BattleCharas;
+                foreach (var enemy in p.World.Children.OfType<SimEnemy>())
+                    if (client.Find(enemy.EntityId) is { } actor && actor.Health < actor.MaxHealth)
+                        dropped.Add(enemy.BNpcBaseId);
+            },
+        });
+        Assert.That(shown.Run.Passed, shown.Run.ToString);
+        Assert.That(dropped, Is.SubsetOf(new[] { BNpcBaseId.PlasmaShield }));
+    }
+
     [Test]
     public void ReplayStateRoundTrips()
     {

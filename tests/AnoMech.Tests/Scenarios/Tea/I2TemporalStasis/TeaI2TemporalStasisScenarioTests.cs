@@ -314,6 +314,98 @@ public class TeaI2TemporalStasisScenarioTests
 
     private static float Angle(float a, float b) => MathF.Abs(MathF.IEEERemainder(a - b, MathF.Tau));
 
+    private static TeaI2TemporalStasisState State(ScenarioProbe p)
+        => p.Game.Catalog.Scenarios.OfType<TeaI2TemporalStasisScenario>().Single().LastState!;
+
+    // The swords Cruise Chaser cuts while time stands still, on any roll and from either side: three
+    // ways onto three players, his model facing along each.
+    [Test]
+    public void CruiseChasersThreeSwordsCutThreeWays([Values] bool bruteJusticeEast)
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            string? cruiseChaser = null;
+            var shown = ShownRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, seed, new ScenarioRunOptions
+            {
+                Overrides = o => ((TeaI2TemporalStasisStateOverrides)o).BruteJusticeEast = bruteJusticeEast,
+                Probe = p => cruiseChaser ??= State(p).Objects.CruiseChaser is { } chaser ? TeaShown.Id(chaser) : null,
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            TeaShown.SwordsCutThreeWays(shown.Rows, cruiseChaser!, ActionId.AlphaSwordP3, $"seed {seed}");
+        }
+    }
+
+    // Each debuff on the players the roll dealt it to, from 7.55s to 18.45s, each pair tethered for as
+    // long, and each Plaint on its own: Surety on the pair, Severity on each Aggravated Assault.
+    [Test]
+    public void EachDebuffShowsOnItsRolledPlayersAndItsPlaintFindsThem()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaI2TemporalStasisState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, seed, new ScenarioRunOptions { Probe = p => state ??= State(p) });
+            var what = $"seed {seed}";
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            string[] With(StasisDebuff debuff) => state!.Debuffs.Where(d => d.Value == debuff).Select(d => shown.IdOf(d.Key)).ToArray();
+            string Support(StasisDebuff debuff) => shown.IdOf(TeaI2TemporalStasisState.Supports.Single(r => state!.Debuffs[r] == debuff));
+            string Dps(StasisDebuff debuff) => shown.IdOf(TeaI2TemporalStasisState.Dps.Single(r => state!.Debuffs[r] == debuff));
+            Assert.Multiple(() =>
+            {
+                foreach (var (debuff, status) in new[]
+                         {
+                             (StasisDebuff.AggravatedAssault, StatusId.AggravatedAssault), (StasisDebuff.HouseArrest, StatusId.HouseArrest),
+                             (StasisDebuff.RestrainingOrder, StatusId.RestrainingOrder),
+                         })
+                {
+                    Assert.That(shown.Of("status_gain", status).Select(r => r["actor"]), Is.EquivalentTo(With(debuff)), $"{what}: {debuff} on");
+                    Assert.That(shown.Of("status_lose", status).Select(r => r["actor"]), Is.EquivalentTo(With(debuff)), $"{what}: {debuff} off");
+                    Assert.That(shown.Of("status_gain", status).Select(ShownRun.Time), Is.All.EqualTo(7.55f).Within(0.05f), $"{what}: {debuff} on");
+                    Assert.That(shown.Of("status_lose", status).Select(ShownRun.Time), Is.All.EqualTo(18.45f).Within(0.05f), $"{what}: {debuff} off");
+                }
+                foreach (var (debuff, tetherId) in new[] { (StasisDebuff.HouseArrest, TetherId.HouseArrest), (StasisDebuff.RestrainingOrder, TetherId.RestrainingOrder) })
+                {
+                    var tether = shown.Rows.FirstOrDefault(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x23" && r["p"].Split(',')[1] == $"0x{tetherId:X}");
+                    Assert.That(tether is null ? Array.Empty<string>() : new[] { tether["actor"], tether["p"].Split(',')[2][2..] }, Is.EquivalentTo(new[] { Support(debuff), Dps(debuff) }),
+                        $"{what}: {debuff}'s tether between its pair");
+                    Assert.That(tether is null ? (float?)null : ShownRun.Time(tether), Is.EqualTo(7.55f).Within(0.05f), $"{what}: {debuff}'s tether");
+                    Assert.That(shown.Rows.Where(r => r["actor"] == tether?["actor"] && r["kind"] is "ac" or "ac_self" && r["id"] == "0x2F").Select(ShownRun.Time).FirstOrDefault(),
+                        Is.EqualTo(18.45f).Within(0.05f), $"{what}: {debuff}'s tether down");
+                }
+                var sureties = shown.Of("ability", ActionId.PlaintOfSurety).Select(r => ShownRun.Hits(r).Order().ToArray()).ToList();
+                Assert.That(sureties, Is.EquivalentTo(new[]
+                {
+                    new[] { Support(StasisDebuff.HouseArrest), Dps(StasisDebuff.HouseArrest) }.Order().ToArray(),
+                    new[] { Support(StasisDebuff.RestrainingOrder), Dps(StasisDebuff.RestrainingOrder) }.Order().ToArray(),
+                }), $"{what}: Surety on each pair");
+                Assert.That(shown.Of("ability", ActionId.PlaintOfSeverity).Select(r => ShownRun.Hits(r).Single()), Is.EquivalentTo(With(StasisDebuff.AggravatedAssault)),
+                    $"{what}: Severity on each Aggravated Assault");
+            });
+        }
+    }
+
+    // Brute Justice's two flames, on any roll and from either side, each on its own bait alone.
+    [Test]
+    public void BruteJusticesTwoFlamesBurnTwoBaits([Values] bool bruteJusticeEast)
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            string? bruteJustice = null;
+            var shown = ShownRun.Execute(typeof(TeaI2TemporalStasisScenario), 0, seed, new ScenarioRunOptions
+            {
+                Overrides = o => ((TeaI2TemporalStasisStateOverrides)o).BruteJusticeEast = bruteJusticeEast,
+                Probe = p => bruteJustice ??= State(p).Objects.BruteJustice is { } robot ? TeaShown.Id(robot) : null,
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var flames = shown.Of("ability", ActionId.FlarethrowerP3).ToList();
+            Assert.Multiple(() =>
+            {
+                Assert.That(flames.Select(f => f["actor"]), Is.EqualTo(new[] { bruteJustice, bruteJustice }), $"seed {seed}");
+                Assert.That(flames.Select(f => ShownRun.Hits(f).Single()).Distinct().Count(), Is.EqualTo(2), $"seed {seed}: two baits, one each");
+                Assert.That(flames.Select(f => f["target"]), Is.All.EqualTo(bruteJustice), $"seed {seed}");
+            });
+        }
+    }
+
     [Test]
     public void ReplayStateRoundTrips()
     {

@@ -540,6 +540,235 @@ public class TeaP4PerfectAlexanderScenarioTests
         }
     }
 
+    // The second check of FinalWordPinned, Stillness.
+    private const float StillnessCheck = 34.32f;
+    // The first, Motion.
+    private const float MotionCheck = 23.21f;
+
+    private static ScenarioRun Stillness(PartyRole player, Action<ScenarioProbe> probe, params Takeover[] takeovers)
+        => ScenarioRun.Execute(typeof(TeaP4PerfectAlexanderScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            PlayerRole = player,
+            StopAt = 36f,
+            WriteArtifactsOnFailure = false,
+            Overrides = o => FinalWordPinned((TeaP4PerfectAlexanderStateOverrides)o),
+            Takeovers = takeovers,
+            Probe = probe,
+        });
+
+    private static (PartyRole, uint?)[] Death(PartyRole role, uint actionId) => [(role, actionId)];
+
+    private static IEnumerable<(PartyRole, uint?)> Deaths(ScenarioRun run) => run.Deaths.Select(d => (d.Role, d.ActionId));
+
+    // The window opens 2.0s before the check: an instant action let go 1.9s before breaks it, one let go
+    // 2.1s before doesn't.
+    [TestCase(1.9f, true)]
+    [TestCase(2.1f, false)]
+    public void AnActionLetGoInStillnessWindowKills(float beforeTheCheck, bool dies)
+    {
+        var run = Stillness(RegenHealer, p => { if (p.Crossed(StillnessCheck - beforeTheCheck)) p.PressAction(); });
+        Assert.That(Deaths(run), dies ? Is.EqualTo(Death(RegenHealer, ActionId.OrdainedStillnessFail)) : Is.Empty, run.ToString);
+    }
+
+    // Turning on the spot counts as moving: a quarter turn a second before the check breaks it, one
+    // 2.2s before doesn't, as a real 177-degree turn 2.18s before passed.
+    [TestCase(1.0f, true)]
+    [TestCase(2.2f, false)]
+    public void TurningOnTheSpotInStillnessWindowKills(float beforeTheCheck, bool dies)
+    {
+        var run = Stillness(RegenHealer, p =>
+        {
+            if (p.Crossed(StillnessCheck - beforeTheCheck)) p.Member(RegenHealer)!.SetRotation(p.Member(RegenHealer)!.Rotation + MathF.PI / 2f);
+        }, new Takeover(31.8f, null));
+        Assert.That(Deaths(run), dies ? Is.EqualTo(Death(RegenHealer, ActionId.OrdainedStillnessFail)) : Is.Empty, run.ToString);
+    }
+
+    // Holding a direction keeps the player walking as far as the game can tell, though a wall or a
+    // freeze leaves them in place.
+    [Test]
+    public void HoldingADirectionThroughOrdainedStillnessKills()
+    {
+        var run = Stillness(RegenHealer, p => { if (p.Time >= StillnessCheck - 1f) p.HoldMovementInput(); }, new Takeover(31.8f, null));
+        Assert.That(Deaths(run), Is.EqualTo(Death(RegenHealer, ActionId.OrdainedStillnessFail)), run.ToString);
+    }
+
+    // Motion wants a step in its last 0.3s: a player still since 0.4s before the check fails it, one who
+    // stopped 0.2s before passes.
+    [TestCase(0.4f, true)]
+    [TestCase(0.2f, false)]
+    public void StoppingBeforeOrdainedMotionKills(float beforeTheCheck, bool dies)
+    {
+        var run = Stillness(RegenHealer, _ => { }, new Takeover(MotionCheck - beforeTheCheck, null));
+        Assert.That(Deaths(run), dies ? Is.EqualTo(Death(RegenHealer, ActionId.OrdainedMotionFail)) : Is.Empty, run.ToString);
+    }
+
+    // Every player's client shows each of the four Ordained checks as passed, on any roll: the right
+    // one of Motion and Stillness, cast at each of them, and never a fail.
+    [Test]
+    public void EveryOrdainedCheckShowsEachPlayerTheirPass()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP4PerfectAlexanderState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaP4PerfectAlexanderScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 104f,
+                Probe = p => state ??= LastState(p),
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            uint[] verdicts = [ActionId.OrdainedMotionSuccess, ActionId.OrdainedStillnessSuccess, ActionId.OrdainedMotionFail, ActionId.OrdainedStillnessFail];
+            var shownVerdicts = shown.Of("ability").Where(r => verdicts.Contains(uint.Parse(r["id"]))).ToList();
+            Assert.Multiple(() =>
+            {
+                foreach (var (at, motion) in new[]
+                         {
+                             (MotionCheck, state!.FinalWordMotionFirst), (StillnessCheck, !state.FinalWordMotionFirst),
+                             (97.97f, state.AlphaFirstMotion), (102.00f, state.AlphaSecondMotion),
+                         })
+                {
+                    var these = shownVerdicts.Where(r => MathF.Abs(ShownRun.Time(r) - at) < 0.1f).ToList();
+                    var pass = motion ? ActionId.OrdainedMotionSuccess : ActionId.OrdainedStillnessSuccess;
+                    Assert.That(these.Select(r => r["id"]), Is.All.EqualTo(pass.ToString()), $"seed {seed}: the check at {at}");
+                    Assert.That(these.Select(r => r["target"]), Is.EquivalentTo(shown.Seats.Keys), $"seed {seed}: the check at {at}");
+                }
+                Assert.That(shownVerdicts, Has.Count.EqualTo(4 * PerRole.All.Length), $"seed {seed}: verdicts outside the four checks");
+            });
+        }
+    }
+
+    // On any roll: each Final Word debuff on its rolled player at 16.80s for 10s, turning at 26.61s into
+    // the Ordained ones, each follower told to march, and every march let go as the Ordained statuses
+    // end at 31.61s.
+    [Test]
+    public void TheFinalWordsShowOnTheirRolledPlayersAndOrdainTheMarch()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP4PerfectAlexanderState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaP4PerfectAlexanderScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 33f,
+                Probe = p => state ??= LastState(p),
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var what = $"seed {seed}";
+            string[] Ids(IEnumerable<PartyRole> roles) => roles.Select(shown.IdOf).ToArray();
+            Assert.Multiple(() =>
+            {
+                foreach (var (debuff, status) in new[]
+                         {
+                             (FinalWordDebuff.LightBeacon, StatusId.FinalWordContactRegulation), (FinalWordDebuff.LightFollower, StatusId.FinalWordContactProhibition),
+                             (FinalWordDebuff.DarkBeacon, StatusId.FinalWordEscapeDetection), (FinalWordDebuff.DarkFollower, StatusId.FinalWordEscapeProhibition),
+                         })
+                {
+                    var gains = shown.Of("status_gain", status).ToList();
+                    Assert.That(gains.Select(r => r["actor"]), Is.EquivalentTo(Ids(PerRole.All.Where(r => state!.FinalWordOf(r) == debuff))), $"{what}: {debuff}");
+                    Assert.That(gains.Select(ShownRun.Time), Is.All.EqualTo(16.80f).Within(0.05f), $"{what}: {debuff}");
+                    Assert.That(gains.Select(r => r["detail"]), Is.All.StartsWith("dur=10.0"), $"{what}: {debuff}");
+                    Assert.That(shown.Of("status_lose", status).Select(ShownRun.Time), Is.All.EqualTo(26.61f).Within(0.05f), $"{what}: {debuff} off");
+                }
+                var light = shown.IdOf(state!.LightBeacon);
+                var dark = shown.IdOf(state.DarkBeacon);
+                Assert.That(shown.Of("status_gain", StatusId.ContactRegulationOrdained).Select(r => r["actor"]), Is.EqualTo(new[] { light }), what);
+                Assert.That(shown.Of("status_gain", StatusId.EscapeDetectionOrdained).Select(r => r["actor"]), Is.EqualTo(new[] { dark }), what);
+                Assert.That(shown.Of("status_gain", StatusId.ContactProhibitionOrdained).Select(r => r["actor"]), Is.EquivalentTo(Ids(state.LightFollowers)), $"{what}: the light followers");
+                Assert.That(shown.Of("status_gain", StatusId.EscapeProhibitionOrdained).Select(r => r["actor"]), Is.EquivalentTo(Ids(state.DarkFollowers)), $"{what}: the dark followers");
+                var marches = shown.Rows.Where(r => r["kind"] is "ac" or "ac_self" && r["id"] == $"0x{MarchControl.Category:X}").ToList();
+                Assert.That(marches.Where(r => r["p"].Length > 0 && ShownRun.Time(r) < 27f).Select(r => (r["actor"], r["p"])),
+                    Is.EquivalentTo(Ids(state.LightFollowers).Select(f => (f, $"0x{MarchControl.Contact:X}"))
+                        .Concat(Ids(state.DarkFollowers).Select(f => (f, $"0x{MarchControl.Escape:X}")))), $"{what}: told to march");
+                Assert.That(marches.Where(r => r["p"].Length == 0).Select(r => r["actor"]), Is.EquivalentTo(Ids(state.LightFollowers.Concat(state.DarkFollowers))),
+                    $"{what}: let go");
+                Assert.That(marches.Where(r => r["p"].Length == 0).Select(ShownRun.Time), Is.All.EqualTo(31.61f).Within(0.05f), $"{what}: let go");
+            });
+        }
+    }
+
+    // Perfect Alexander keeps his HP on the client until he falls at the slowest kill; only the
+    // projections show any loss before.
+    [Test]
+    public void OnlyTheProjectionsLoseHpBeforePerfectAlexanderFalls()
+    {
+        var dropped = new Dictionary<uint, float>();
+        var shown = ShownRun.Execute(typeof(TeaP4PerfectAlexanderScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            Probe = p =>
+            {
+                var client = (FakeBattleCharas)Natives.BattleCharas;
+                foreach (var enemy in p.World.Children.OfType<SimEnemy>())
+                    if (client.Find(enemy.EntityId) is { } actor && actor.Health < actor.MaxHealth)
+                        dropped.TryAdd(enemy.BNpcBaseId, p.Time);
+            },
+        });
+        Assert.That(shown.Run.Passed, shown.Run.ToString);
+        Assert.Multiple(() =>
+        {
+            Assert.That(dropped.Keys, Is.SubsetOf(new[] { BNpcBaseId.FateProjection, BNpcBaseId.PerfectAlexander }));
+            if (dropped.TryGetValue(BNpcBaseId.PerfectAlexander, out var fell)) Assert.That(fell, Is.GreaterThanOrEqualTo(TeaP4PerfectAlexanderState.KillAt));
+        });
+    }
+
+    // On any roll: both Optical Sights' markers, in the rolled order, at 41.48s and 47.56s: the spread's
+    // on everyone, the stack's on its two rolled targets.
+    [Test]
+    public void TheOpticalSightMarkersShowOnTheirPlayers()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP4PerfectAlexanderState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaP4PerfectAlexanderScenario), 0, seed, new ScenarioRunOptions { StopAt = 54f, Probe = p => state ??= LastState(p) });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var markers = shown.Rows.Where(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x22" && ShownRun.Time(r) is > 40f and < 50f).ToList();
+            List<string> At(float t, uint lockon) => markers.Where(r => MathF.Abs(ShownRun.Time(r) - t) < 0.05f && r["p"].StartsWith($"0x{lockon:X},")).Select(r => r["actor"]).ToList();
+            var (first, second) = state!.OpticalSpreadFirst ? (41.48f, 47.56f) : (47.56f, 41.48f);
+            Assert.Multiple(() =>
+            {
+                Assert.That(At(first, LockonId.OpticalSightSpread), Is.EquivalentTo(shown.Seats.Keys), $"seed {seed}: the spread's markers");
+                Assert.That(At(second, LockonId.OpticalSightStack), Is.EquivalentTo(state.OpticalStackTargets.Select(shown.IdOf)), $"seed {seed}: the stack's markers");
+                Assert.That(markers, Has.Count.EqualTo(PerRole.All.Length + state.OpticalStackTargets.Count), $"seed {seed}: markers besides");
+            });
+        }
+    }
+
+    // On any roll: Fate Projection α's projections spawn at 66.98s each where its player stands, in the
+    // rolled order, and each is tethered to its player within a second.
+    [Test]
+    public void EveryAlphaProjectionIsItsPlayersImageTetheredToThem()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP4PerfectAlexanderState? state = null;
+            var spots = new Dictionary<PartyRole, Vector2>();
+            var shown = ShownRun.Execute(typeof(TeaP4PerfectAlexanderScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 69f,
+                Probe = p =>
+                {
+                    state ??= LastState(p);
+                    if (p.Crossed(66.98f))
+                        foreach (var role in PerRole.All) spots[role] = new(p.Member(role)!.Position.X, p.Member(role)!.Position.Z);
+                },
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var projections = shown.Of("spawn", BNpcBaseId.FateProjection).Where(r => ShownRun.Time(r) < 68f).ToList();
+            Assert.Multiple(() =>
+            {
+                Assert.That(projections, Has.Count.EqualTo(state!.AlphaClones.Count), $"seed {seed}");
+                for (var k = 0; k < Math.Min(projections.Count, state.AlphaClones.Count); k++)
+                {
+                    var (projection, owner) = (projections[k], state.AlphaClones[k]);
+                    var at = new Vector2(ShownRun.Number(projection, "x") - 100f, ShownRun.Number(projection, "z") - 100f);
+                    Assert.That(Vector2.Distance(at, spots[owner]), Is.LessThan(0.05f), $"seed {seed}: projection {k} where {owner} stood");
+                    Assert.That(ShownRun.Time(projection), Is.EqualTo(66.98f).Within(0.05f), $"seed {seed}: projection {k}");
+                    var tethered = shown.Rows.FirstOrDefault(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x23" && r["p"].Split(',') is var p
+                                                               && p[1] == $"0x{TetherId.FateProjection:X}"
+                                                               && new[] { r["actor"], p[2][2..] }.Order().SequenceEqual(new[] { shown.IdOf(owner), projection["actor"] }.Order()));
+                    Assert.That(tethered is null ? (float?)null : ShownRun.Time(tethered) - ShownRun.Time(projection), Is.InRange(0f, 1f), $"seed {seed}: {owner}'s tether to projection {k}");
+                }
+            });
+        }
+    }
+
     [Test]
     public void ReplayStateRoundTrips()
     {
