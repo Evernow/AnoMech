@@ -123,11 +123,11 @@ internal static class RelayHttp
         return WriteAsync(stream, $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n", body, token);
     }
 
-    public static async Task<WebSocket> AcceptWebSocketAsync(Stream stream, RelayHttpRequest request, CancellationToken token)
+    public static async Task<WebSocket> AcceptWebSocketAsync(Stream stream, RelayHttpRequest request, TimeSpan keepAlive, CancellationToken token)
     {
         var accept = Convert.ToBase64String(SHA1.HashData(Encoding.ASCII.GetBytes(request.Header("Sec-WebSocket-Key") + WebSocketGuid)));
         await WriteAsync(stream, $"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n", [], token);
-        return WebSocket.CreateFromStream(stream, new WebSocketCreationOptions { IsServer = true, KeepAliveInterval = WebSocket.DefaultKeepAliveInterval });
+        return WebSocket.CreateFromStream(stream, new WebSocketCreationOptions { IsServer = true, KeepAliveInterval = keepAlive });
     }
 
     private static async Task WriteAsync(Stream stream, string head, byte[] body, CancellationToken token)

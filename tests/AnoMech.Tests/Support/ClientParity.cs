@@ -43,7 +43,7 @@ internal static partial class ClientParity
     // message's included, a hitch of the peer's own, its copy of a new actor arriving, and a few
     // frames.
     public static double Slack(MultiplayerRun run)
-        => Math.Max(run.Relay.MaxHostDelay, run.MaxStreamDelay()) + run.PeerLink.PeerHitchMax + MultiplayerRun.PeerSpawnFrames.Max / run.PeerLink.PeerFps + 0.1;
+        => Math.Max(run.Network.MaxHostDelay, run.MaxStreamDelay()) + run.PeerLink.PeerHitchMax + MultiplayerRun.PeerSpawnFrames.Max / run.PeerLink.PeerFps + 0.1;
 
     public static IReadOnlyList<ParityGap> Compare(MultiplayerRun run, TestClient peer)
     {
