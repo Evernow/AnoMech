@@ -544,7 +544,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         var hadLightning = role == firstLightningCarrier || Member(role) is { } member && member.ShowsStatus(StatusId.LightningResistanceDownII);
         if (role is MeleeDpsA or MeleeDpsB && !hadLightning) return;
         Job(role);
-        var clear = Stroll with { ClearOf = (TornadoSpot(0), SettlingTornadoes[0].Until - 0.4f, TornadoClearance) };
+        var clear = Stroll with { ClearOf = TornadoReach(0) };
         switch (role)
         {
             case MeleeDpsA:
@@ -818,7 +818,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     private void TakeTheShieldSpot(PartyRole role)
     {
         var job = Job(role);
-        var clear = Stroll with { ClearOf = (TornadoSpot(1), SettlingTornadoes[1].Until - 0.4f, TornadoClearance), Settle = 0.4f };
+        var clear = Stroll with { ClearOf = TornadoReach(1), Settle = 0.4f };
         var fromB = At(role).X > 9f;
         switch (role)
         {
@@ -848,7 +848,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     {
         if (Holds(healer, StatusId.CompressedLightning))
             Later(healer, job, React(healer, "line-switch", 0.25f, 0.4f, 0.7f), () => Walk(healer,
-                Stroll with { ClearOf = (TornadoSpot(1), SettlingTornadoes[1].Until - 0.4f, TornadoClearance), Settle = 0.3f, Shaped = false }, LightningHealerLine()));
+                Stroll with { ClearOf = TornadoReach(1), Settle = 0.3f, Shaped = false }, LightningHealerLine()));
         else if (!HealerLightningSeen() && Now < SecondStacks + 2.5f) WatchForTheLightning(healer, job);
     });
 
@@ -1222,7 +1222,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         var approach = role == MainTank ? new[] { new Vector2(slot.X, -9.7f), staging } : new[] { staging };
         var clear = Stroll with
         {
-            ClearOf = (TornadoSpot(2), SettlingTornadoes[2].Until - 0.4f, TornadoClearance),
+            ClearOf = TornadoReach(2),
             Hops = role == MainTank ? 1 : Pick(role, "lineup-hops", 1, 2),
             PauseAtStops = role == MainTank,
         };
@@ -1410,10 +1410,12 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
             return;
         }
         foreach (var role in PerRole.All)
-            if (OutsideTheTornado(role, k) is not null)
+            if (OutsideTheTornado(role, k) is not null || LateOutOfTheTornado(role, k))
                 When(Now + React(role, "tornado-step", 0.05f, 0.15f, 0.35f), () =>
                 {
-                    if (OutsideTheTornado(role, k) is { } clear) Head(role, Stroll with { Shaped = false }, seats[(int)role].Arrived, [clear]);
+                    var seat = seats[(int)role];
+                    if (OutsideTheTornado(role, k) is { } clear) Head(role, Stroll with { Shaped = false }, seat.Arrived, [clear]);
+                    else if (LateOutOfTheTornado(role, k)) Head(role, seat.Gait with { ClearOf = TornadoReach(k), Shaped = false }, seat.Arrived, seat.Stops);
                 });
     }
 
@@ -1426,7 +1428,17 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         return Vector2.Distance(clear, to) > 0.1f ? clear : null;
     }
 
+    private bool LateOutOfTheTornado(PartyRole role, int k)
+    {
+        var seat = seats[(int)role];
+        var (tornado, by, reach) = TornadoReach(k);
+        if (seat.Chasing is not null || !seat.HasWalk(Now) || seat.Stops.Length == 0 || Vector2.Distance(seat.Stops[^1], tornado) < reach) return false;
+        return Vector2.Distance(seat.Walking(Now) ? CourseAt(seat.Course, by) : At(role), tornado) < reach - 0.05f;
+    }
+
     private Vector2 TornadoSpot(int k) => state.Objects.Tornadoes.ElementAtOrDefault(k) is { } rage ? Flat(rage.Position) : SettlingTornadoes[k].Spot;
+
+    private (Vector2 Where, float By, float Reach) TornadoReach(int k) => (TornadoSpot(k), SettlingTornadoes[k].Until - 0.4f, TornadoClearance);
 
     private Vector2 ClearOfTornado(int k, Vector2 spot)
     {
@@ -1434,8 +1446,8 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         var away = spot - tornado;
         if (away.Length() >= TornadoClearance) return spot;
         var outward = away.LengthSquared() > 1e-4f ? Vector2.Normalize(away) : tornado.LengthSquared() > 1e-4f ? -Vector2.Normalize(tornado) : Vector2.UnitX;
-        var clear = tornado + outward * TornadoClearance;
-        return clear.Length() > ArenaEdge ? Vector2.Normalize(clear) * ArenaEdge : clear;
+        return Enumerable.Range(0, 37).Select(n => tornado + Rotate(outward, (n + 1) / 2 * 10f * (n % 2 == 0 ? 1f : -1f)) * TornadoClearance)
+            .FirstOrDefault(clear => clear.Length() <= ArenaEdge, spot);
     }
 
     private List<Vector2> Blasters()
@@ -1925,9 +1937,9 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         var urgent = Urgent(course, gait);
         seat.Urgent = urgent;
         var conflicted = Conflict(role, course, now, urgent, dodgingFrom, Pressed(gait, urgent, from, goal, now));
-        if (gait.ClearOf is { } hazard && now >= hazard.By - 1.5f && Vector2.Distance(from, hazard.Where) < hazard.Reach
+        if (gait.ClearOf is { } hazard && Vector2.Distance(from, hazard.Where) < hazard.Reach
             && Vector2.Distance(goal[^1], hazard.Where) >= hazard.Reach
-            && (conflicted is not null || Vector2.Distance(CourseAt(course, hazard.By), hazard.Where) < hazard.Reach - 0.05f)
+            && (conflicted is not null && now >= hazard.By - 1.5f || Vector2.Distance(CourseAt(course, hazard.By), hazard.Where) < hazard.Reach - 0.05f)
             && Escape(role, from, hazard.Where, hazard.Reach) is { } exit)
         {
             var then = gait with { ClearOf = null };
@@ -2002,6 +2014,12 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
             var spot = from + Rotate(way, turn) * (reach - distance + 0.8f);
             if (Vector2.Distance(spot, hazard) >= reach && spot.Length() <= ArenaEdge - 0.5f && SafeToStand(role, spot, NearestAllowed)
                 && SegmentClear(from, spot, Obstacles(role, Puddles()).Where(o => Vector2.Distance(o.At, from) >= o.Radius).ToList())) return spot;
+        }
+        foreach (var turn in Enumerable.Range(1, 18).Select(n => (n + 1) / 2 * 10f * (n % 2 == 0 ? -1f : 1f)))
+        {
+            var spot = hazard + Rotate(way, turn) * (reach + 0.8f);
+            if (spot.Length() <= ArenaEdge - 0.5f && SafeToStand(role, spot, NearestAllowed)
+                && SegmentClear(from, spot, [.. Obstacles(role, Puddles()).Where(o => Vector2.Distance(o.At, from) >= o.Radius), new Obstacle(hazard, distance - 0.05f)])) return spot;
         }
         return null;
     }
