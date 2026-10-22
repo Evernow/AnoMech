@@ -1129,6 +1129,201 @@ public class TeaP1LivingLiquidScenarioTests
         Assert.That(tell, Is.EqualTo(19), "Liquid Hand's tell");
     }
 
+    private static TeaP1LivingLiquidState State(ScenarioProbe p) => p.Game.Catalog.Scenarios.OfType<TeaP1LivingLiquidScenario>().Single().LastState!;
+
+    private static Vector2 Local(Dictionary<string, string> row) => new(ShownRun.Number(row, "x") - 100f, ShownRun.Number(row, "z") - 100f);
+
+    // On any roll: each doll tethered to the player who took it, then fed under a quarter of its HP on
+    // the client, tethered to the boss that takes it, and down within 3s of its blast.
+    [Test]
+    public void EveryDollIsFedUnderAQuarterOnScreen()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            var dolls = new string[4];
+            var hpAtBlast = new Dictionary<string, float>();
+            var seen = 0;
+            var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 72f,
+                Probe = p =>
+                {
+                    if (p.Crossed(33f))
+                        for (var k = 0; k < dolls.Length; k++) dolls[k] = Id(State(p).Objects.Dolls[k]);
+                    var rows = ((FakeBattleCharas)Natives.BattleCharas).Timeline.Rows;
+                    for (; seen < rows.Count; seen++)
+                        if (rows[seen]["kind"] == "ability" && rows[seen]["id"] == ActionId.ReducibleComplexity.ToString() && dolls.Contains(rows[seen]["actor"])
+                            && ((FakeBattleCharas)Natives.BattleCharas).Find(uint.Parse(rows[seen]["actor"], System.Globalization.NumberStyles.HexNumber)) is { } doll)
+                            hpAtBlast[rows[seen]["actor"]] = doll.Health / (float)doll.MaxHealth;
+                },
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            Assert.Multiple(() =>
+            {
+                foreach (var doll in dolls)
+                {
+                    var what = $"seed {seed}, doll {Array.IndexOf(dolls, doll)}";
+                    var mine = shown.Rows.Where(r => r["actor"] == doll).ToList();
+                    var tethers = mine.Where(r => r["kind"] == "ac" && r["id"] == "0x23").Select(r => r["p"].Split(',')).ToList();
+                    var blasts = mine.Where(r => r["kind"] == "ability" && r["id"] == ActionId.ReducibleComplexity.ToString()).ToList();
+                    Assert.That(tethers.Select(t => Convert.ToUInt32(t[1], 16)), Is.EqualTo(new uint[] { TetherId.DollFixate, TetherId.DollFeed }), $"{what}: fixate, then feed");
+                    Assert.That(tethers.Count > 0 && shown.SeatOf(tethers[0][2][2..]) is not null, Is.True, $"{what}: fixated on a player");
+                    Assert.That(blasts, Has.Count.EqualTo(1), what);
+                    Assert.That(hpAtBlast.GetValueOrDefault(doll, 1f), Is.LessThan(0.25f), $"{what}: its HP on the client as it went off");
+                    if (blasts.Count == 1)
+                        Assert.That(mine.Any(r => r["kind"] == "ac" && r["id"] == "0xE" && ShownRun.Time(r) > ShownRun.Time(blasts[0]) && ShownRun.Time(r) <= ShownRun.Time(blasts[0]) + 3f),
+                            Is.True, $"{what}: down within 3s of its blast");
+                }
+            });
+        }
+    }
+
+    // The Liquid Hand shows which Hand it will cast, from 29.35s and 118.04s, and casts that one: Prayer's
+    // tell (model state 19) for Prayer, Parting's (20) for Parting, on any roll.
+    [Test]
+    public void TheHandCastsTheMechanicItsTellShowed()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            string? hand = null;
+            var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 125f,
+                Probe = p => hand ??= State(p).Objects.LiquidHand is { } liquidHand ? Id(liquidHand) : null,
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var mine = shown.Rows.Where(r => r["actor"] == hand).ToList();
+            var tells = mine.Where(r => r["kind"] == "ac" && r["id"] == "0x3F").ToList();
+            var hands = mine.Where(r => r["kind"] == "ability" && r["id"] is var id && (id == ActionId.HandOfPrayer.ToString() || id == ActionId.HandOfParting.ToString())).ToList();
+            Assert.Multiple(() =>
+            {
+                Assert.That(tells.Select(ShownRun.Time), Is.EqualTo(new[] { 29.35f, 34.33f, 118.04f, 122.99f }).Within(0.05f), $"seed {seed}: the tells on and off");
+                Assert.That(hands, Has.Count.EqualTo(2), $"seed {seed}");
+                if (tells.Count != 4 || hands.Count != 2) return;
+                for (var k = 0; k < 2; k++)
+                {
+                    Assert.That(tells[2 * k + 1]["p"], Is.Empty, $"seed {seed}: tell {k + 1} cleared");
+                    Assert.That(hands[k]["id"], Is.EqualTo((tells[2 * k]["p"] == "0x13" ? ActionId.HandOfPrayer : ActionId.HandOfParting).ToString()),
+                        $"seed {seed}: Hand {k + 1} after tell {tells[2 * k]["p"]}");
+                }
+            });
+        }
+    }
+
+    // On any roll: each tethered tornado's Drainage tether on the tank the roll gave it from 78.53s, the
+    // third tornado untethered, and each Drainage at 85.65s on its own tank alone.
+    [Test]
+    public void EachDrainageTetherRunsToItsTank()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP1LivingLiquidState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 87f,
+                Probe = p => state ??= State(p),
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var spawned = shown.Of("spawn", BNpcBaseId.LiquidRage).Take(3).ToList();
+            var rages = Enumerable.Range(0, 3).Select(i => spawned.MinBy(r => Vector2.Distance(Local(r), state!.FirstTornadoes.Tornado(i)))!["actor"]).ToArray();
+            var tanks = state!.MainTankHoldsEarlierTether ? new[] { MainTank, OffTank } : [OffTank, MainTank];
+            var sources = Enumerable.Range(0, 3).Where(i => i != state.UntetheredTornado).Select(i => rages[i]).ToList();
+            var tethers = shown.Rows.Where(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x23" && r["p"].Split(',')[1] == $"0x{TetherId.Drainage:X}").ToList();
+            var drainages = shown.Of("ability", ActionId.Drainage).ToList();
+            Assert.Multiple(() =>
+            {
+                Assert.That(tethers.Select(r => (r["actor"], r["p"].Split(',')[2])), Is.EqualTo(sources.Select((rage, j) => (rage, "0x" + shown.IdOf(tanks[j])))), $"seed {seed}");
+                Assert.That(tethers.Select(ShownRun.Time), Is.All.EqualTo(78.53f).Within(0.05f), $"seed {seed}");
+                Assert.That(drainages.Select(r => (r["actor"], ShownRun.Hits(r).Single())), Is.EquivalentTo(sources.Select((rage, j) => (rage, shown.IdOf(tanks[j])))),
+                    $"seed {seed}: each Drainage on its tank alone");
+                Assert.That(drainages.Select(ShownRun.Time), Is.All.EqualTo(85.65f).Within(0.05f), $"seed {seed}");
+            });
+        }
+    }
+
+    // On any roll: Throttle on the six the roll gave it at 95.38s, each taken off by an Esuna on them,
+    // before any runs out. The player sits out a healer's seat: a debug bot there applies its Esuna
+    // straight, and its own client shows no action.
+    [Test]
+    public void EveryThrottleShowsOnItsPlayerAndEsunaTakesItOff()
+    {
+        foreach (var seed in TeaShown.Seeds())
+        {
+            TeaP1LivingLiquidState? state = null;
+            var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, seed, new ScenarioRunOptions
+            {
+                StopAt = 107f,
+                PlayerRole = MeleeDpsA,
+                Probe = p => state ??= State(p),
+            });
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            var throttled = state!.Throttled.Select(shown.IdOf).ToArray();
+            var gains = shown.Of("status_gain", StatusId.Throttle).ToList();
+            var losses = shown.Of("status_lose", StatusId.Throttle).ToList();
+            var esunas = shown.Of("ability", Esuna.ActionId).ToList();
+            Assert.Multiple(() =>
+            {
+                Assert.That(gains.Select(r => r["actor"]), Is.EquivalentTo(throttled), $"seed {seed}");
+                Assert.That(gains.Select(ShownRun.Time), Is.All.EqualTo(95.38f).Within(0.05f), $"seed {seed}");
+                Assert.That(losses.Select(r => r["actor"]), Is.EquivalentTo(throttled), $"seed {seed}: every Throttle taken off");
+                foreach (var loss in losses)
+                {
+                    Assert.That(ShownRun.Time(loss), Is.LessThan(95.38f + 10f), $"seed {seed}: {shown.SeatOf(loss["actor"])}'s ran out");
+                    Assert.That(esunas.Any(e => e["target"] == loss["actor"] && ShownRun.Time(e) < ShownRun.Time(loss) && ShownRun.Time(e) > ShownRun.Time(loss) - 1.5f), Is.True,
+                        $"seed {seed}: {shown.SeatOf(loss["actor"])}'s Throttle off with no Esuna on them");
+                }
+            });
+        }
+    }
+
+    // Each set of tornadoes stands where its T says, 15y out on the three arms but the open one, for
+    // every opening.
+    [Test]
+    public void TheTornadoesStandOnTheirT([Values(0, 45, 90, 135, 180, 225, 270, 315)] int openSide)
+    {
+        var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            StopAt = 93f,
+            Overrides = o =>
+            {
+                ((TeaP1LivingLiquidStateOverrides)o).FirstTornadoesOpenSide = openSide;
+                ((TeaP1LivingLiquidStateOverrides)o).SecondTornadoesOpenSide = (openSide + 90) % 360;
+            },
+        });
+        Assert.That(shown.Run.Passed, shown.Run.ToString);
+        var rages = shown.Of("spawn", BNpcBaseId.LiquidRage).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(rages, Has.Count.EqualTo(6));
+            foreach (var (set, t, at) in new[] { (rages.Take(3), new TornadoT(openSide), 19.66f), (rages.Skip(3), new TornadoT((openSide + 90) % 360), 92.10f) })
+            {
+                var spots = set.Select(Local).ToList();
+                Assert.That(set.Select(ShownRun.Time), Is.All.EqualTo(at).Within(0.05f));
+                for (var i = 0; i < 3; i++)
+                    Assert.That(spots.Min(s => Vector2.Distance(s, t.Tornado(i))), Is.LessThan(0.05f), $"open {t.OpenSide}: no tornado at {t.Tornado(i)}");
+            }
+        });
+    }
+
+    // Living Liquid and the Hand never lose HP on the client; only the dolls do.
+    [Test]
+    public void OnlyTheDollsLoseHp()
+    {
+        var dropped = new HashSet<uint>();
+        var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
+        {
+            Probe = p =>
+            {
+                var client = (FakeBattleCharas)Natives.BattleCharas;
+                foreach (var enemy in p.World.Children.OfType<SimEnemy>())
+                    if (client.Find(enemy.EntityId) is { } actor && actor.Health < actor.MaxHealth)
+                        dropped.Add(enemy.BNpcBaseId);
+            },
+        });
+        Assert.That(shown.Run.Passed, shown.Run.ToString);
+        Assert.That(dropped, Is.SubsetOf(new[] { BNpcBaseId.JagdDoll }));
+    }
+
     [Test]
     public void ReplayStateRoundTrips()
     {
