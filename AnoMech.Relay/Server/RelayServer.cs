@@ -80,6 +80,8 @@ public sealed class RelayServer : IAsyncDisposable
 
     private readonly RelayOptions options;
     private readonly IRelayLog log;
+    private readonly TimeProvider time;
+    private readonly TimeSpan keepAlive;
 
     private readonly RelayRooms rooms;
     private int nextConnectionId;
@@ -99,6 +101,7 @@ public sealed class RelayServer : IAsyncDisposable
     private volatile bool acceptingConnections = true;
 
     private TcpListener? listener;
+    private bool started;
     private readonly CancellationTokenSource shutdown = new();
     private Task acceptLoop = Task.CompletedTask;
     private Task reapLoop = Task.CompletedTask;
@@ -110,7 +113,7 @@ public sealed class RelayServer : IAsyncDisposable
     // not lock-guarded -- each is an independent running total, no cross-field consistency
     // needed. recentRejections resets every ReapInterval (see ReapLoop) and drives the alert
     // threshold above.
-    private DateTime startedAtUtc = DateTime.UtcNow;
+    private DateTime startedAtUtc;
     private long totalConnectionsAccepted;
     private long totalMessagesBroadcast;
     private long totalBytesBroadcast;
@@ -121,24 +124,34 @@ public sealed class RelayServer : IAsyncDisposable
         rejectedMessageTooLarge, rejectedMessageTimeout, rejectedMessageRate, rejectedByteRate,
         rejectedUnencrypted, rejectedTooManyFragments, rejectedBanned, rejectedPaused, rejectedBadProtocol;
 
-    public RelayServer(RelayOptions options, IRelayLog log)
+    public RelayServer(RelayOptions options, IRelayLog log) : this(options, log, TimeProvider.System, WebSocket.DefaultKeepAliveInterval) { }
+
+    // keepAlive: Zero where whoever carries the connections delivers every byte itself, since a
+    // WebSocket keeps its keep-alive on a timer of its own.
+    internal RelayServer(RelayOptions options, IRelayLog log, TimeProvider time, TimeSpan keepAlive)
     {
         this.options = options with { TrustedProxies = [.. options.TrustedProxies], Group = [.. options.Group] };
         this.log = log;
-        rooms = new RelayRooms(this.options);
+        this.time = time;
+        this.keepAlive = keepAlive;
+        rooms = new RelayRooms(this.options, time);
+        startedAtUtc = UtcNow;
     }
 
     public IPEndPoint? LocalEndPoint => listener?.LocalEndpoint as IPEndPoint;
-    public bool IsRunning => listener != null && !shutdown.IsCancellationRequested;
+    public bool IsRunning => started && !shutdown.IsCancellationRequested;
+
+    private DateTime UtcNow => time.GetUtcNow().UtcDateTime;
 
     // ---- Lifecycle ------------------------------------------------------------------------
 
     // Throws SocketException when the port can't be bound.
     public void Start()
     {
-        if (listener != null) throw new InvalidOperationException("A relay instance can only be started once.");
+        if (started) throw new InvalidOperationException("A relay instance can only be started once.");
         listener = Bind(options.BindAddress, options.Port);
-        startedAtUtc = DateTime.UtcNow;
+        started = true;
+        startedAtUtc = UtcNow;
 
         var endpoint = LocalEndPoint!;
         log.Info($"[AnoMech.Relay] Listening on {endpoint}. Host a session at /host, join one at /session/<code>.");
@@ -161,6 +174,15 @@ public sealed class RelayServer : IAsyncDisposable
         reapLoop = ReapLoop();
     }
 
+    // A relay handed its connections (ServeAsync) instead of listening for them.
+    internal void StartUnbound()
+    {
+        if (started) throw new InvalidOperationException("A relay instance can only be started once.");
+        started = true;
+        startedAtUtc = UtcNow;
+        reapLoop = ReapLoop();
+    }
+
     private static TcpListener Bind(IPAddress address, int port)
     {
         var candidate = new TcpListener(address, port);
@@ -180,9 +202,9 @@ public sealed class RelayServer : IAsyncDisposable
 
     public async Task StopAsync()
     {
-        if (listener == null || shutdown.IsCancellationRequested) return;
+        if (!started || shutdown.IsCancellationRequested) return;
         shutdown.Cancel();
-        listener.Stop();
+        listener?.Stop();
 
         foreach (var peer in rooms.Clear()) peer.Socket.Abort();
         foreach (var client in connections.Keys) client.Dispose();
@@ -339,12 +361,32 @@ public sealed class RelayServer : IAsyncDisposable
 
     // ---- Connection handling -------------------------------------------------------------
 
-    private async Task HandleConnectionAsync(TcpClient client)
+    private Task HandleConnectionAsync(TcpClient client)
+        => HandleConnectionAsync(client.GetStream(), NormalizeIp(((IPEndPoint)client.Client.RemoteEndPoint!).Address));
+
+    // A connection that reached the relay some other way than its listener, served the same way
+    // from its first request byte. Nothing may escape, as from HandleClientAsync.
+    internal async Task ServeAsync(Stream stream, IPAddress remoteAddress)
     {
-        var stream = client.GetStream();
-        var transport = NormalizeIp(((IPEndPoint)client.Client.RemoteEndPoint!).Address);
-        using var handshake = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token);
-        handshake.CancelAfter(HandshakeTimeout);
+        try
+        {
+            await HandleConnectionAsync(stream, NormalizeIp(remoteAddress));
+        }
+        catch (Exception e)
+        {
+            if (!shutdown.IsCancellationRequested)
+                log.Detail($"[AnoMech.Relay] connection ended with an error: {e.GetType().Name}: {e.Message}");
+        }
+        finally
+        {
+            await stream.DisposeAsync();
+        }
+    }
+
+    private async Task HandleConnectionAsync(Stream stream, IPAddress transport)
+    {
+        using var deadline = new CancellationTokenSource(HandshakeTimeout, time);
+        using var handshake = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token, deadline.Token);
 
         RelayHttpRequest? request;
         try
@@ -470,7 +512,7 @@ public sealed class RelayServer : IAsyncDisposable
         WebSocket socket;
         try
         {
-            socket = await RelayHttp.AcceptWebSocketAsync(stream, request, handshake.Token);
+            socket = await RelayHttp.AcceptWebSocketAsync(stream, request, keepAlive, handshake.Token);
         }
         catch (Exception e)
         {
@@ -486,7 +528,7 @@ public sealed class RelayServer : IAsyncDisposable
         }
 
         Interlocked.Increment(ref totalConnectionsAccepted);
-        var peer = new PeerConn(socket, (uint)Interlocked.Increment(ref nextConnectionId), ip, authenticatedPeerId);
+        var peer = new PeerConn(socket, (uint)Interlocked.Increment(ref nextConnectionId), ip, authenticatedPeerId, UtcNow);
 
         // The slot is released here and nowhere else, so no path between "reserved" and
         // "socket finished" can leak it -- including the rejection closes below, which each
@@ -577,7 +619,7 @@ public sealed class RelayServer : IAsyncDisposable
                 // Armed only once the first fragment lands: this bounds how long a message may
                 // take to finish arriving, not how long a connection may sit idle between
                 // messages (which is what IdleTimeout is for, at the room level).
-                using var messageCts = new CancellationTokenSource();
+                using var messageCts = new CancellationTokenSource(Timeout.InfiniteTimeSpan, time);
                 WebSocketReceiveResult result;
                 var fragmentCount = 0;
                 try
@@ -623,7 +665,7 @@ public sealed class RelayServer : IAsyncDisposable
                 }
 
                 var messageBytes = messageBuffer.ToArray();
-                var now = DateTime.UtcNow;
+                var now = UtcNow;
                 var cutoff = now - TimeSpan.FromSeconds(1);
 
                 recentMessageTimes.Enqueue(now);
@@ -750,7 +792,7 @@ public sealed class RelayServer : IAsyncDisposable
     private bool IsLockedOut(Dictionary<IPAddress, DateTime> table, IPAddress key)
     {
         lock (AbuseLock)
-            return table.TryGetValue(key, out var until) && until > DateTime.UtcNow;
+            return table.TryGetValue(key, out var until) && until > UtcNow;
     }
 
     // Sliding window of recent failures; crossing the threshold inside it trips a lockout.
@@ -762,7 +804,7 @@ public sealed class RelayServer : IAsyncDisposable
         {
             if (!attemptsTable.TryGetValue(key, out var attempts))
                 attemptsTable[key] = attempts = new Queue<DateTime>();
-            var now = DateTime.UtcNow;
+            var now = UtcNow;
             attempts.Enqueue(now);
             while (attempts.Count > 0 && now - attempts.Peek() > FailedJoinWindow) attempts.Dequeue();
             if (attempts.Count >= options.MaxFailedJoinsPerWindow)
@@ -794,7 +836,7 @@ public sealed class RelayServer : IAsyncDisposable
             relayVersion = RelayVersion, capabilities = RelayCapabilities,
             sessionCode = assignedSessionCode, peerId = peer.PeerId,
         });
-        using var timeout = new CancellationTokenSource(SendTimeout);
+        using var timeout = new CancellationTokenSource(SendTimeout, time);
         await SendOneAsync(peer, bytes, WebSocketMessageType.Text, timeout.Token);
     }
 
@@ -826,7 +868,7 @@ public sealed class RelayServer : IAsyncDisposable
     private async Task SendNoticeAsync(PeerConn host, Guid[] removed)
     {
         var body = JsonSerializer.SerializeToUtf8Bytes(new { t = RelayWire.NoticeType, Removed = removed });
-        using var timeout = new CancellationTokenSource(SendTimeout);
+        using var timeout = new CancellationTokenSource(SendTimeout, time);
         await SendOneAsync(host, RelayWire.Envelope(false, 0, Guid.Empty, false, body), WebSocketMessageType.Binary, timeout.Token);
     }
 
@@ -914,11 +956,11 @@ public sealed class RelayServer : IAsyncDisposable
         lock (AbuseLock)
         {
             ipCount = ConnectionsByIp.Count;
-            lockoutCount = JoinLockoutUntilByIp.Count(kv => kv.Value > DateTime.UtcNow);
+            lockoutCount = JoinLockoutUntilByIp.Count(kv => kv.Value > UtcNow);
             bannedCount = BannedIps.Count;
         }
         return new AdminStats(
-            (DateTime.UtcNow - startedAtUtc).TotalSeconds, RelayVersion, sessionCount, totalPeers, ipCount,
+            (UtcNow - startedAtUtc).TotalSeconds, RelayVersion, sessionCount, totalPeers, ipCount,
             lockoutCount, bannedCount, acceptingConnections,
             Interlocked.Read(ref totalConnectionsAccepted), Interlocked.Read(ref totalMessagesBroadcast), Interlocked.Read(ref totalBytesBroadcast),
             new RejectionCounts(
@@ -1035,7 +1077,7 @@ public sealed class RelayServer : IAsyncDisposable
         {
             try
             {
-                await Task.Delay(ReapInterval, shutdown.Token);
+                await Task.Delay(ReapInterval, time, shutdown.Token);
             }
             catch (OperationCanceledException)
             {
@@ -1060,7 +1102,7 @@ public sealed class RelayServer : IAsyncDisposable
 
     private async Task ReapOnceAsync()
     {
-        foreach (var (code, peers) in rooms.RemoveIdleSince(DateTime.UtcNow - IdleTimeout))
+        foreach (var (code, peers) in rooms.RemoveIdleSince(UtcNow - IdleTimeout))
         {
             log.Info($"[{code}] idle for over {IdleTimeout.TotalSeconds:F0}s -- disbanding ({peers.Count} connected).");
             await Task.WhenAll(peers.Select(peer =>
@@ -1069,7 +1111,7 @@ public sealed class RelayServer : IAsyncDisposable
 
         lock (AbuseLock)
         {
-            var now = DateTime.UtcNow;
+            var now = UtcNow;
             PruneLockouts(JoinLockoutUntilByIp, FailedJoinsByIp, now);
             PruneLockouts(AdminLockoutUntilByIp, FailedAdminByIp, now);
         }
@@ -1128,7 +1170,7 @@ public sealed class RelayServer : IAsyncDisposable
         // before awaiting), so a shared deadline is functionally identical to a per-target one
         // while costing O(1) timer/CTS allocations per broadcast instead of O(peers). At
         // hundreds of sessions this adds up fast otherwise (see README's Security notes).
-        using var cts = new CancellationTokenSource(SendTimeout);
+        using var cts = new CancellationTokenSource(SendTimeout, time);
         // Parallel, not sequential -- one slow peer must not delay delivery to everyone else.
         await Task.WhenAll(targets.Select(target => SendOneAsync(target, tagged, WebSocketMessageType.Binary, cts.Token)));
         return targets.Count;
@@ -1167,25 +1209,25 @@ public sealed class RelayServer : IAsyncDisposable
     // A close is a send too, so it waits its turn behind any broadcast to the same socket. A
     // close the relay starts (kick, ban) lingers so the client can read why before the abort;
     // answering the client's own close has nothing left to wait for.
-    private static async Task ClosePeerAsync(PeerConn peer, WebSocketCloseStatus status, string? description, bool linger = true)
+    private async Task ClosePeerAsync(PeerConn peer, WebSocketCloseStatus status, string? description, bool linger = true)
     {
-        using var timeout = new CancellationTokenSource(CloseTimeout);
+        using var timeout = new CancellationTokenSource(CloseTimeout, time);
         try
         {
             await peer.SendGate.WaitAsync(timeout.Token);
             try { await peer.Socket.CloseOutputAsync(status, description, timeout.Token); }
             finally { peer.SendGate.Release(); }
-            if (linger) await Task.Delay(CloseTimeout);
+            if (linger) await Task.Delay(CloseTimeout, time);
         }
         catch (Exception) { }
         finally { peer.Socket.Abort(); }
     }
 
-    private static async Task CloseQuietlyAsync(WebSocket socket, WebSocketCloseStatus status, string? description)
+    private async Task CloseQuietlyAsync(WebSocket socket, WebSocketCloseStatus status, string? description)
     {
         try
         {
-            using var cts = new CancellationTokenSource(CloseTimeout);
+            using var cts = new CancellationTokenSource(CloseTimeout, time);
             await socket.CloseAsync(status, description, cts.Token);
         }
         catch (Exception)

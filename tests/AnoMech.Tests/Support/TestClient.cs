@@ -20,7 +20,7 @@ internal sealed class TestClient
     private readonly Configuration config = new();
     private readonly NativesState natives = new();
     private readonly Dictionary<uint, List<(double At, string Name)>> names = new();
-    private readonly TestRelay relay;
+    private readonly ISessionNetwork relay;
     private bool botControl;
 
     public string Name { get; }
@@ -37,7 +37,7 @@ internal sealed class TestClient
     public MultiplayerManager Multiplayer { get; }
     public TraceLog Log { get; }
 
-    public TestClient(string name, PartyRole seat, int seed, TestRelay relay, bool isHost, int slotOffset, (int Min, int Max) spawnFrames)
+    public TestClient(string name, PartyRole seat, int seed, ISessionNetwork relay, bool isHost, int slotOffset, (int Min, int Max) spawnFrames)
     {
         Name = name;
         Seat = seat;
@@ -73,7 +73,7 @@ internal sealed class TestClient
     // A frame in Plugin.OnFrameworkUpdate's order.
     public void Frame(float deltaSeconds) => Do(() =>
     {
-        relay.RaiseDisconnects(PeerId);
+        relay.RaiseLinkEvents(PeerId);
         Fake.Frame(deltaSeconds, delta =>
         {
             Natives.Tick(delta);
