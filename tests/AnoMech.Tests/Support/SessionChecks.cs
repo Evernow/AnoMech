@@ -12,8 +12,9 @@ namespace AnoMech.Tests;
 // (ClientParity), with the same actors left and its run clock on the host's.
 internal static class SessionChecks
 {
-    // A peer's run clock against the host's: on it, or ahead by its poses' delay.
-    private const double ClockBehind = 0.05, ClockAhead = 0.25;
+    // A peer's run clock against the host's: ahead by its poses' delay, or behind by no more than
+    // a frame past what the peer leaves as jitter rather than catch up.
+    private const double ClockAhead = 0.25, ClockBehind = MultiplayerManager.ClockCatchUpSeconds + 1.0 / 60;
 
     public static string Who(int client) => client == 0 ? "the host" : $"peer {client}";
 
