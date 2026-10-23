@@ -35,6 +35,7 @@ internal sealed class MultiplayerRun
     private readonly List<(TestClient Client, double Frame, double LastFrame, double NextFrame, Random Hitches, double NextHitch, ConnectionProfile Link)> clients = [];
     private readonly List<Death> deaths = [];
     private readonly List<(double At, int Client, Action<TestClient> Input)> inputs = [];
+    private readonly bool live;
     private Action<TestClient>? beforeFrame;
 
     public ISessionNetwork Network { get; }
@@ -53,6 +54,7 @@ internal sealed class MultiplayerRun
 
     private MultiplayerRun(int seed, PlayerSeat host, IReadOnlyList<PlayerSeat> peers, ConnectionProfile hostLink, ConnectionProfile peerLink, bool live)
     {
+        this.live = live;
         Network = live ? new LiveRelay() : new TestRelay(seed, index => index == 0 ? hostLink : peerLink);
         PeerLink = peerLink;
         Host = new TestClient("Host", host.Role, seed, Network, isHost: true, slotOffset: 0, spawnFrames: (0, 0));
@@ -75,14 +77,16 @@ internal sealed class MultiplayerRun
     // seconds into the host's fight. configure: each client's own settings, before anyone connects.
     // beforeFrame: what a client's player does at the start of each of that client's frames.
     // liveConnection: over the real relay on this machine's loopback, in real time, the links'
-    // own faults and limits left out.
+    // own limits left out. network: the session's network, either kind, before anyone connects.
     public static MultiplayerRun Play(Type scenarioType, int strat, int seed, PlayerSeat host, IReadOnlyList<PlayerSeat> peers,
         ConnectionProfile? hostLink = null, ConnectionProfile? peerLink = null, double timeout = 600, bool immortal = false, int runs = 1,
         Action<TestRelay>? interrupt = null, IEnumerable<(double At, int Client, Action<TestClient> Input)>? inputs = null,
-        Action<TestClient>? configure = null, Action<TestClient>? beforeFrame = null, bool liveConnection = false)
+        Action<TestClient>? configure = null, Action<TestClient>? beforeFrame = null, bool liveConnection = false,
+        Action<ISessionNetwork>? network = null)
     {
         var run = new MultiplayerRun(seed, host, peers, hostLink ?? TestRelay.Perfect, peerLink ?? TestRelay.Perfect, liveConnection);
         if (interrupt != null) interrupt(run.Relay);
+        network?.Invoke(run.Network);
         foreach (var client in run.Peers.Prepend(run.Host)) configure?.Invoke(client);
         run.inputs.AddRange((inputs ?? []).OrderBy(i => i.At));
         run.beforeFrame = beforeFrame;
@@ -205,7 +209,9 @@ internal sealed class MultiplayerRun
         return worst;
     }
 
-    // Each client's frames at its own rate, the relay advancing to each.
+    // Each client's frames at its own rate, the relay advancing to each. In real time a frame is as
+    // long as it really took, as in game: the thread can be late for one, while the clients time
+    // what they're sent by the clock.
     private void RunUntil(Func<bool> done, double seconds, string what)
     {
         var deadline = Network.Now + seconds;
@@ -217,16 +223,17 @@ internal sealed class MultiplayerRun
                 if (clients[i].NextFrame < clients[index].NextFrame) index = i;
             var (client, frame, last, next, hitches, nextHitch, link) = clients[index];
             Network.AdvanceTo(next);
+            var at = live ? Network.Now : next;
             if (beforeFrame is { } drive) client.Do(() => drive(client));
             RunInputs(index, client);
-            client.Frame((float)(next - last));
+            client.Frame((float)(at - last));
             var gap = frame;
             if (next >= nextHitch)
             {
                 gap = link.PeerHitchMin + hitches.NextDouble() * (link.PeerHitchMax - link.PeerHitchMin);
                 nextHitch = next + gap + Exponential(hitches, link.PeerHitchEvery);
             }
-            clients[index] = (client, frame, next, next + gap, hitches, nextHitch, link);
+            clients[index] = (client, frame, at, next + gap, hitches, nextHitch, link);
         }
     }
 

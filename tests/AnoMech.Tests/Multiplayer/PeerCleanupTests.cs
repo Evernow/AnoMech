@@ -1,5 +1,4 @@
 using AnoMech.Core.Game.Party;
-using AnoMech.Core.SimObjects;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 
 namespace AnoMech.Tests;
@@ -37,13 +36,13 @@ public class PeerCleanupTests
     {
         TestRelay? relay = null;
         List<string> before = [];
-        var inputs = Inputs(ending, () => relay!).Prepend((EndAt - 0.5, 1, peer => before = Leftovers(peer))).ToList();
+        var inputs = Inputs(ending, () => relay!).Prepend((EndAt - 0.5, 1, peer => before = SessionChecks.Leftovers(peer))).ToList();
         var run = MultiplayerRun.Play(typeof(UmadP3BlackHoleScenario), 0, 1, new PlayerSeat(PartyRole.MeleeDpsA), [new PlayerSeat(PartyRole.CasterDps)],
             immortal: true, interrupt: r => relay = r, inputs: inputs);
         Assert.That(run.Failure, Is.Null);
         Assert.That(run.InputsLeft, Is.Zero, "the run ended before the ending");
         Assert.That(before, Is.Not.Empty, "the peer had nothing of the host's to keep");
-        Assert.That(Leftovers(run.Peers[0]), Is.Empty);
+        Assert.That(SessionChecks.Leftovers(run.Peers[0]), Is.Empty);
     }
 
     private static IEnumerable<(double At, int Client, Action<TestClient> Input)> Inputs(Ending ending, Func<TestRelay> relay)
@@ -80,19 +79,5 @@ public class PeerCleanupTests
     {
         client.Multiplayer.LeaveSession();
         if (client.Game.World.Map.IsInInstance) client.Game.Leave();
-    }
-
-    // What the host's packets left on the peer's client.
-    private static List<string> Leftovers(TestClient peer)
-    {
-        var left = peer.Fake.BattleCharas.LiveEntityIds.Concat(peer.Fake.EventObjects.LiveEntityIds)
-            .Select(id => peer.NameAt(id, double.MaxValue))
-            .Where(name => name.StartsWith("actor ", StringComparison.Ordinal))
-            .ToList();
-        left.AddRange(peer.Game.World.Children.OfType<SimTether>().Select(t => "a tether"));
-        if (peer.Fake.PlayerConditions.StatusAffliction) left.Add("a status lock on its player");
-        if (peer.Fake.PlayerConditions.ControlAffliction) left.Add("a control lock on its player");
-        left.AddRange(peer.Fake.BattleCharas.Player.Statuses.Keys.Select(id => $"status {id} on its player"));
-        return left;
     }
 }
