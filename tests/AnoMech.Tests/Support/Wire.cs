@@ -18,7 +18,7 @@ internal sealed class Wire
 
     private readonly ConnectionProfile link;
     private readonly Func<double> now;
-    private readonly Func<double, bool> uploadsDead, downloadsDead;
+    private readonly Func<double, bool> uploadsDead, downloadsDead, uploadsStalled;
     private readonly Random swing, jitter;
     private readonly LinkStalls uploadStalls, downloadStalls;
 
@@ -35,12 +35,13 @@ internal sealed class Wire
     // relayRead: the tag of what the relay's end just read. relayWriting: the tag for what it
     // writes, which the relay forwards from whichever connection it read last.
     public Wire(ConnectionProfile link, int seed, Func<double> now, Func<double, bool> uploadsDead, Func<double, bool> downloadsDead,
-        Action<object?> relayRead, Func<object?> relayWriting)
+        Func<double, bool> uploadsStalled, Action<object?> relayRead, Func<object?> relayWriting)
     {
         this.link = link;
         this.now = now;
         this.uploadsDead = uploadsDead;
         this.downloadsDead = downloadsDead;
+        this.uploadsStalled = uploadsStalled;
         swing = new Random(seed + 1);
         jitter = new Random(seed + 2);
         uploadStalls = new LinkStalls(new Random(seed + 3), link.UploadStallEvery, link.UploadStallMin, link.UploadStallMax);
@@ -84,7 +85,7 @@ internal sealed class Wire
             uploadShare = 1 - link.UploadSwing + swing.NextDouble() * 2 * link.UploadSwing;
             nextSwing = at + link.UploadSwingEvery;
         }
-        if (uploadStalls.Within(at) == null)
+        if (uploadStalls.Within(at) == null && !uploadsStalled(at))
         {
             uploadCredit += Math.Min(link.UploadRate * uploadShare * step, int.MaxValue);
             while (sendBuffer.Count > 0 && uploadCredit >= 1)
