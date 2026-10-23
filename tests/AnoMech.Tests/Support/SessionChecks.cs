@@ -22,8 +22,13 @@ internal static class SessionChecks
     {
         if (run.Failure != null) return [run.Failure];
         var problems = run.Network.Rejected.Select(r => $"refused {r}").ToList();
-        if (run.HostOutcome is not (SessionStatus.Succeeded or SessionStatus.CompletedWithMistake))
-            problems.Add($"the host's fight ended {(run.HostOutcome is { } outcome ? outcome.ToString() : "before its end")}");
+        // An immortal host's fight runs to its end through the mechanics its players fail, as through
+        // their deaths: a player whose link is down can't do their part.
+        var ranToItsEnd = run.HostOutcome is SessionStatus.Succeeded or SessionStatus.CompletedWithMistake
+                          || run.HostOutcome is SessionStatus.CompletedFailed && run.Host.Game.GodMode;
+        if (!ranToItsEnd)
+            problems.Add($"the host's fight ended {(run.HostOutcome is { } outcome ? outcome.ToString() : "before its end")}"
+                         + string.Concat(run.Host.Log.Warnings.Where(w => w.StartsWith("[ScenarioSession] Mechanic failed", StringComparison.Ordinal)).Select(w => $"; {w}")));
         foreach (var lost in run.Network.Sends.Where(c => c.Message is StreamLostMessage))
             problems.Add($"{Who(lost.From)} no longer had what the other end missed: {lost.Message}");
         foreach (var client in run.Peers.Prepend(run.Host))

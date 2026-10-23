@@ -17,7 +17,6 @@ namespace AnoMech.Tests;
 // at random moments of every fight. A new message, or a new scenario sending one, is covered as
 // it is.
 [TestFixture]
-[Ignore("Too slow")]
 public class LinkInterruptionTests
 {
     private static readonly PlayerSeat Host = new(PartyRole.MeleeDpsA);
