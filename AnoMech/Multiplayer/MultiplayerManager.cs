@@ -1135,13 +1135,13 @@ public sealed partial class MultiplayerManager : IDisposable
     // A Start that came late, sent again after a link drop, left this run behind the host's;
     // each ping's clock catches it up. Never back, and never for less than jitter, which would
     // only creep it forward.
-    private const float ClockCatchUpSeconds = 0.1f;
+    internal const float ClockCatchUpSeconds = 0.1f;
     private (RunClockState Clock, long ReceivedAt)? pingClock;
 
     // The round trips the host measured to us, from its last few statuses. The lead is built on
     // the shortest: a clock that never moves back would keep a single slow ping's lead for the
     // rest of the run, while a link that stays slower shows in every one.
-    private const int LeadRoundTrips = 3;
+    internal const int LeadRoundTrips = 3;
     private readonly Queue<float> roundTripsMs = new();
 
     private void CatchUpClockToHost()
