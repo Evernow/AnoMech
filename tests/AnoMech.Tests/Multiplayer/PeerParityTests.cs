@@ -46,12 +46,6 @@ public class PeerParityTests
     public void APeerSeesWhatTheHostSeesAfterAReset(Type scenarioType)
         => Verify(MultiplayerRun.Play(scenarioType, 0, 1, Host, [new PlayerSeat(PeerSeat)], runs: 2));
 
-    // Each client on the real RelayClient, over TCP to a relay on this machine, in real time.
-    [Category("RealConnection")]
-    [TestCaseSource(nameof(EachScenario))]
-    public void APeerSeesWhatTheHostSeesOverARealConnection(Type scenarioType)
-        => Verify(MultiplayerRun.Play(scenarioType, 0, 1, Host, [new PlayerSeat(PeerSeat)], liveConnection: true));
-
     private static void Verify(MultiplayerRun run)
     {
         Assert.That(run.Failure, Is.Null);

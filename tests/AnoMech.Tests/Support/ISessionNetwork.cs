@@ -18,6 +18,10 @@ internal interface ISessionNetwork
     void RaiseLinkEvents(Guid identity);
     // The longest a host's message took from its send to a peer's queue.
     double MaxHostDelay { get; }
+    // Everything the clients handed their links, in order.
+    List<Carried> Sends { get; }
+    // The client's link fails at `at` (on Now), the n-th client to connect being client n.
+    void Schedule(int client, double at, LinkFault fault);
     // What the clients refused as they read it, and what the relay refused of what they sent: the
     // relay cuts that link, which reconnects and resends, so nothing else would show it.
     IReadOnlyList<string> Rejected { get; }
