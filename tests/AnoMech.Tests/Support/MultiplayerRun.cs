@@ -13,6 +13,8 @@ internal sealed record PlayerSeat(PartyRole Role, bool BotControlled = true);
 internal sealed class MultiplayerRun
 {
     private const double LobbySeconds = 10;
+    // A ping every 2 s, the first answer reported at the next.
+    private const double RoundTripsSeconds = 20;
     private const double ResetSeconds = 10;
     // Enter, the stage's settle and the start, with the start check's own wait.
     private const double StartSeconds = 45;
@@ -138,6 +140,26 @@ internal sealed class MultiplayerRun
             peer.Do(() => peer.Multiplayer.ClaimRole(seat.Role));
         }
         RunUntil(() => Peers.All(p => p.Multiplayer.MyClaimedRole == p.Seat), LobbySeconds, "peers claiming their seats");
+        // In real time the lobby lasts until each peer has the round trips its clock lead is built
+        // on, as a real lobby does. Ones measured while this process was still starting up, its
+        // clients connecting for the first time, would lead each peer by the CPU it was short of.
+        if (live) RunUntil(RoundTripsTold(), RoundTripsSeconds, "the host to measure every peer's round trips");
+    }
+
+    // Whether every peer has been told MultiplayerManager.LeadRoundTrips of its round trips since
+    // this was called, in the host's PeerStatusMessages.
+    private Func<bool> RoundTripsTold()
+    {
+        var seen = Network.Sends.Count;
+        var told = Peers.ToDictionary(p => p.PeerId, _ => 0);
+        return () =>
+        {
+            for (; seen < Network.Sends.Count; seen++)
+                if (Network.Sends[seen] is { From: 0, Message: PeerStatusMessage status })
+                    foreach (var (peerId, entry) in status.Statuses)
+                        if (entry.LatencyMs != null && told.ContainsKey(peerId)) told[peerId]++;
+            return told.Values.All(count => count >= MultiplayerManager.LeadRoundTrips);
+        };
     }
 
     // The host's Reset button: every client's run ends, and the stay goes on.
