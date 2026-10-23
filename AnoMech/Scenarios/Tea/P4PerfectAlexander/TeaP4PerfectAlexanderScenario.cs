@@ -377,6 +377,13 @@ public sealed class TeaP4PerfectAlexanderScenario : IMultiplayerReplayable
 
     public void RunInstanceEvents(SimWorld instanceWorld) => Natives.TimelinePreload.Preload(HelperTimelines, "TeaP4PerfectAlexander");
 
+    // A stack taken alone sets off Faithlessness.
+    public void OnActionResolved(ActionResolved resolved)
+    {
+        if (resolved is { Action.ActionId: ActionId.CollectiveReprobation, Hits.Count: < 2, Caster: SimEnemy helper })
+            helper.Cast(TeaActions.Faithlessness);
+    }
+
     public void Tick(float delta, float elapsed)
     {
         if (state is null) return;

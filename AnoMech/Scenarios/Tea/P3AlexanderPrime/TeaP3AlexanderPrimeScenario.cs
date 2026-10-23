@@ -147,7 +147,6 @@ public sealed class TeaP3AlexanderPrimeScenario : IMultiplayerReplayable
     // A pair per size, each size spawned as the last one bursts.
     private readonly SimEventObject?[,] wormholes = new SimEventObject?[3, 2];
     private float rayFacing;
-    private EnemyActionCast? divineJudgment;
     private readonly SimTether?[] robotTethers = new SimTether?[2];
 
     public TeaP3AlexanderPrimeState? LastState { get; private set; }
@@ -185,7 +184,6 @@ public sealed class TeaP3AlexanderPrimeScenario : IMultiplayerReplayable
         swordBait = null;
         Array.Clear(numberBaits);
         Array.Clear(wormholes);
-        divineJudgment = null;
         Array.Clear(robotTethers);
         var practice = TeaP3AlexanderPrimePractice.Of(state.Practice);
         DiagnosticLog.Info($"[TeaP3AlexanderPrime] Roll: practice {practice.Label}, orbs {string.Join(" ", state.OrbHolders)}, Restraining Order {state.RestrainingOrderTank}+{state.RestrainingOrderDps}, "
@@ -385,6 +383,13 @@ public sealed class TeaP3AlexanderPrimeScenario : IMultiplayerReplayable
         ScheduleDowns();
 
         if (practice.Start > 0f) world.Events.Advance(practice.Start);
+    }
+
+    // A wormhole nobody soaks goes off on everyone.
+    public void OnActionResolved(ActionResolved resolved)
+    {
+        if (resolved is { Action.ActionId: ActionId.Repentance1 or ActionId.Repentance2 or ActionId.Repentance3, Hits.Count: 0, Caster: SimEnemy wormhole })
+            wormhole.Cast(TeaActions.Confession);
     }
 
     public void Tick(float delta, float elapsed)
@@ -1194,7 +1199,7 @@ public sealed class TeaP3AlexanderPrimeScenario : IMultiplayerReplayable
     {
         if (alexanderPrime is { } boss)
         {
-            divineJudgment = boss.Cast(TeaActions.DivineJudgment);
+            boss.Cast(TeaActions.DivineJudgment);
             for (var k = 0; k < 2; k++)
                 if ((k == 0 ? bruteJustice : cruiseChaser) is { } robot)
                     robotTethers[k] = world.Tether(robot, boss, TetherId.Plasmasphere);
@@ -1286,10 +1291,10 @@ public sealed class TeaP3AlexanderPrimeScenario : IMultiplayerReplayable
         boss.PlayActionTimeline(ActionTimelineId.WarpStart);
     }
 
-    // Divine Judgment completing ends the party.
+    // Divine Judgment completing ends the party; only his defeat cuts its bar short.
     private void DivineJudgmentEnrage()
     {
-        if (divineJudgment is null || divineJudgment.IsCancelled) return;
+        if (!alexanderPrime.IsAlive()) return;
         party.WipeAllPlayers(ActionId.DivineJudgmentEnrage, "Alexander Prime wasn't down before Divine Judgment");
     }
 

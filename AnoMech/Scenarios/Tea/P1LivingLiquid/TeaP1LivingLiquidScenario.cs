@@ -73,7 +73,6 @@ public sealed class TeaP1LivingLiquidScenario : IMultiplayerReplayable
     private bool dollsChase;
     private readonly SimTether?[] drainageTethers = new SimTether?[2];
     private readonly Dictionary<SimCharacter, float> dropsy = [];
-    private readonly Dictionary<SimCharacter, SimStatus> throttles = [];
     private PartyRole livingLiquidTank = PartyRole.MainTank;
     private PartyRole liquidHandTank = PartyRole.OffTank;
     private bool liquidHandWalks;
@@ -98,7 +97,6 @@ public sealed class TeaP1LivingLiquidScenario : IMultiplayerReplayable
         Array.Clear(dollTakers);
         dollsChase = false;
         dropsy.Clear();
-        throttles.Clear();
         livingLiquidTank = PartyRole.MainTank;
         liquidHandTank = PartyRole.OffTank;
         liquidHandWalks = false;
@@ -223,13 +221,18 @@ public sealed class TeaP1LivingLiquidScenario : IMultiplayerReplayable
         world.Events.Add(139.51f, () => DespawnVoidzones(secondVoidzones));
     }
 
+    // Throttle kills as it runs out; an Esuna takes it off with time left.
+    public void OnStatusLost(StatusLost lost)
+    {
+        if (lost is { StatusId: StatusId.Throttle, Reason: StatusLossReason.Expired }) lost.Holder.Die(ActionId.LiquidGaol, "Throttle ran out");
+    }
+
     public void Tick(float delta, float elapsed)
     {
         if (state is null) return;
         FeedDolls();
         MoveEmboli();
         SoakPuddles();
-        ThrottleRunsOut();
     }
 
     public MpMessage? BuildReplayStateMessage()
@@ -687,17 +690,6 @@ public sealed class TeaP1LivingLiquidScenario : IMultiplayerReplayable
         foreach (var role in state.Throttled)
             if (party.Get(role) is { } member && member.IsAlive())
                 member.AddStatus(StatusId.Throttle, 10f);
-    }
-
-    // Throttle kills as it runs out; an Esuna takes it off with time left.
-    private void ThrottleRunsOut()
-    {
-        foreach (var member in party.ActiveMembers())
-        {
-            if (member.FindStatus(StatusId.Throttle) is { } throttle) throttles[member] = throttle;
-            else if (throttles.Remove(member, out var held) && held.RemainingTime <= 0f)
-                member.Die(ActionId.LiquidGaol, "Throttle ran out");
-        }
     }
 
     // Dropsy lands on stepping into a tornado's water and kills once it has held long enough.

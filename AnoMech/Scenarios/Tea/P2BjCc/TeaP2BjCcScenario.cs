@@ -85,6 +85,8 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
     private readonly List<SimEnemy> helpers = [];
     // Each Compressed's current holder; the scenario hands both out.
     private readonly SimCharacter?[] holders = new SimCharacter?[2];
+    // Whom each element went off on, until its hit says who carries the next: the hit can't name its target.
+    private readonly SimCharacter?[] wentOffOn = new SimCharacter?[2];
     private readonly List<Vector3> aimSpots = [];
     private readonly List<Vector3> hawkSpots = [];
     private readonly List<Vector3> missileSpots = [];
@@ -113,6 +115,7 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
         bruteJustice = cruiseChaser = punisher = null;
         Array.Clear(down);
         Array.Clear(holders);
+        Array.Clear(wentOffOn);
         helpers.Clear();
         aimSpots.Clear();
         hawkSpots.Clear();
@@ -280,11 +283,14 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
         (4449, "mon_sp/gimmick/alexfour_hitogata_shinpan"),
     ];
 
+    public void OnActionResolved(ActionResolved resolved) => PassCompressed(resolved);
+
+    public void OnStatusLost(StatusLost lost) => PunishDeadHolder(lost);
+
     public void Tick(float delta, float elapsed)
     {
         if (state is null) return;
         TouchNisis();
-        PunishDeadHolders();
         PopMines();
         DrainShield(delta);
         puddles.Tick();
@@ -327,8 +333,10 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
 
     private bool Up(Robot robot) => RobotOf(robot) is { IsActive: true } && !down[(int)robot];
 
-    private EnemyActionCast? CastBy(Robot robot, EnemyAction action, CastTarget target = default)
-        => Up(robot) ? RobotOf(robot)!.Cast(action, target) : null;
+    private void CastBy(Robot robot, EnemyAction action, CastTarget target = default)
+    {
+        if (Up(robot)) RobotOf(robot)!.Cast(action, target);
+    }
 
     private SimCharacter? TankOf(Robot robot) => party.Get(robot == Robot.BruteJustice ? MainTank : OffTank) is { } tank && tank.IsAlive() ? tank : null;
 
@@ -539,13 +547,14 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
     }
 
     // A holder's death sets its element off on the whole party.
-    private void PunishDeadHolders()
+    private void PunishDeadHolder(StatusLost lost)
     {
+        if (lost.Reason != StatusLossReason.Died) return;
         for (var k = 0; k < 2; k++)
         {
-            if (holders[k] is not { } holder || holder.IsAlive()) continue;
+            if (lost.StatusId != Compressed[k].Status || !ReferenceEquals(holders[k], lost.Holder)) continue;
             holders[k] = null;
-            var at = holder.Position;
+            var at = lost.Holder.Position;
             var action = k == 0 ? TeaActions.PunishingWave : TeaActions.PunishingThunder;
             world.Events.Add(0.1f, () =>
             {
@@ -569,21 +578,30 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
             holder.RemoveStatus(Compressed[k].Status);
             var at = holder.Position;
             free[k].SetPosition(new Placement(at, 0f));
-            var cast = free[k].Cast(water ? TeaActions.CrashingWave : TeaActions.CrashingThunder, holder);
+            wentOffOn[k] = holder;
+            free[k].Cast(water ? TeaActions.CrashingWave : TeaActions.CrashingThunder, holder);
             var resistance = water ? StatusId.WaterResistanceDownIIP2 : StatusId.LightningResistanceDownII;
             world.Events.Add(0.6f, () =>
             {
                 if (holder.IsAlive()) holder.AddStatus(resistance, ResistanceDownSeconds);
             });
-            var slot = k;
-            world.Events.Add(0.68f, () =>
-            {
-                var others = cast.Hits.Select(h => h.Who)
-                    .Where(m => !ReferenceEquals(m, holder) && m.IsAlive() && !(water && m.HasStatus(resistance))).ToList();
-                Give(slot, water ? others.Count > 0 ? state.PickRandom(others) : null : others.Count == 1 ? others[0] : null);
-            });
             if (water) world.Events.Add(round == 1 ? 0.75f : 0.9f, () => SpawnTornado(at));
         }
+    }
+
+    // Who carries the next is read 0.68s after the hit, from those it caught alongside its holder.
+    private void PassCompressed(ActionResolved resolved)
+    {
+        var k = resolved.Action.ActionId switch { ActionId.CrashingWave => 0, ActionId.CrashingThunder => 1, _ => -1 };
+        if (k < 0 || wentOffOn[k] is not { } holder) return;
+        wentOffOn[k] = null;
+        var water = k == 0;
+        var resistance = water ? StatusId.WaterResistanceDownIIP2 : StatusId.LightningResistanceDownII;
+        world.Events.Add(0.68f, () =>
+        {
+            var others = resolved.Hits.Where(m => !ReferenceEquals(m, holder) && m.IsAlive() && !(water && m.HasStatus(resistance))).ToList();
+            Give(k, water ? others.Count > 0 ? state.PickRandom(others) : null : others.Count == 1 ? others[0] : null);
+        });
     }
 
     private void SpawnTornado(Vector3 at)
@@ -837,7 +855,8 @@ public sealed class TeaP2BjCcScenario : IMultiplayerReplayable
     // Cruise Chaser stands still behind the Plasma Shield until it is gone.
     private void CruiseChaserLimitCut()
     {
-        if (CastBy(Robot.CruiseChaser, TeaActions.LimitCutP2) is null) return;
+        if (!Up(Robot.CruiseChaser)) return;
+        CastBy(Robot.CruiseChaser, TeaActions.LimitCutP2);
         cruiseChaser!.Follow(null);
     }
 

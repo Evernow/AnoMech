@@ -594,7 +594,7 @@ public static class TeaActions
     {
         public void Apply(EnemyActionContext ctx, IReadOnlyList<SimCharacter> hits)
         {
-            if (spent is not null) ctx.AfterResolve(spent);
+            spent?.Invoke();
             foreach (var target in hits)
             {
                 var dx = target.Position.X - ctx.Origin.Position.X;
@@ -787,7 +787,6 @@ public static class TeaActions
         [
             Damage(MagicallyVulnerable, split: Distribution.Stack(3)),
             ApplyStatus(StatusId.MagicVulnerabilityUp, 4f),
-            FollowUp(Faithlessness, ctx => ctx.Hits.Count < 2),
         ],
         Timing = new() { DamageDelay = 0.5f },
     };
@@ -924,7 +923,6 @@ public static class TeaActions
             Damage(MagicallyVulnerable.VulnerableTo(StatusId.VulnerabilityUp)),
             ApplyStatus(StatusId.MagicVulnerabilityUp, 10f),
             ApplyStatus(StatusId.VulnerabilityUp, 3f),
-            FollowUp(Confession, ctx => ctx.Hits.Count == 0),
         ],
         Timing = new() { DamageDelay = 0.15f },
     };
@@ -952,8 +950,9 @@ internal sealed class LuminousOverloadEffect(EnemyAction explosion) : IEnemyActi
         foreach (var target in hits)
         {
             if (ctx.IsKilled(target) || !target.IsAlive()) continue;
+            // Once this resolve is done, so the explosion can't claim its kills.
             if (target.HasStatus(StatusId.LuminousAetheroplasm))
-                ctx.AfterResolve(() =>
+                ctx.Events.Add(0f, () =>
                 {
                     if (target.IsAlive()) party.Act(target, explosion);
                 });
