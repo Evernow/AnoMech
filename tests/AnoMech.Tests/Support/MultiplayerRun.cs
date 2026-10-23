@@ -163,8 +163,8 @@ internal sealed class MultiplayerRun
         HostOutcome = Host.Game.ActiveScenario != null ? Host.Game.Status : null;
         EndedAt = Network.Now;
         Fights.Add((StartedAt, EndedAt));
-        HostClockAtEnd = Host.Game.Events.Elapsed;
-        PeerClocksAtEnd = Peers.Select(p => (double)p.Game.Events.Elapsed).ToList();
+        HostClockAtEnd = ClockNow(0);
+        PeerClocksAtEnd = Enumerable.Range(1, Peers.Count).Select(ClockNow).ToList();
         var until = Network.Now + FlushSeconds;
         RunUntil(() => Network.Now >= until && StreamsSettled() && Idle(), SettleSeconds, "the last messages to land");
     }
@@ -178,6 +178,16 @@ internal sealed class MultiplayerRun
     // Each run clock as the host's run ended; a peer's leads the host's by its poses' delay.
     public double HostClockAtEnd { get; private set; }
     public IReadOnlyList<double> PeerClocksAtEnd { get; private set; } = [];
+
+    // A client's run clock now: where its last frame left it plus the time since, as the host
+    // reads its own between frames. The clients' last frames come at different moments, and in
+    // real time far apart when the thread runs late.
+    private double ClockNow(int index)
+    {
+        var (client, _, last, _, _, _, _) = clients[index];
+        var game = client.Game;
+        return game.Events.Elapsed + (game.Paused ? 0 : (Network.Now - last) * game.EventTimeScale);
+    }
 
     // Every client still in the session has taken everything the others numbered for it.
     private bool StreamsSettled()

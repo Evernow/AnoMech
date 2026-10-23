@@ -42,9 +42,16 @@ internal static class SessionChecks
             if (peer.Fake.EventObjects.Live != run.Host.Fake.EventObjects.Live)
                 problems.Add($"{peer.Name} has {peer.Fake.EventObjects.Live} event objects left, the host {run.Host.Fake.EventObjects.Live}");
             var lead = run.PeerClocksAtEnd[i] - run.HostClockAtEnd;
-            if (lead < -ClockBehind || lead > ClockAhead) problems.Add($"{peer.Name}'s run clock is {lead * 1000:+0;-0} ms off the host's");
+            if (lead < -ClockBehind || lead > ClockAhead)
+                problems.Add($"{peer.Name}'s run clock is {lead * 1000:+0;-0} ms off the host's, set by: {string.Join(" / ", ClockMoves(peer))}");
         }
         return problems;
+    }
+
+    // What moved a peer's run clock: its sync to the host's at the run's start, and each catch-up.
+    private static IEnumerable<string> ClockMoves(TestClient peer)
+    {
+        lock (peer.Log.Lines) return peer.Log.Lines.Where(l => l.Contains("[Multiplayer] Peer: run clock", StringComparison.Ordinal)).ToList();
     }
 
     // What the host's packets left on a peer's client.
