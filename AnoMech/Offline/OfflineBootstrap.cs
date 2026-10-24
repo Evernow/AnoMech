@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using Dalamud.Game.ClientState.Conditions;
@@ -13,6 +14,7 @@ using FFXIVClientStructs.FFXIV.Client.Network;
 using FFXIVClientStructs.FFXIV.Client.System.Framework;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Lumina.Excel.Sheets;
 using CSPlayerState = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState;
@@ -41,6 +43,9 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     private const uint TerritoryUnloading = 3;
     private const uint DisplayHatHidden = 0x40, DisplayWeaponHidden = 0x80, DisplayVisor = 0x800;
     private const ushort FullCondition = 30000;
+    // A blacklist reply page: 20 entries of 0x30 bytes, then the next page's start (0 on the last
+    // page), this page's start and the request id it answers.
+    private const int BlacklistPageSize = 0x3C8, BlacklistPageRequestId = 0x3C2;
 
     private static readonly TimeSpan HudTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LayoutTimeout = TimeSpan.FromSeconds(60);
@@ -58,17 +63,22 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     private const string SettingsLoadedSignature = "40 57 48 81 EC ?? ?? ?? ?? 48 83 79 40 00 48 8B F9 0F 84 ?? ?? ?? ?? 85 D2 0F 84 ?? ?? ?? ?? 83 EA 03";
     private const int SettingsLoadRequesterOffset = 0x40;
     private const int SettingsLoadSucceeded = 0;
+    // What the game's own world entry runs right after leaving the lobby scene: it ends the title
+    // screen's fixed time of day (Framework's ClientTime override), so the world keeps Eorzea time.
+    private const string ClearTimeOverrideSignature = "48 8B 05 ?? ?? ?? ?? 48 C7 80 ?? ?? 00 00 00 00 00 00 C6 80 ?? ?? 00 00 00 C3";
 
     private delegate void SetClassJobIdDelegate(CSPlayerState* state, byte classJobId);
     private delegate void SetCurrentLevelDelegate(CSPlayerState* state, short level);
     private delegate void GaugePacketDelegate(JobGaugeManager* manager, byte* packet);
     private delegate byte LobbySceneDelegate(int scene, int time);
     private delegate void SettingsLoadedDelegate(ConfigModule* module, int result);
+    private delegate void ClearTimeOverrideDelegate();
 
     private readonly OfflineSession session;
     private readonly OfflineNetworkGuard guard = new();
     private readonly OfflineFileGuard files = new();
     private readonly OfflineConnectionGuard connections = new();
+    private readonly OfflineWeather weather = new();
     private Stage stage = Stage.Preflight;
     private long stageStarted = Stopwatch.GetTimestamp();
     private SetClassJobIdDelegate? setClassJobId;
@@ -76,6 +86,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     private GaugePacketDelegate? gaugePacket;
     private LobbySceneDelegate? lobbyScene;
     private SettingsLoadedDelegate? settingsLoaded;
+    private ClearTimeOverrideDelegate? clearTimeOverride;
     private OfflineLoadout loadout = null!;
     private OfflineInnRoom inn = null!;
     private byte weatherId = 1;
@@ -95,6 +106,9 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     public OfflineSnapshot? Snapshot { get; private set; }
     // Once the scene has changed, only the game's own logout brings the title screen back.
     public bool EnteredGameUi { get; private set; }
+    public bool ZoneEntered { get; private set; }
+
+    public void TickWeather() => weather.Tick();
 
     public void ClearReZoning()
     {
@@ -205,6 +219,13 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
         {
             return Fail(out status, $"This game version isn't supported by offline mode (a game function wasn't found: {e.Message}).");
         }
+        if (!weather.Found)
+            return Fail(out status, "This game version isn't supported by offline mode (the weather update wasn't found).");
+
+        // Without it the offline world only keeps the title screen's time of day.
+        clearTimeOverride = Plugin.SigScanner.TryScanText(ClearTimeOverrideSignature, out var clearAt)
+            ? Marshal.GetDelegateForFunctionPointer<ClearTimeOverrideDelegate>(clearAt)
+            : null;
 
         Snapshot = OfflineSnapshot.Take(out var snapshotWhy);
         if (Snapshot == null)
@@ -246,6 +267,11 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
         // Edit, housing included) rebuilds it during the inn's zone change.
         lobbyScene!(NoLobbyScene, 0);
         OfflineTrace.Write("[Offline] Left the lobby scene.");
+        if (clearTimeOverride != null)
+        {
+            clearTimeOverride();
+            OfflineTrace.Write("[Offline] Ended the title screen's time of day.");
+        }
         var changed = AtkModule()->ChangeUIScene(GameUIScene.GameMain);
         OfflineTrace.Write($"[Offline] ChangeUIScene(GameMain) returned {changed}.");
         Advance(Stage.WaitHud);
@@ -376,6 +402,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
         };
         OfflineTrace.Write($"[Offline] HandleZoneInitPacket(0x{LocalEntityId:X}, territory {inn.TerritoryId}, weather {weatherId}).");
         PacketDispatcher.HandleZoneInitPacket(LocalEntityId, &packet, 0);
+        ZoneEntered = true;
         // The zone init takes the local entity id from the zone connection, which offline has none.
         Control.Instance()->LocalPlayerEntityId = LocalEntityId;
 
@@ -445,16 +472,40 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
         PacketDispatcher.HandleActorControlPacket(LocalEntityId, ZoneInActorControl, 0, 0, 0, 0, 0, 0, 0, 0, InvalidObjectId, false);
         // A server's Condition packet normally sets this; without it nothing does.
         Conditions.Instance()->Normal = true;
+        ReceiveEmptyBlacklist();
         Snapshot?.NoteWorldEntered();
         Menus.Arm();
         OfflineTrace.Write(OfflineProbe.Describe("in the offline world"));
         return Result.Done;
     }
 
+    // Until a blacklist has come from the server the game hides every other player, since it can't
+    // tell yet whether they are blocked, and leaves their names unresolved. This is a server's reply
+    // for an empty list: one page, both the first and the last. A logout clears it again.
+    private static void ReceiveEmptyBlacklist()
+    {
+        var blacklist = InfoProxyBlacklist.Instance();
+        if (blacklist == null)
+        {
+            OfflineTrace.Write("[Offline] The blacklist isn't available; other players stay hidden.");
+            return;
+        }
+        var page = stackalloc byte[BlacklistPageSize];
+        new Span<byte>(page, BlacklistPageSize).Clear();
+        page[BlacklistPageRequestId] = blacklist->CurrentRequestId;
+        blacklist->AddPage((nint)page);
+        OfflineTrace.Write("[Offline] Received an empty blacklist.");
+    }
+
+    // A real character always stands on a world; spawned without one, the client's world ids stay 0,
+    // and the bots and the party list copy them. The game keeps no character's world locally, so this
+    // is the first public one.
+    private static readonly ushort SandboxWorld = (ushort)(Plugin.DataManager.GetExcelSheet<World>().FirstOrDefault(w => w.IsPublic).RowId);
+
     private SpawnPlayerPacket BuildSpawn()
     {
         var look = loadout.Look;
-        var packet = new SpawnPlayerPacket { ContentId = SandboxContentId };
+        var packet = new SpawnPlayerPacket { ContentId = SandboxContentId, HomeWorldId = SandboxWorld, CurrentWorldId = SandboxWorld };
         ref var common = ref packet.Common;
         common.TargetId = InvalidObjectId;
         common.CombatTaggerId = InvalidObjectId;

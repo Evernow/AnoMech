@@ -273,6 +273,8 @@ internal sealed unsafe class OfflineSession : IDisposable
         }
         if (exitAfterReturn && Phase == OfflinePhase.Idle) ExitFromTitle();
         if (Phase == OfflinePhase.InWorld) bootstrap?.Menus.Apply();
+        // From the zone-in until the logout, as a zone connection would.
+        if (Phase == OfflinePhase.InWorld || Phase == OfflinePhase.Starting && bootstrap is { ZoneEntered: true }) bootstrap?.TickWeather();
 
         if (Phase == OfflinePhase.Leaving)
         {
