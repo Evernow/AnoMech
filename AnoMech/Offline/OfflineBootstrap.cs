@@ -25,7 +25,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
 {
     public enum Result { Working, Done, Failed }
 
-    private enum Stage { Preflight, LoadConfig, EnterGameUi, WaitHud, Player, ZoneIn, WaitLayout, Spawn, WaitWarp, Finish }
+    private enum Stage { Preflight, Disconnect, LoadConfig, EnterGameUi, WaitHud, Player, ZoneIn, WaitLayout, Spawn, WaitWarp, Finish }
 
     public const uint LocalEntityId = 0x10FFA001;
     // Never a real character's id, so nothing the game keys on it can reach a real character's files.
@@ -50,6 +50,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     private static readonly TimeSpan HudTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LayoutTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan WarpTimeout = TimeSpan.FromSeconds(75);
+    private static readonly TimeSpan DisconnectTimeout = TimeSpan.FromSeconds(5);
 
     private const string SetClassJobIdSignature = "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 20 0F B6 F2 48 8B D9 88 51 7E";
     private const string SetCurrentLevelSignature = "66 89 91 88 00 00 00 66 C7 81 10 09 00 00 01 01 C3";
@@ -66,6 +67,11 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     // What the game's own world entry runs right after leaving the lobby scene: it ends the title
     // screen's fixed time of day (Framework's ClientTime override), so the world keeps Eorzea time.
     private const string ClearTimeOverrideSignature = "48 8B 05 ?? ?? ?? ?? 48 C7 80 ?? ?? 00 00 00 00 00 00 C6 80 ?? ?? 00 00 00 C3";
+    // LobbyData's reset of the lobby screen that the game's own world entry runs (inlined there):
+    // the screen releases the data-center list entry it picked and drops its worlds, characters and
+    // state. A released entry's connection is closed by the network module's list update. Backing out
+    // of the character select keeps all of it, connection included.
+    private const string ResetLobbyScreenSignature = "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 48 89 7C 24 ?? 41 56 48 83 EC 20 48 8B 81 D8 08 00 00 48 8D 99 60 08 00 00 33 ED 48 89 81 E0 08 00 00 48 89 A9 D0 08 00 00 8B F5 66 89 A9 F0 08 00 00 49 BE 5B C7 9B 13 4A 34 70 8B 0F 1F 44 00 00 48 8B 93 C0 F7 FF FF 48 8B 8B B8 F7 FF FF E8";
 
     private delegate void SetClassJobIdDelegate(CSPlayerState* state, byte classJobId);
     private delegate void SetCurrentLevelDelegate(CSPlayerState* state, short level);
@@ -73,6 +79,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     private delegate byte LobbySceneDelegate(int scene, int time);
     private delegate void SettingsLoadedDelegate(ConfigModule* module, int result);
     private delegate void ClearTimeOverrideDelegate();
+    private delegate void ResetLobbyScreenDelegate(LobbyData* data);
 
     private readonly OfflineSession session;
     private readonly OfflineNetworkGuard guard = new();
@@ -91,6 +98,9 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
     private OfflineInnRoom inn = null!;
     private byte weatherId = 1;
     private bool setReZoning;
+    private ResetLobbyScreenDelegate? resetLobbyScreen;
+    private string? openServer;
+    private bool lobbyScreenReset;
 
     public OfflineBootstrap(OfflineSession session)
     {
@@ -133,6 +143,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
         return stage switch
         {
             Stage.Preflight => Preflight(out status),
+            Stage.Disconnect => Disconnect(out status),
             Stage.LoadConfig => LoadConfig(out status),
             Stage.EnterGameUi => EnterGameUi(out status),
             Stage.WaitHud => WaitHud(out status),
@@ -183,6 +194,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
             return Fail(out status, "The game's network layer isn't ready yet. Wait a moment at the title screen and try again.");
         if (OfflineProbe.ZoneClient() != 0)
             return Fail(out status, "The game is still connected to a server. Wait a moment at the title screen and try again.");
+        openServer = OfflineConnectionGuard.OpenServerConnection(fresh: true);
 
         var game = GameMain.Instance();
         var control = Control.Instance();
@@ -226,6 +238,13 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
             ? Marshal.GetDelegateForFunctionPointer<ClearTimeOverrideDelegate>(clearAt)
             : null;
 
+        if (openServer != null)
+        {
+            if (!Plugin.SigScanner.TryScanText(ResetLobbyScreenSignature, out var resetAt))
+                return Fail(out status, $"The game is still connected to a data center ({openServer}), and this game version's lobby reset wasn't found. Restart the game to go offline.");
+            resetLobbyScreen = Marshal.GetDelegateForFunctionPointer<ResetLobbyScreenDelegate>(resetAt);
+        }
+
         Snapshot = OfflineSnapshot.Take(out var snapshotWhy);
         if (Snapshot == null)
             return Fail(out status, $"This game version isn't supported by offline mode ({snapshotWhy}).");
@@ -234,7 +253,28 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
             return Fail(out status, $"This game version isn't supported by offline mode ({why}).");
 
         OfflineTrace.Write($"[Offline] Preflight passed: {loadout.Character.Key}, job {loadout.ClassJobId} level {loadout.Level}, inn {inn.TerritoryId} at {inn.Position}, weather {weatherId}.");
-        Advance(Stage.LoadConfig);
+        Advance(openServer == null ? Stage.LoadConfig : Stage.Disconnect);
+        return Result.Working;
+    }
+
+    // The data-center connection the character select left open, let go as the game's world entry
+    // lets go of it; the close itself takes the network module a frame or so.
+    private Result Disconnect(out string status)
+    {
+        status = "Closing the data-center connection...";
+        var server = OfflineConnectionGuard.OpenServerConnection(fresh: true);
+        if (server == null)
+        {
+            OfflineTrace.Write("[Offline] The data-center connection is closed.");
+            Advance(Stage.LoadConfig);
+            return Result.Working;
+        }
+        if (lobbyScreenReset)
+            return InStage > DisconnectTimeout ? Fail(out status, $"The data-center connection ({server}) didn't close. Restart the game to go offline.") : Result.Working;
+
+        OfflineTrace.Write($"[Offline] Resetting the lobby screen, which lets go of the data center it picked ({server}).");
+        resetLobbyScreen!(&AgentLobby.Instance()->LobbyData);
+        lobbyScreenReset = true;
         return Result.Working;
     }
 

@@ -198,6 +198,7 @@ internal sealed class OfflinePanel(OfflineSession session)
         ImGui.PushTextWrapPos(0f);
         if (starting) ImGui.TextUnformatted(session.Status);
         else if ((reason ?? session.SelectedLoadout(out _)?.Summary) is { } hint) ImGui.TextDisabled(hint);
+        if (!starting && session.StillConnected) ImGui.TextDisabled("Closes the game's data-center connection first.");
         if (!starting && session.TurnsOff.Count > 0) ImGui.TextDisabled($"Turns off {string.Join(", ", session.TurnsOff)} until you leave.");
         ImGui.PopTextWrapPos();
         if (enter) session.Start();

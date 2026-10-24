@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -18,6 +19,15 @@ internal sealed unsafe class OfflineConnectionGuard : IDisposable
     private const uint ConnectOrdinal = 4, GetHostByNameOrdinal = 52;
     private const int SocketError = -1, HostNotFound = 11001;
     private const ushort InternetFamily = 2, Internet6Family = 23;
+    // Square Enix's documented game server ports (lobby, chat and zone).
+    private static readonly (int First, int Last)[] ServerPorts = [(54992, 54994), (55006, 55007), (55021, 55040)];
+    // GetExtendedTcpTable's TCP_TABLE_OWNER_PID_ALL, ERROR_INSUFFICIENT_BUFFER, and the
+    // MIB_TCP_STATE range from SYN_SENT to ESTABLISHED.
+    private const int TcpTableOwnerPidAll = 5;
+    private const uint InsufficientBuffer = 122, SynSent = 3, Established = 5;
+    private static readonly TimeSpan TableReadInterval = TimeSpan.FromSeconds(1);
+    private static long tableReadAt;
+    private static string? openServer;
 
     private delegate int ConnectDelegate(nint socket, byte* address, int length);
     private delegate nint GetHostByNameDelegate(byte* name);
@@ -124,6 +134,50 @@ internal sealed unsafe class OfflineConnectionGuard : IDisposable
         if (family == Internet6Family && length >= 24) return $"[{new IPAddress(new ReadOnlySpan<byte>(address + 8, 16))}]:{port}";
         return "a server";
     }
+
+    // A server connection the game already holds, which the hooks can't stop: the title screen keeps
+    // the data center's from the character select open. Read from Windows' table of this process's
+    // TCP connections, at most once a second unless fresh, since the setup screen asks every frame.
+    public static string? OpenServerConnection(bool fresh = false)
+    {
+        if (!fresh && tableReadAt != 0 && Stopwatch.GetElapsedTime(tableReadAt) < TableReadInterval) return openServer;
+        tableReadAt = Stopwatch.GetTimestamp();
+        return openServer = ReadOpenServerConnection();
+    }
+
+    private static string? ReadOpenServerConnection()
+    {
+        var size = 0u;
+        GetExtendedTcpTable(null, ref size, false, InternetFamily, TcpTableOwnerPidAll, 0);
+        // The table can grow between the size query and the read.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            size += 4096;
+            var buffer = new byte[size];
+            fixed (byte* table = buffer)
+            {
+                var result = GetExtendedTcpTable(table, ref size, false, InternetFamily, TcpTableOwnerPidAll, 0);
+                if (result == InsufficientBuffer) continue;
+                if (result != 0) return $"an unknown server: Windows' connection table couldn't be read (error {result})";
+                var count = *(uint*)table;
+                var pid = (uint)Environment.ProcessId;
+                // MIB_TCPROW_OWNER_PID: state, local address, local port, remote address, remote port, owning pid.
+                for (var i = 0; i < count; i++)
+                {
+                    var row = (uint*)(table + 4 + i * 24);
+                    if (row[5] != pid || row[0] is < SynSent or > Established) continue;
+                    var port = (int)(((row[4] & 0xFF) << 8) | ((row[4] >> 8) & 0xFF));
+                    foreach (var (first, last) in ServerPorts)
+                        if (port >= first && port <= last) return $"{new IPAddress(row[3])}:{port}";
+                }
+                return null;
+            }
+        }
+        return "an unknown server: Windows' connection table couldn't be read";
+    }
+
+    [DllImport("iphlpapi.dll")]
+    private static extern uint GetExtendedTcpTable(byte* table, ref uint size, bool sort, uint family, int tableClass, uint reserved);
 
     public void Dispose()
     {

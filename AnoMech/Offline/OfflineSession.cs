@@ -57,6 +57,7 @@ internal sealed unsafe class OfflineSession : IDisposable
     public string? LastRefusal => lastRefusal;
     public string? Notice => notice;
     public string? ClosedLastTime => closedLastTime;
+    public bool StillConnected => OfflineConnectionGuard.OpenServerConnection() != null;
     // Display names of the blacklisted plugins starting turns off.
     public IReadOnlyList<string> TurnsOff { get; private set; } = [];
 
@@ -547,6 +548,7 @@ internal sealed unsafe class OfflineSession : IDisposable
     private static string? LoginReached()
     {
         if (OfflineProbe.ZoneClient() != 0 || OfflineProbe.ChatClient() != 0) return "the game opened a server connection";
+        if (OfflineConnectionGuard.OpenServerConnection() is { } server) return $"the game had a server connection open ({server})";
         var lobby = AgentLobby.Instance();
         if (lobby != null && (lobby->IsLoggedIn || lobby->IsLoggedIntoZone)) return "the game logged in";
         return Plugin.ClientState.IsLoggedIn ? "Dalamud reported a login" : null;
