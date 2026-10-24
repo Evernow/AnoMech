@@ -9,6 +9,7 @@ internal static class OfflineProcessState
     private const string LastLogoutKey = "AnoMech.Offline.LastLogout";
     private const string TaintedKey = "AnoMech.Offline.Tainted";
     private const string InWorldKey = "AnoMech.Offline.InWorld";
+    private const string TurnedOffPluginsKey = "AnoMech.Offline.TurnedOffPlugins";
 
     // Offline mode has changed game state that isn't put back yet.
     public static bool Tainted
@@ -28,6 +29,13 @@ internal static class OfflineProcessState
     {
         get => Get(InWorldKey);
         set => Set(InWorldKey, value);
+    }
+
+    // Internal names of the plugins offline mode turned off and hasn't turned back on.
+    public static string[] TurnedOffPlugins
+    {
+        get => AppDomain.CurrentDomain.GetData(TurnedOffPluginsKey) as string[] ?? [];
+        set => AppDomain.CurrentDomain.SetData(TurnedOffPluginsKey, value);
     }
 
     private static bool Get(string key) => AppDomain.CurrentDomain.GetData(key) is true;

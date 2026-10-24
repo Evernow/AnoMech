@@ -167,7 +167,6 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
 
     private Result Preflight(out string status)
     {
-        OfflineTrace.Begin();
         OfflineTrace.Write(OfflineProbe.Describe("preflight"));
         status = "Checking the game...";
 

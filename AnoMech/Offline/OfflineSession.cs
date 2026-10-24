@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using AnoMech.Core;
 using AnoMech.Core.Native.Implementations;
 using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Plugin;
 using FFXIVClientStructs.FFXIV.Application.Network;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.UI;
@@ -30,6 +31,9 @@ internal sealed unsafe class OfflineSession : IDisposable
     // AgentLobby.ReceiveEvent value of the title menu's Exit.
     private const int TitleExitEvent = 12;
     private static readonly TimeSpan ReturnTimeout = TimeSpan.FromSeconds(60);
+    // Each unload takes a frame or two; Dalamud never turns off on its own a plugin that is in more
+    // than one collection.
+    private static readonly TimeSpan TurnOffTimeout = TimeSpan.FromSeconds(20);
     // A real logout's saves are issued as it happens and written asynchronously; they are long done
     // by then, and offline mode's file guard would refuse one still in flight.
     private const long SaveSettleMilliseconds = 10_000;
@@ -53,6 +57,8 @@ internal sealed unsafe class OfflineSession : IDisposable
     public string? LastRefusal => lastRefusal;
     public string? Notice => notice;
     public string? ClosedLastTime => closedLastTime;
+    // Display names of the blacklisted plugins starting turns off.
+    public IReadOnlyList<string> TurnsOff { get; private set; } = [];
 
     private readonly Action openMainWindow;
     private List<OfflineLocalCharacter>? characters;
@@ -68,6 +74,7 @@ internal sealed unsafe class OfflineSession : IDisposable
     private string? leaveReason;
     private bool ownLogout;
     private long leavingSince;
+    private long turningOffSince;
 
     public OfflineSession(Action openMainWindow)
     {
@@ -79,6 +86,8 @@ internal sealed unsafe class OfflineSession : IDisposable
         if (closedLastTime != null) DiagnosticLog.Info($"[Offline] {closedLastTime}");
 
         Plugin.ClientState.Logout += OnLogout;
+        TurnsOff = OfflinePlugins.Loaded();
+        Plugin.PluginInterface.ActivePluginsChanged += OnPluginsChanged;
 
         if (OfflineProcessState.Tainted) Resume();
     }
@@ -86,9 +95,14 @@ internal sealed unsafe class OfflineSession : IDisposable
     public void Dispose()
     {
         Plugin.ClientState.Logout -= OnLogout;
+        Plugin.PluginInterface.ActivePluginsChanged -= OnPluginsChanged;
         bootstrap?.Dispose();
+        // Unloaded while still starting; a tainted game was closed before this.
+        if (!OfflineProcessState.Tainted) OfflinePlugins.TurnBackOn();
         if (Current == this) Current = null;
     }
+
+    private void OnPluginsChanged(IActivePluginsChangedEventArgs args) => TurnsOff = OfflinePlugins.Loaded();
 
     // The game's own logout, from its menus or anything else: the title screen is on its way, so
     // offline mode only has to put things back once it arrives. Raised before the game's own
@@ -190,6 +204,7 @@ internal sealed unsafe class OfflineSession : IDisposable
     {
         if (Phase == OfflinePhase.InWorld) return null;
         if (OfflineProcessState.Tainted) return "Offline mode couldn't put this game session back. Restart the game to start it again.";
+        if (!OfflinePlugins.CanHoldAutoUpdate) return "Offline mode can't hold off this Dalamud version's plugin auto-update.";
         if (Plugin.ClientState.IsLoggedIn || Plugin.ObjectTable.LocalPlayer != null) return "Offline mode starts from the title screen.";
         if (!AtTitleScreen()) return "Go back to the title screen to start offline mode.";
         if (AgentLobby.Instance() is var lobby && lobby != null && lobby->LobbyUIStage != TitleUiStage)
@@ -233,11 +248,15 @@ internal sealed unsafe class OfflineSession : IDisposable
         if (Loadout == null) return;
         UseConfig = Store.UseConfig;
 
+        // From here, so turning the blacklisted plugins off is in the offline log too.
+        OfflineTrace.Begin();
         DiagnosticLog.Info($"[Offline] Starting: character {Loadout.Character.Key}, {Loadout.Summary}, inn territory {Loadout.Inn.TerritoryId}, configuration {(UseConfig ? "on" : "off")}.");
         lastRefusal = null;
         notice = null;
         closedLastTime = null;
         exitAfterReturn = false;
+        OfflinePlugins.TurnOff();
+        turningOffSince = Stopwatch.GetTimestamp();
         bootstrap?.Dispose();
         bootstrap = new OfflineBootstrap(this);
         Phase = OfflinePhase.Starting;
@@ -268,6 +287,7 @@ internal sealed unsafe class OfflineSession : IDisposable
         if (Phase == OfflinePhase.InWorld) bootstrap?.Menus.Apply();
         // From the zone-in until the logout, as a zone connection would.
         if (Phase == OfflinePhase.InWorld || Phase == OfflinePhase.Starting && bootstrap is { ZoneEntered: true }) bootstrap?.TickWeather();
+        if (Phase != OfflinePhase.Idle) OfflinePlugins.HoldAutoUpdate();
 
         if (Phase == OfflinePhase.Leaving)
         {
@@ -275,6 +295,15 @@ internal sealed unsafe class OfflineSession : IDisposable
             return;
         }
         if (Phase != OfflinePhase.Starting || bootstrap == null) return;
+        // The blacklisted plugins are gone before the bootstrap touches the game.
+        if (!bootstrap.ChangedGameState && OfflinePlugins.Loaded() is { Count: > 0 } loaded)
+        {
+            var names = string.Join(", ", loaded);
+            if (Stopwatch.GetElapsedTime(turningOffSince) > TurnOffTimeout)
+                Fail($"{names} didn't turn off. Turn {(loaded.Count == 1 ? "it" : "them")} off in the plugin installer and try again.");
+            else Status = $"Turning off {names}...";
+            return;
+        }
 
         OfflineBootstrap.Result result;
         string status;
@@ -317,6 +346,7 @@ internal sealed unsafe class OfflineSession : IDisposable
         {
             bootstrap.Dispose();
             bootstrap = null;
+            OfflinePlugins.TurnBackOn();
             Phase = OfflinePhase.Idle;
             Status = "";
             lastRefusal = reason;
@@ -422,6 +452,8 @@ internal sealed unsafe class OfflineSession : IDisposable
         Loadout = null;
         OfflineProcessState.InWorld = false;
         OfflineProcessState.Tainted = false;
+        // Not before an exit, which would only load them to shut them down.
+        if (!exitAfterReturn) OfflinePlugins.TurnBackOn();
         Phase = OfflinePhase.Idle;
         Status = "";
         notice = leaveReason == null
