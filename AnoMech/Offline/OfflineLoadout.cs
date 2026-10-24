@@ -95,7 +95,7 @@ internal static class OfflineLoadouts
         var level = GearLevel(equipment);
         var maxHp = EstimatedMaxHp(level, JobRow(set.ClassJobId) is { Role: 1 });
         var inn = inns[0];
-        var summary = $"{JobName(set.ClassJobId)} level {level}, i{set.ItemLevel}, about {maxHp:N0} HP, in {inn.Name}";
+        var summary = $"{JobName(set.ClassJobId)} level {level}, i{set.ItemLevel}, about {maxHp:N0} HP";
         return new OfflineLoadout(character, ChosenName(choice), set.ClassJobId, level, maxHp, DefaultMaxMp, Attributes(equipment, level), LookFromGearset(set),
                                   equipment, appearance?.Customize ?? DefaultCustomize, appearance?.Voice ?? DefaultVoice, inn, summary);
     }

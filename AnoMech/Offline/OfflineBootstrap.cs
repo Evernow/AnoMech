@@ -205,7 +205,7 @@ internal sealed unsafe class OfflineBootstrap : IDisposable
             return Fail(out status, "The inn room couldn't be read from the game data.");
         weatherId = FirstWeather(territory);
         if (session.UseConfig && !OfflineGameFiles.CanLoadConfig(out var configWhy))
-            return Fail(out status, $"Your configuration can't be loaded on this game version ({configWhy}). Turn off \"Use my hotbars, keybinds, HUD layout and settings\" to go offline without it.");
+            return Fail(out status, $"Your configuration can't be loaded on this game version ({configWhy}). Turn off \"Use my settings\" to go offline without it.");
 
         try
         {

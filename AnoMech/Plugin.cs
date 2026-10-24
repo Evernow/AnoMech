@@ -250,9 +250,8 @@ public sealed class Plugin : IDalamudPlugin
         try
         {
             Offline = new Offline.OfflineSession(() => MainWindow.IsOpen = true);
-            windowSystem.AddWindow(Offline.ConfigWindow);
             var icon = TextureProvider.GetFromManifestResource(typeof(Plugin).Assembly, "AnoMech.OfflineIcon.png");
-            offlineTitleEntry = TitleScreenMenu.AddEntry("AnoMech offline mode", icon, Offline.OpenFromTitle);
+            offlineTitleEntry = TitleScreenMenu.AddEntry("AnoMech offline mode", icon, () => MainWindow.IsOpen = true);
         }
         catch (Exception e)
         {
@@ -315,7 +314,7 @@ public sealed class Plugin : IDalamudPlugin
                 Runs.Leave();
                 break;
             case "offline":
-                Offline?.ConfigWindow.Toggle();
+                MainWindow.IsOpen = true;
                 break;
             default:
                 MainWindow.Toggle();

@@ -2,14 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using AnoMech.Core;
 using AnoMech.Core.Native.Implementations;
-using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Conditions;
-using Dalamud.Interface.Colors;
-using Dalamud.Interface.Utility;
 using FFXIVClientStructs.FFXIV.Application.Network;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.UI;
@@ -37,8 +33,10 @@ internal sealed unsafe class OfflineSession : IDisposable
     // A real logout's saves are issued as it happens and written asynchronously; they are long done
     // by then, and offline mode's file guard would refuse one still in flight.
     private const long SaveSettleMilliseconds = 10_000;
-    internal const string LoginPrecaution = "As a precaution, the game closes at once if anything tries to log in or reach a server while offline mode is active, "
-                                            + "for example a plugin that logs in on its own, so no login can happen with offline mode's changes in place.";
+    internal const string LoginPrecaution = "As a precaution, the game closes if anything tries to log in or reach a server while offline mode is active.";
+    // Dalamud.Boot hands this exception code to the crash handler, which ends the game and launches it
+    // again through Dalamud.Injector with the launcher's arguments: Dalamud's own Restart game.
+    private const uint DalamudRestartCode = 0x12345678;
 
     internal static OfflineSession? Current { get; private set; }
     // Process-wide rather than this instance's phase: the game stays in the offline world across
@@ -46,13 +44,15 @@ internal sealed unsafe class OfflineSession : IDisposable
     internal static bool InWorld => OfflineProcessState.InWorld;
 
     public OfflineStore Store { get; }
-    public OfflineConfigWindow ConfigWindow { get; }
+    public OfflinePanel Panel { get; }
     public OfflinePhase Phase { get; private set; }
     public string Status { get; private set; } = "";
     public bool Busy => Phase is OfflinePhase.Starting or OfflinePhase.Leaving;
     public OfflineLoadout? Loadout { get; private set; }
     public bool UseConfig { get; private set; }
-    public IReadOnlyList<string> OtherPlugins { get; private set; } = [];
+    public string? LastRefusal => lastRefusal;
+    public string? Notice => notice;
+    public string? ClosedLastTime => closedLastTime;
 
     private readonly Action openMainWindow;
     private List<OfflineLocalCharacter>? characters;
@@ -60,7 +60,6 @@ internal sealed unsafe class OfflineSession : IDisposable
     private int unusable;
     private (OfflineLoadout? Loadout, string Error)? selection;
     private OfflineBootstrap? bootstrap;
-    private bool confirmClose;
     private bool returnRequested;
     private bool exitAfterReturn;
     private string? lastRefusal;
@@ -69,13 +68,12 @@ internal sealed unsafe class OfflineSession : IDisposable
     private string? leaveReason;
     private bool ownLogout;
     private long leavingSince;
-    private bool configWindowHidden;
 
     public OfflineSession(Action openMainWindow)
     {
         this.openMainWindow = openMainWindow;
         Store = new OfflineStore(Plugin.PluginInterface.ConfigDirectory.FullName);
-        ConfigWindow = new OfflineConfigWindow(this);
+        Panel = new OfflinePanel(this);
         Current = this;
         closedLastTime = Store.TakeCloseRecord();
         if (closedLastTime != null) DiagnosticLog.Info($"[Offline] {closedLastTime}");
@@ -128,8 +126,8 @@ internal sealed unsafe class OfflineSession : IDisposable
         OfflineProcessState.InWorld = false;
         Phase = OfflinePhase.Failed;
         Status = armed
-            ? "Offline mode ended in an earlier plugin load and can't put the game back. Close the game and start it again."
-            : $"Offline mode couldn't resume after a plugin reload ({why}). Close the game and start it again.";
+            ? "Offline mode ended in an earlier plugin load and can't put the game back. Restart the game."
+            : $"Offline mode couldn't resume after a plugin reload ({why}). Restart the game.";
         DiagnosticLog.Warn($"[Offline] {Status}");
     }
 
@@ -141,11 +139,6 @@ internal sealed unsafe class OfflineSession : IDisposable
         characters = all.Where(c => OfflineLoadouts.CombatGearsets(c).Count > 0).ToList();
         unusable = all.Count - characters.Count;
         appearances = OfflineGameFiles.ScanAppearances();
-        OtherPlugins = Plugin.PluginInterface.InstalledPlugins
-                             .Where(p => p.IsLoaded && p.InternalName != Plugin.PluginInterface.InternalName)
-                             .Select(p => p.Name)
-                             .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-                             .ToList();
         SelectionChanged();
     }
 
@@ -184,8 +177,8 @@ internal sealed unsafe class OfflineSession : IDisposable
         selection ??= SelectedCharacter is { } character
             ? (Resolve(character, out var why), why)
             : (null, UnusableCharacters > 0
-                ? "None of the characters on this PC has a combat gearset offline mode can read. Log in once normally and save a gearset for a combat job."
-                : $"No characters were found in {OfflineGameFiles.UserFolder()}. Log in once normally so the game saves one.");
+                ? "No character on this PC has a combat gearset. Log in once and save one for a combat job."
+                : $"No characters found in {OfflineGameFiles.UserFolder()}. Log in once so the game saves one.");
         error = selection.Value.Error;
         return selection.Value.Loadout;
     }
@@ -201,7 +194,7 @@ internal sealed unsafe class OfflineSession : IDisposable
         if (!AtTitleScreen()) return "Go back to the title screen to start offline mode.";
         if (AgentLobby.Instance() is var lobby && lobby != null && lobby->LobbyUIStage != TitleUiStage)
             return "Wait until the title screen is idle, with none of its menus open.";
-        if (SaveSettleSeconds() is > 0 and var wait) return $"The game is still saving your last session; offline mode can start in {wait} s.";
+        if (SaveSettleSeconds() is > 0 and var wait) return $"The game is still saving your last session; ready in {wait} s.";
         if (OfflineGameFiles.FileModulesBusy() is { } busy) return busy;
         return SelectedLoadout(out var error) == null ? error : null;
     }
@@ -309,9 +302,6 @@ internal sealed unsafe class OfflineSession : IDisposable
                 Status = "";
                 DiagnosticLog.Info("[Offline] In the offline world.");
                 openMainWindow();
-                // Out of the way in the world, where the main window has the controls.
-                configWindowHidden = ConfigWindow.IsOpen;
-                ConfigWindow.IsOpen = false;
                 break;
             case OfflineBootstrap.Result.Failed:
                 Fail(status);
@@ -345,6 +335,11 @@ internal sealed unsafe class OfflineSession : IDisposable
         if (Plugin.Condition[ConditionFlag.BetweenAreas] || Plugin.Condition[ConditionFlag.BetweenAreas51]) return "Wait for the loading screen to finish.";
         return null;
     }
+
+    // Returning puts back the title screen as it was when offline mode started, which a plugin
+    // reload forgets.
+    internal string? ReturnBlockedReason()
+        => bootstrap?.Snapshot == null ? "A plugin reload lost the title screen's state; restart the game instead." : LeaveBlockedReason();
 
     // Ends offline mode through the game's own logout handler, as a server's reply to a logout
     // would: the game tears the world down and brings the title screen back itself.
@@ -430,13 +425,11 @@ internal sealed unsafe class OfflineSession : IDisposable
         Phase = OfflinePhase.Idle;
         Status = "";
         notice = leaveReason == null
-            ? "Back at the title screen. Everything offline mode changed was put back."
-            : $"Offline mode stopped: {leaveReason} Everything it changed was put back.";
+            ? "Back at the title screen with everything put back."
+            : $"Offline mode stopped: {leaveReason} Everything was put back.";
         OfflineTrace.Write(OfflineProbe.Describe("back at the title screen"));
         DiagnosticLog.Info($"[Offline] {notice}");
         OfflineTrace.End();
-        if (configWindowHidden && !exitAfterReturn) ConfigWindow.IsOpen = true;
-        configWindowHidden = false;
     }
 
     // The game's Exit Game, finished by the title menu's own Exit once the title is up: it closes the
@@ -487,6 +480,30 @@ internal sealed unsafe class OfflineSession : IDisposable
         TerminateProcess(GetCurrentProcess(), 0);
     }
 
+    // A new process, so nothing offline mode did outlives it. Without a crash handler to take the
+    // exception the game only closes.
+    internal static void RestartGame()
+    {
+        try
+        {
+            DiagnosticLog.Info("[Offline] Restarting the game.");
+            DiagnosticLog.Shutdown();
+        }
+        catch
+        {
+            // Restarting is all that is left to do.
+        }
+        try
+        {
+            RaiseException(DalamudRestartCode, 0, 0, 0);
+        }
+        catch
+        {
+            // Nothing restarted the game.
+        }
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+
     internal static void CloseGameForLogin(string what)
     {
         OfflineTrace.Write($"[Offline] {what} while offline mode was active.");
@@ -509,104 +526,12 @@ internal sealed unsafe class OfflineSession : IDisposable
     [DllImport("kernel32.dll")]
     private static extern bool TerminateProcess(nint process, uint exitCode);
 
+    [DllImport("kernel32.dll")]
+    private static extern void RaiseException(uint code, uint flags, uint argumentCount, nint arguments);
+
     // Only at the title screen or in the offline world; normal play never sees it.
     public bool ShowsControls => !Plugin.ClientState.IsLoggedIn || OfflineProcessState.Tainted;
 
-    public void OpenFromTitle() => ConfigWindow.IsOpen = true;
-
-    public void DrawMainWindowBar()
-    {
-        if (!ShowsControls) return;
-
-        if (ImGui.Button("Offline config")) ConfigWindow.Toggle();
-        ImGui.SameLine();
-        DrawControls();
-        ImGui.Separator();
-    }
-
-    public void DrawControls(bool withSummary = true)
-    {
-        switch (Phase)
-        {
-            case OfflinePhase.Idle:
-                DrawIdle(withSummary);
-                break;
-            case OfflinePhase.Starting:
-            case OfflinePhase.Leaving:
-                ImGui.AlignTextToFramePadding();
-                ImGui.TextColored(ImGuiColors.DalamudYellow, Status);
-                break;
-            case OfflinePhase.InWorld:
-                ImGui.AlignTextToFramePadding();
-                ImGui.TextColored(ImGuiColors.HealerGreen, $"Offline mode - {Plugin.ObjectTable.LocalPlayer?.Name.TextValue ?? Loadout?.Name}");
-                ImGui.SameLine();
-                if (bootstrap?.Snapshot != null) DrawLeaveButton();
-                else DrawCloseButton();
-                break;
-            case OfflinePhase.Failed:
-                DrawCloseButton();
-                ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + 520f * ImGuiHelpers.GlobalScale);
-                ImGui.TextColored(ImGuiColors.DalamudRed, Status);
-                ImGui.PopTextWrapPos();
-                break;
-        }
-    }
-
-    private void DrawIdle(bool withSummary)
-    {
-        if (UnavailableReason() is { } reason)
-        {
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextDisabled(reason);
-        }
-        else
-        {
-            if (ImGui.Button("Enter offline inn")) Start();
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Experimental. Loads an inn room without connecting to a server, so you can practice scenarios while logged out.\n"
-                                 + "Returning to the title screen puts everything back.\n"
-                                 + "If anything tries to log in or reach a server meanwhile, the game closes as a precaution.");
-            if (withSummary && SelectedLoadout(out _) is { } loadout)
-            {
-                ImGui.SameLine();
-                ImGui.AlignTextToFramePadding();
-                ImGui.TextDisabled($"{loadout.Name}: {loadout.Summary}");
-            }
-        }
-        if (lastRefusal != null || notice != null || closedLastTime != null)
-        {
-            ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + 520f * ImGuiHelpers.GlobalScale);
-            if (closedLastTime != null) ImGui.TextColored(ImGuiColors.DalamudOrange, closedLastTime);
-            if (lastRefusal != null) ImGui.TextColored(ImGuiColors.DalamudOrange, lastRefusal);
-            if (notice != null) ImGui.TextColored(ImGuiColors.HealerGreen, notice);
-            ImGui.PopTextWrapPos();
-        }
-    }
-
-    private void DrawLeaveButton()
-    {
-        var blocked = LeaveBlockedReason();
-        ImGui.BeginDisabled(blocked != null);
-        if (ImGui.Button("Return to title")) RequestReturn(exitAfterwards: false);
-        ImGui.EndDisabled();
-        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-            ImGui.SetTooltip(blocked ?? "Logs out of the offline world and puts everything offline mode changed back,\n"
-                                        + "so you can log in normally or start offline mode again.");
-    }
-
-    private void DrawCloseButton()
-    {
-        if (!confirmClose)
-        {
-            if (ImGui.Button("Close the game")) confirmClose = true;
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Offline mode can't put this game session back, so it can only be closed.");
-            return;
-        }
-        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.15f, 0.15f, 1f));
-        if (ImGui.Button("Close the game now")) CloseGame("Close the game", explainNextTime: false);
-        ImGui.PopStyleColor();
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel##close")) confirmClose = false;
-    }
+    // The main window is offline mode's setup screen until the offline world is up.
+    public bool ShowsSetup => ShowsControls && Phase is OfflinePhase.Idle or OfflinePhase.Starting;
 }
