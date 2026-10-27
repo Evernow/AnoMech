@@ -489,9 +489,9 @@ internal static class AdminConsole
     }
 }
 
-// File logging: mirrors console-worthy events to disk plus much higher-volume per-message
-// detail, rotated and gzip-compressed, held under a total size cap. Never logs message
-// CONTENTS -- only metadata (who, when, which session, how big, how many peers it reached),
+// File logging: mirrors console-worthy events to disk plus higher-volume detail (each rejected
+// attempt, each session's usage), rotated and gzip-compressed, held under a total size cap.
+// Never logs message CONTENTS -- only metadata (who, when, which session, how much traffic),
 // same stance as the README's existing "the relay doesn't log message contents" note.
 //
 // A plain rotating/compressed log directory rather than a database: this is meant to run as a
@@ -515,9 +515,9 @@ internal static class RelayLog
     // Producers (Info/Warn/Detail, called from every connection's own async flow) only ever
     // enqueue a string -- no lock, no disk I/O, on that path. A single background task is the
     // only thing that ever touches the file, so it needs no locking either. At hundreds of
-    // sessions all broadcasting, this is what keeps logging from becoming the actual bottleneck
-    // (it used to be a synchronous, AutoFlush=true write under one relay-wide lock, shared by
-    // literally every connection).
+    // sessions, or under a flood of rejected connections, this is what keeps logging from
+    // becoming the actual bottleneck (it used to be a synchronous, AutoFlush=true write under
+    // one relay-wide lock, shared by literally every connection).
     // Bounded, not unbounded: a stuck/full disk should drop log lines rather than let the queue
     // grow without limit and eventually pressure the process's own memory. Capacity is generous
     // relative to realistic burst rates -- dropping is the rare, "something's already wrong" case.
@@ -570,7 +570,7 @@ internal static class RelayLog
 
             // Batches flushes instead of one disk write per line (what AutoFlush did) --
             // still bounds how stale the file can be to ~1s, without paying a syscall per
-            // message broadcast under real load.
+            // line under real load.
             if (DateTime.UtcNow - lastFlushUtc >= FlushInterval)
             {
                 activeWriter.Flush();
@@ -608,7 +608,8 @@ internal static class RelayLog
     }
 
     // File only. For anything high-volume enough that echoing it to the console would drown
-    // out the events actually worth watching live: individual rejection reasons, every broadcast.
+    // out the events actually worth watching live: individual rejection reasons, each session's
+    // usage.
     public static void Detail(string message) => Write("DETAIL", message);
 
     private static void Write(string level, string message)

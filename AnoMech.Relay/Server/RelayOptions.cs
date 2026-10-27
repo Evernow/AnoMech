@@ -13,8 +13,8 @@ public interface IRelayLog
     // to carry their own message, alerts, summaries.
     void Info(string message);
     void Warn(string message);
-    // High-volume lines (individual rejection reasons, every broadcast) that would drown out
-    // the live events if echoed alongside them.
+    // High-volume lines (individual rejection reasons, each session's usage) that would drown
+    // out the live events if echoed alongside them.
     void Detail(string message);
 }
 
