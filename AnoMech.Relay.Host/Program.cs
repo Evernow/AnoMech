@@ -120,9 +120,6 @@ internal static class Program
             var logDir = GetArg(args, "--log-dir") ?? Path.Combine(AppContext.BaseDirectory, "logs");
             var maxLogBytes = long.TryParse(GetArg(args, "--log-max-bytes"), out var mlb) ? mlb : 5L * 1024 * 1024 * 1024;
             RelayLog.Configure(logDir, maxLogBytes);
-            // Log writes are buffered and flushed roughly once a second (see RelayLog) -- catch
-            // a graceful shutdown (systemd stop, Ctrl+C) so the last stretch isn't silently lost.
-            AppDomain.CurrentDomain.ProcessExit += (_, _) => RelayLog.FlushOnShutdown();
             RelayLog.Info($"[AnoMech.Relay] Logging to {logDir} (compressed, capped at {maxLogBytes / (1024.0 * 1024 * 1024):F1} GB). " +
                            "Use --session-log <code> to read back one session's lines.");
         }
@@ -525,6 +522,19 @@ internal static class RelayLog
         new BoundedChannelOptions(20_000) { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.DropWrite });
     private static long droppedLines;
 
+    // Console lines go out through a queue of their own, written by one background task: a
+    // console write blocks while whatever reads it (journald, a terminal) falls behind, and the
+    // producers are connection handlers. Dropped when full, like the file's lines.
+    private static readonly Channel<(string Line, bool Error)> ConsoleQueue = Channel.CreateBounded<(string Line, bool Error)>(
+        new BoundedChannelOptions(10_000) { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.DropWrite });
+    private static long droppedConsoleLines;
+    private static readonly Task ConsoleWriter = Task.Run(WriteConsoleAsync);
+    private static readonly TimeSpan ShutdownDrain = TimeSpan.FromSeconds(2);
+
+    // Both kinds of line are written in the background, so a graceful exit (systemd stop, Ctrl+C,
+    // a startup error) drains them first rather than losing the last stretch.
+    static RelayLog() => AppDomain.CurrentDomain.ProcessExit += (_, _) => FlushOnShutdown();
+
     private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
     private static DateTime lastFlushUtc = DateTime.UtcNow;
 
@@ -597,14 +607,33 @@ internal static class RelayLog
     // rejections severe enough to already carry their own explicit message, alerts, summaries.
     public static void Info(string message)
     {
-        Console.WriteLine(message);
+        ToConsole(message, error: false);
         Write("INFO", message);
     }
 
     public static void Warn(string message)
     {
-        Console.Error.WriteLine(message);
+        ToConsole(message, error: true);
         Write("WARN", message);
+    }
+
+    private static void ToConsole(string message, bool error)
+    {
+        if (!ConsoleQueue.Writer.TryWrite((message, error))) Interlocked.Increment(ref droppedConsoleLines);
+    }
+
+    private static async Task WriteConsoleAsync()
+    {
+        await foreach (var (line, error) in ConsoleQueue.Reader.ReadAllAsync())
+        {
+            var dropped = Interlocked.Exchange(ref droppedConsoleLines, 0);
+            try
+            {
+                if (dropped > 0) Console.Error.WriteLine($"[AnoMech.Relay] {dropped} console line(s) dropped -- the console couldn't keep up.");
+                (error ? Console.Error : Console.Out).WriteLine(line);
+            }
+            catch (IOException) { }
+        }
     }
 
     // File only. For anything high-volume enough that echoing it to the console would drown
@@ -632,11 +661,12 @@ internal static class RelayLog
         EnforceCap();
     }
 
-    // Best-effort flush for a graceful shutdown (see Main's ProcessExit hook) -- anything still
-    // sitting in the queue at the instant of a hard kill is lost either way, same tradeoff any
-    // buffered logger makes.
-    public static void FlushOnShutdown()
+    // Best-effort -- anything still sitting in a queue at the instant of a hard kill is lost
+    // either way, same tradeoff any buffered logger makes.
+    private static void FlushOnShutdown()
     {
+        ConsoleQueue.Writer.TryComplete();
+        try { ConsoleWriter.Wait(ShutdownDrain); } catch { /* best effort */ }
         try { activeWriter?.Flush(); } catch { /* best effort */ }
     }
 
