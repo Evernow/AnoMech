@@ -89,9 +89,18 @@ public sealed class SimWorld : ISimObject, IDisposable
 
     private SimTether CreateTether(ITetherEnd from, ITetherEnd to, ushort tetherId, float duration, ushort debuffStatusId)
     {
-        var tether = new SimTether(from, to, new TetherContext(Party.Find, tetherId, Rng), debuffStatusId, duration, SimEvents);
+        var tether = new SimTether(from, to, new TetherContext(Party.Find, tetherId, Rng, OnTether), debuffStatusId, duration, SimEvents);
         children.Add(tether);
         return tether;
+    }
+
+    private bool OnTether(SimCharacter member, ushort tetherId)
+    {
+        foreach (var child in children)
+            if (child is SimTether { IsActive: true } tether && tether.TetherId == tetherId
+                && (ReferenceEquals(tether.A, member) || ReferenceEquals(tether.B, member)))
+                return true;
+        return false;
     }
 
     

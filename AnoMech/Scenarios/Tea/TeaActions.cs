@@ -171,14 +171,6 @@ public static class TeaActions
         Timing = new() { DamageDelay = 0.51f },
     };
 
-    // The second on one holder of both tethers: the pair comes to about 1.7x a tank's HP, lethal to
-    // everyone it hits short of an invuln.
-    public static readonly EnemyAction DrainageOnBothTethersHolder = Drainage with
-    {
-        Effects = [LethalShortOfAnInvuln(VulnSpec.None)],
-        DeathExplanation = "held both Drainage tethers",
-    };
-
     public static readonly EnemyAction LiquidGaol = Visual(ActionId.LiquidGaol, 2.1f);
 
     // -- Limit Cut --

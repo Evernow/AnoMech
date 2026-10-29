@@ -653,11 +653,11 @@ public sealed class TeaP1LivingLiquidScenario : IMultiplayerReplayable
         var holders = tanks.Select(role => party.Get(role) is { } tank && tank.IsAlive() ? tank : null).ToArray();
         for (var j = 0; j < 2; j++)
             holders[j] ??= DrainageStandIn(tanks[j], holders);
-        // UNVERIFIED: that a Drainage tether passes through its beam at all, and onto a member already
-        // holding the other.
+        // UNVERIFIED: that a Drainage tether passes through its beam at all. It passes over a member
+        // already holding the other.
         for (var j = 0; j < 2; j++)
             if (firstRages[sources[j]] is { } rage && holders[j] is { } holder)
-                drainageTethers[j] = world.Tether(rage, End.Passable(holder), TetherId.Drainage);
+                drainageTethers[j] = world.Tether(rage, End.Passable(holder, skipsHolders: true), TetherId.Drainage);
     }
 
     // A dead tank's tether goes to another living player, at random, never the other tether's holder.
@@ -674,12 +674,11 @@ public sealed class TeaP1LivingLiquidScenario : IMultiplayerReplayable
 
     private void ResolveDrainage()
     {
-        var holders = new HashSet<SimCharacter>();
         foreach (var tether in drainageTethers)
         {
             if (tether is null) continue;
             if (tether.A is SimEnemy rage && tether.B is { } holder && holder.IsAlive())
-                rage.Cast(holders.Add(holder) ? TeaActions.Drainage : TeaActions.DrainageOnBothTethersHolder, holder);
+                rage.Cast(TeaActions.Drainage, holder);
             tether.Despawn();
         }
         Array.Clear(drainageTethers);

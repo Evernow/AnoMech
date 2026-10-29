@@ -380,46 +380,40 @@ public class TeaP1LivingLiquidScenarioTests
         Assert.That(run.Passed, run.ToString);
     }
 
-    // On MT's beam from the W tornado where M2 takes it, so OT holds both tethers over 6y from MT.
+    // On MT's beam from the W tornado, where M2 takes it, over 6y from MT.
     private static void OffTankOnMainTanksBeam(ScenarioProbe p)
         => p.Member(OffTank)!.SetPosition(new Placement(Vector3.Lerp(new Vector3(-15, 0, 0), p.Member(MainTank)!.Position, 0.44f), 0f));
 
     private static int DrainageTethersOn(ScenarioProbe p, PartyRole role)
         => p.World.Children.OfType<SimTether>().Count(t => t.IsActive && t.TetherId == TetherId.Drainage && t.B == p.Member(role));
 
-    // The death names the double hold and the PLD OT's invuln.
+    // OT, already on the E tornado's tether, stands where MT's would pass to anyone else: MT keeps it,
+    // and each Drainage lands on its own tank. The OT's invuln covers the mitigation nobody presses.
     [Test]
-    public void TankHoldingBothDrainageTethersDies()
+    public void ATankOnTheOtherTanksBeamKeepsOnlyTheirOwnTether()
     {
-        var held = 0;
-        var run = RunToDeath(OffTank, 87f, p =>
+        var shown = ShownRun.Execute(typeof(TeaP1LivingLiquidScenario), 0, Random.Shared.Next(), new ScenarioRunOptions
         {
-            if (p.Crossed(79.05f)) OffTankOnMainTanksBeam(p);
-            if (p.Crossed(85.6f)) held = DrainageTethersOn(p, OffTank);
-        }, new Takeover(79f, null));
-        var death = run.Deaths.FirstOrDefault();
-        Assert.That(death, Is.Not.Null, run.ToString);
+            PlayerRole = OffTank,
+            StopAt = 87f,
+            Overrides = o => Pin((TeaP1LivingLiquidStateOverrides)o),
+            Takeovers = [new Takeover(79f, null)],
+            Probe = p =>
+            {
+                if (p.Crossed(79.05f)) OffTankOnMainTanksBeam(p);
+                if (p.Crossed(84.9f)) p.Member(OffTank)!.AddStatus(Holmgang, 10f);
+            },
+        });
+        var tanks = new[] { "0x" + shown.IdOf(MainTank), "0x" + shown.IdOf(OffTank) };
+        var tethered = shown.Rows.Where(r => r["kind"] is "ac" or "ac_self" && r["id"] == "0x23" && r["p"].Split(',')[1] == $"0x{TetherId.Drainage:X}")
+            .Select(r => r["p"].Split(',')[2]);
+        var hit = shown.Of("ability", ActionId.Drainage).Select(r => "0x" + ShownRun.Hits(r).Single());
         Assert.Multiple(() =>
         {
-            Assert.That((death!.Role, death.ActionId), Is.EqualTo((OffTank, ActionId.Drainage)), run.ToString);
-            Assert.That(run.Deaths.Where(d => d.ActionId == ActionId.Drainage).Select(d => d.Role), Is.EquivalentTo(new[] { OffTank }), run.ToString);
-            Assert.That(death.Cause, Does.Contain("held both Drainage tethers").And.Contain("Hallowed Ground"));
-            Assert.That(held, Is.EqualTo(2));
+            Assert.That(shown.Run.Passed, shown.Run.ToString);
+            Assert.That(tethered, Is.EquivalentTo(tanks), "each tether drawn once, to its own tank");
+            Assert.That(hit, Is.EquivalentTo(tanks), "each Drainage on its own tank");
         });
-    }
-
-    [Test]
-    public void TankHoldingBothDrainageTethersLivesUnderAnInvuln()
-    {
-        var held = 0;
-        var run = Run(OffTank, 87f, p =>
-        {
-            if (p.Crossed(79.05f)) OffTankOnMainTanksBeam(p);
-            if (p.Crossed(84.9f)) p.Member(OffTank)!.AddStatus(Holmgang, 10f);
-            if (p.Crossed(85.6f)) held = DrainageTethersOn(p, OffTank);
-        }, new Takeover(79f, null));
-        Assert.That(run.Passed, run.ToString);
-        Assert.That(held, Is.EqualTo(2));
     }
 
     // Not onto the other tank as a second tether. Given to H1, whose beam bots may then take.
@@ -450,7 +444,6 @@ public class TeaP1LivingLiquidScenarioTests
             Assert.That(held[survivor], Is.EqualTo(1));
             Assert.That(held[deadTank], Is.Zero);
             Assert.That(held.Values.Sum(), Is.EqualTo(2));
-            Assert.That(run.Deaths.Where(d => d.Cause.Contains("held both")), Is.Empty, run.ToString);
         });
     }
 
