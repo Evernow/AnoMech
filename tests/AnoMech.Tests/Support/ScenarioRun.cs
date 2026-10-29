@@ -33,6 +33,9 @@ internal sealed record ScenarioRunOptions
     // settings go in their seats, not in Mine.
     public Action<object>? Overrides { get; init; }
 
+    // Plays solo instead of as a host: per-role settings come from Mine, for the player's seat.
+    public bool Solo { get; init; }
+
     // In time order.
     public IReadOnlyList<Takeover> Takeovers { get; init; } = [];
 
@@ -108,7 +111,7 @@ internal sealed record ScenarioRun(
         options.Configure?.Invoke(config);
         DalamudServices.Install(nameof(Plugin.Config), config);
         DebugBotControl.Enabled = true;
-        PerRole.ForceSeats = true;
+        PerRole.ForceSeats = !options.Solo;
         AoeQuery.Evaluated += OnAoeEvaluated;
         game = new Game();
         DalamudServices.Install(nameof(Plugin.Game), game);
