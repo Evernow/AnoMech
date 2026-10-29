@@ -10,13 +10,16 @@ using static AnoMech.Scenarios.Tea.TeaConstants;
 namespace AnoMech.Tests;
 
 // The P2 bots act on what they see: a human partner off its spot, a late pass, a frozen holder,
-// the shield going down, a lossy link; and they never all set off on the same frame.
+// the shield going down, a lossy link; and they never all set off on the same frame. Like real
+// players, they keep clear while walking but rarely make room for a player on their spot or walking
+// into them.
 public class TeaP2BjCcAiTests
 {
     private static readonly int[] Seeds = [11, 23, 37, 41, 59, 67];
     private static readonly PartyRole[] Dps = [MeleeDpsA, MeleeDpsB, PhysRangedDps, CasterDps];
     private static readonly Vector2 OffTankAfterMines = new(1.8f, 11.1f);
     private static readonly Vector2 OffTheMainTankSpot = new(-4.5f, -16.2f);
+    private static readonly Vector2 OffTankClockSpot = new(0f, 3.4f);
 
     private static NisiLetter? NisiOf(SimCharacter member)
         => Enum.GetValues<NisiLetter>().Where(l => member.HasStatus(StatusId.FinalDecreeNisi(l))).Cast<NisiLetter?>().FirstOrDefault();
@@ -233,6 +236,49 @@ public class TeaP2BjCcAiTests
             }, takeovers: [new Takeover(freeze, OffTheMainTankSpot)]);
             Assert.That(run.Passed, run.ToString);
         }
+    }
+
+    // The human M1 stands on the OT's clock spot from 2s and the letters land on the supports: the OT
+    // often walks onto its spot anyway and copies its letter onto the M1 at the landing; otherwise it
+    // waits short of the M1 or stands beside it.
+    [Test]
+    public void APlayerOnAnotherClockSpotIsOftenCaughtAtTheLanding()
+    {
+        var copied = 0;
+        foreach (var seed in Enumerable.Range(0, 60))
+        {
+            var run = Run(0, seed, MeleeDpsA, 19f, o => o.NisiOnDps = false, p =>
+            {
+                if (p.Crossed(18.3f) && NisiOf(p.Member(MeleeDpsA)!) is not null) copied++;
+            }, [new Takeover(2f, OffTankClockSpot)]);
+            Assert.That(run.Failure, Is.Null, run.ToString);
+        }
+        Assert.That(copied, Is.InRange(12, 42));
+    }
+
+    // Letters on the supports; the human H1 walks at 3y/s straight through the MT on its clock spot:
+    // the MT rarely steps aside, and both are sentenced.
+    [Test]
+    public void AHolderWalkingIntoAStandingBotIsSentenced()
+    {
+        var sentenced = 0;
+        foreach (var seed in Enumerable.Range(0, 60))
+        {
+            var run = Run(0, seed, RegenHealer, 24f, o =>
+            {
+                o.NisiOnDps = false;
+                o.Nisi[MainTank] = NisiLetter.Beta;
+                o.Nisi[OffTank] = NisiLetter.Delta;
+                o.Nisi[RegenHealer] = NisiLetter.Gamma;
+                o.Nisi[ShieldHealer] = NisiLetter.Alpha;
+            }, p =>
+            {
+                if (p.Time is >= 19.5f and <= 22.3f && p.Member(RegenHealer) is { } h1)
+                    h1.SetPosition(new Vector3(0f, 0f, MathF.Min(-2f, -10.2f + (p.Time - 19.5f) * 3f)));
+            }, [new Takeover(19.5f, new Vector2(0f, -10.2f))]);
+            if (run.Deaths.Select(d => d.Role).Intersect([MainTank, RegenHealer]).Count() == 2) sentenced++;
+        }
+        Assert.That(sentenced, Is.GreaterThanOrEqualTo(51));
     }
 
     // Every seat a bot on its own client, the peers on bad Wi-Fi: each sees the others late and in

@@ -27,6 +27,12 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     private const float DodgeStep = 2.4f;
     private const float DodgeFrom = 4f;
     private const float DodgedClear = 3f;
+    private const float ComingWithin = 5f;
+    private const float GoneBeyond = 6f;
+    private const float NoticeChance = 0.05f;
+    private const float TouchNoticeChance = 0.25f;
+    private const float TakenWithin = 1.5f;
+    private const float SpotSeenFrom = 5f;
     private const float Foresight = 0.8f;
     private const float MotionCarriesOn = 0.35f;
     private const float UrgentNearest = 1.3f;
@@ -300,7 +306,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     {
         foreach (var (role, at) in Departures("clock", (OffTank, 2.6f, 3.8f, 5f), (RegenHealer, 2.6f, 4.2f, 6.5f), (ShieldHealer, 3f, 5.2f, 7.5f),
                      (MeleeDpsA, 2.8f, 4.8f, 7f), (MeleeDpsB, 2.4f, 3.6f, 5.5f), (PhysRangedDps, 2.4f, 3.8f, 6f), (CasterDps, 3.2f, 5.6f, 8.5f)))
-            When(at, () => Walk(role, Stroll with { Settle = 0.3f }, ClockSpot(role)));
+            When(at, () => TakeTheSpot(role, Stroll with { Settle = 0.3f }, ClockSpot));
         When(JKick + React(MainTank, "toward-bj", 0.3f, 0.7f, 1.2f), () => Walk(MainTank, Stroll, new Vector2(-3.8f, 0.3f)));
         When(RobotsTargetable + React(MainTank, "lure", 0.3f, 0.6f, 1f), () => LureToTheCentre(MainTank, state.Objects.BruteJustice, new Vector2(-0.5f, -0.3f)));
         When(RobotsTargetable + React(OffTank, "lure", 0.8f, 1.3f, 1.9f), () => LureToTheCentre(OffTank, state.Objects.CruiseChaser, new Vector2(0.8f, 0.4f)));
@@ -309,7 +315,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     private void LureToTheCentre(PartyRole tank, SimEnemy? boss, Vector2 bossTo)
     {
         var job = Job(tank);
-        Walk(tank, Stroll, () => Later(tank, job, React(tank, "lured", 0.3f, 0.8f, 1.4f), () => Walk(tank, Stroll with { Hops = 2 }, ClockSpot(tank))),
+        Walk(tank, Stroll, () => Later(tank, job, React(tank, "lured", 0.3f, 0.8f, 1.4f), () => TakeTheSpot(tank, Stroll with { Hops = 2 }, ClockSpot)),
             LureSpot(boss, tank, bossTo));
     }
 
@@ -326,6 +332,89 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     };
 
     private static Vector2 PhotonSpot(PartyRole role) => role == MainTank ? new Vector2(0f, -2.5f) : ClockSpot(role);
+
+    private void TakeTheSpot(PartyRole role, Gait gait, Func<PartyRole, Vector2> spotOf)
+    {
+        var spot = spotOf(role);
+        var job = seats[(int)role].Job;
+        Walk(role, gait, spot);
+        Once(role, job, () => !HeadingFor(role, spot) || Vector2.Distance(At(role), spot) < SpotSeenFrom && SpotTakenBy(role, spot, spotOf) is not null, () =>
+        {
+            if (HeadingFor(role, spot) && Vector2.Distance(At(role), spot) > OffTheSpot + 0.5f && SpotTakenBy(role, spot, spotOf) is { } occupant)
+                FindTheSpotTaken(role, gait, spot, spotOf, occupant);
+        });
+    }
+
+    private bool HeadingFor(PartyRole role, Vector2 spot)
+        => seats[(int)role] is var seat && seat.HasWalk(Now) && seat.Stops.Length > 0 && Vector2.Distance(seat.Stops[^1], spot) < 0.1f;
+
+    private PartyRole? SpotTakenBy(PartyRole role, Vector2 spot, Func<PartyRole, Vector2> spotOf)
+        => PerRole.All.Where(other => other != role && Member(other) is not null && !Moving(other) && Now - lastMotion[(int)other].At >= Settled
+                                      && Vector2.Distance(At(other), spot) < MathF.Min(TakenWithin, Vector2.Distance(At(other), spotOf(other))))
+            .Cast<PartyRole?>().FirstOrDefault();
+
+    private void FindTheSpotTaken(PartyRole role, Gait gait, Vector2 spot, Func<PartyRole, Vector2> spotOf, PartyRole occupant)
+    {
+        var seat = seats[(int)role];
+        var draw = seat.TakenSpots++;
+        var harmful = PerRole.All.Any(r => NisiOf(r) is not null) && Threat(role, occupant);
+        var choice = Dice(role, "spot-taken", draw);
+        if (choice < (harmful ? 0.1f : 0.5f))
+        {
+            seat.Ignoring = occupant;
+            return;
+        }
+        var job = seat.Job;
+        var hold = choice < 0.85f
+            ? ShortOfTheOccupant(role, occupant, harmful ? Sample(role, "wait-short", 2.5f, 3.5f, 4.5f, draw) : Sample(role, "wait-short", 1.8f, 2.95f, 4.2f, draw), spotOf)
+            : BesideTheOccupant(role, occupant, harmful ? Sample(role, "beside", 2f, 2.4f, 3f, draw) : Sample(role, "beside", 1.1f, 1.5f, 2f, draw), spotOf);
+        Stand(role, hold);
+        Once(role, job, () => Member(occupant) is null || Vector2.Distance(At(occupant), spot) >= TakenWithin, () => Walk(role, gait with { Shaped = false }, spot));
+    }
+
+    private Vector2 ShortOfTheOccupant(PartyRole role, PartyRole occupant, float away, Func<PartyRole, Vector2> spotOf)
+    {
+        var there = At(occupant);
+        var off = At(role) - there;
+        var way = off.LengthSquared() > 1e-4f ? Vector2.Normalize(off) : Vector2.UnitX;
+        foreach (var reach in new[] { away, away + 1f })
+        foreach (var turn in new[] { 0f, 20f, -20f, 40f, -40f, 60f, -60f })
+            if (there + Rotate(way, turn) * reach is var spot && FreeToWait(role, occupant, spot, NearestAllowed, spotOf))
+                return spot;
+        return there + way * away;
+    }
+
+    private Vector2 BesideTheOccupant(PartyRole role, PartyRole occupant, float gap, Func<PartyRole, Vector2> spotOf)
+    {
+        var there = At(occupant);
+        var off = At(role) - there;
+        var way = off.LengthSquared() > 1e-4f ? Vector2.Normalize(off) : Vector2.UnitX;
+        foreach (var turn in new[] { 70f, -70f, 100f, -100f, 40f, -40f })
+            if (there + Rotate(way, turn) * gap is var spot && FreeToWait(role, occupant, spot, MathF.Min(NearestAllowed, gap), spotOf))
+                return spot;
+        return ShortOfTheOccupant(role, occupant, MathF.Max(gap, 2f), spotOf);
+    }
+
+    private bool FreeToWait(PartyRole role, PartyRole occupant, Vector2 spot, float clearance, Func<PartyRole, Vector2> spotOf)
+        => spot.Length() <= ArenaEdge - 0.5f && SafeToStand(role, spot, clearance)
+           && PerRole.All.All(other => other == role || (other == occupant || Member(other) is null || Vector2.Distance(At(other), spot) >= ContactMargin + 0.2f)
+                                       && Vector2.Distance(spotOf(other), spot) >= TakenWithin);
+
+    private void Stand(PartyRole role, Vector2 spot)
+    {
+        if (Member(role) is not { } member) return;
+        if (Vector2.Distance(At(role), spot) > OffTheSpot)
+        {
+            Walk(role, Stroll with { Shaped = false, Settle = 0f }, spot);
+            return;
+        }
+        var seat = seats[(int)role];
+        Halt(member, seat);
+        seat.Stops = [];
+        seat.Arrived = null;
+        seat.RetryAt = float.NaN;
+        seat.Wander = 0f;
+    }
 
     private static PartyRole PartnerOf(PartyRole dps) => dps switch
     {
@@ -358,7 +447,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
             When(ChakramsDash + MathF.Max(0.25f, delay), () =>
             {
                 Job(role);
-                Walk(role, Stroll with { Due = BlastersLand - 0.6f, Settle = 0.3f, ClearOf = BlasterUnder(role) }, PhotonSpot(role));
+                TakeTheSpot(role, Stroll with { Due = BlastersLand - 0.6f, Settle = 0.3f, ClearOf = BlasterUnder(role) }, PhotonSpot);
             });
     }
 
@@ -1544,7 +1633,50 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         }
         if (now is > 63f and < 77f) SeeTheMines(now);
         if (now is > 92.5f and < 101f) SeeTheShield(now);
+        Meet(now);
     }
+
+    private void Meet(float now)
+    {
+        foreach (var role in PerRole.All)
+        {
+            var seat = seats[(int)role];
+            foreach (var other in PerRole.All)
+            {
+                if (other == role) continue;
+                if (Member(role) is null || Member(other) is null)
+                {
+                    seat.Met[(int)other] = null;
+                    continue;
+                }
+                var gap = Vector2.Distance(At(role), At(other));
+                var touching = gap < ContactMargin + 0.2f;
+                if (seat.Met[(int)other] is not { } met)
+                {
+                    if (gap >= ComingWithin || !touching && !MovingCloser(other, At(role))) continue;
+                    met = seat.Met[(int)other] = new Encounter { Draw = seat.Meetings++ };
+                }
+                else if (gap >= GoneBeyond)
+                {
+                    seat.Met[(int)other] = null;
+                    continue;
+                }
+                if (Welcome(role, other))
+                {
+                    met.Expected = met.Judged = met.Noticed = true;
+                    met.NoticedAt = now;
+                }
+                if (met.Judged || !Threat(role, other)) continue;
+                met.Judged = true;
+                met.Noticed = Dice(role, "notice", met.Draw) < (touching && !Moving(other) ? TouchNoticeChance : NoticeChance);
+                met.NoticedAt = now + React(role, "notice-react", 0.7f, 1.4f, 2.9f, met.Draw);
+            }
+        }
+    }
+
+    private bool Noticed(PartyRole role, PartyRole other) => seats[(int)role].Met[(int)other] is { Noticed: true } met && Now >= met.NoticedAt;
+
+    private bool Expected(PartyRole role, PartyRole other) => seats[(int)role].Met[(int)other] is { Expected: true };
 
     private void SeeTheMines(float now)
     {
@@ -1591,7 +1723,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
                 return;
             }
             if (Paused(seat, now) && Dodge(role, seat, at, now, true)) return;
-            if (Conflict(role, seat.Course, now, seat.Urgent, null, Pressed(seat.Gait, seat.Urgent, at, seat.Stops, now)) is { } conflict)
+            if (Conflict(role, seat.Course, now, seat.Urgent, seat.Ignoring, Pressed(seat.Gait, seat.Urgent, at, seat.Stops, now)) is { } conflict)
                 GiveWay(role, member, seat, conflict, now, seat.Gait, seat.Arrived, seat.Stops);
             return;
         }
@@ -1690,11 +1822,15 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
 
     private bool MovingAway(PartyRole other, Vector2 from) => Velocity(other) is var velocity && velocity.LengthSquared() >= 1f && Vector2.Dot(velocity, At(other) - from) > 0f;
 
+    private bool MovingCloser(PartyRole other, Vector2 to) => Velocity(other) is var velocity && velocity.LengthSquared() >= 1f && Vector2.Dot(velocity, to - At(other)) > 0f;
+
     private bool Lettered(PartyRole me, PartyRole other) => nisi[(int)me] is not null || (nisi[(int)other] ?? receiving[(int)other]) is not null;
 
     private bool Wary(PartyRole other) => Now - jerkySeen[(int)other] < LagRemembered;
 
     private bool Moving(PartyRole role) => Velocity(role).LengthSquared() >= 1f;
+
+    private bool Escaping(PartyRole role) => At(role) is var at && (NearASettlingTornado(at) || InABlaster(at));
 
     private bool YieldsTo(PartyRole me, PartyRole other)
     {
@@ -1702,6 +1838,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         var theirs = Velocity(other);
         if (mine.LengthSquared() < 1f) return true;
         if (theirs.LengthSquared() < 1f) return false;
+        if (Escaping(me) != Escaping(other)) return Escaping(other);
         var toOther = At(other) - At(me);
         if (toOther.LengthSquared() < 1e-4f) return me > other;
         var way = Vector2.Normalize(toOther);
@@ -1752,19 +1889,22 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         if (dodgingFrom is not null || HeldStill(role, now) || HeldStill(role, now + Settling) || !resume && Vector2.Distance(at, seat.Anchor) > 0.6f + seat.Wander) return false;
         foreach (var other in from is { } only ? new[] { only } : PerRole.All)
         {
-            if (!Threat(role, other) || !OnThePathOf(other, at, !resume && Lettered(role, other) && !HeldStill(role, now + EarlyDodgeReturns))) continue;
-            if (seat.DangerFrom != other)
+            var surprised = from is null && !Expected(role, other);
+            if (!Threat(role, other) || from is null && !Noticed(role, other)
+                || !OnThePathOf(other, at, surprised || !resume && Lettered(role, other) && !HeldStill(role, now + EarlyDodgeReturns))) continue;
+            if (!surprised && seat.DangerFrom != other)
             {
                 seat.DangerFrom = other;
                 seat.DangerSince = now;
                 seat.DangerReact = React(role, "dodge-react", 0.2f, 0.25f, 0.4f, seat.Draws++);
             }
-            if (now - seat.DangerSince < seat.DangerReact) return false;
+            if (!surprised && now - seat.DangerSince < seat.DangerReact) return false;
+            var step = surprised ? Sample(role, "step-aside", 1.1f, 1.8f, 2.7f, seat.Met[(int)other]!.Draw) : DodgeStep;
             var velocity = Velocity(other);
             var ahead = Vector2.Normalize(velocity);
             var across = new Vector2(-ahead.Y, ahead.X);
             if (Vector2.Dot(across, at - At(other)) < 0f) across = -across;
-            foreach (var to in new[] { at + across * DodgeStep, at + Vector2.Normalize(across + ahead) * DodgeStep, at + Vector2.Normalize(across - ahead) * DodgeStep })
+            foreach (var to in new[] { at + across * step, at + Vector2.Normalize(across + ahead) * step, at + Vector2.Normalize(across - ahead) * step })
             {
                 if (to.Length() > ArenaEdge - 0.5f || !SafeToStand(role, to, FidgetClearance - 0.6f) || !SegmentClear(at, to, Standing(role, other))) continue;
                 var after = seat.Dodged ?? (resume
@@ -1816,7 +1956,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     {
         foreach (var other in PerRole.All)
         {
-            if (!Threat(role, other) || Moving(other)) continue;
+            if (!Threat(role, other) || Moving(other) || !Noticed(role, other)) continue;
             var there = At(other);
             var away = at - there;
             var gap = away.Length();
@@ -1906,7 +2046,9 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         seat.Dodged = null;
         seat.Rewalks = 0;
         seat.Halts = 0;
+        seat.Stuck = 0;
         seat.HaltedFor = null;
+        seat.Ignoring = null;
         Head(role, gait, arrived, stops);
     }
 
@@ -1925,18 +2067,19 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         seat.Gait = gait;
         seat.Arrived = arrived;
         seat.RetryAt = float.NaN;
-        var obstacles = Obstacles(role, puddles, false, dodgingFrom, !gait.Direct);
+        var squeezing = seat.Stuck >= MostYields;
+        var obstacles = Obstacles(role, puddles, squeezing, dodgingFrom ?? seat.Ignoring, !gait.Direct);
         var path = Route(from, goal, obstacles);
         var (course, sprint) = Plan(role, from, goal, path, obstacles, gait, now);
-        if (!OnTime(course, gait))
+        if (!squeezing && !OnTime(course, gait))
         {
-            obstacles = Obstacles(role, puddles, true, dodgingFrom, !gait.Direct);
+            obstacles = Obstacles(role, puddles, true, dodgingFrom ?? seat.Ignoring, !gait.Direct);
             path = Route(from, goal, obstacles);
             (course, sprint) = Plan(role, from, goal, path, obstacles, gait, now);
         }
-        var urgent = Urgent(course, gait);
+        var urgent = squeezing || Urgent(course, gait);
         seat.Urgent = urgent;
-        var conflicted = Conflict(role, course, now, urgent, dodgingFrom, Pressed(gait, urgent, from, goal, now));
+        var conflicted = Conflict(role, course, now, urgent, dodgingFrom ?? seat.Ignoring, Pressed(gait, urgent, from, goal, now));
         if (gait.ClearOf is { } hazard && Vector2.Distance(from, hazard.Where) < hazard.Reach
             && Vector2.Distance(goal[^1], hazard.Where) >= hazard.Reach
             && (conflicted is not null && now >= hazard.By - 1.5f || Vector2.Distance(CourseAt(course, hazard.By), hazard.Where) < hazard.Reach - 0.05f)
@@ -1964,7 +2107,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
                     return;
                 }
             }
-            if (!Moving(conflict.Who) && ShortOf(course, At(conflict.Who), urgent ? UrgentNearest : NearestAllowed) is { } shorter && Conflict(role, shorter, now, urgent) is null)
+            if (!Moving(conflict.Who) && ShortOf(course, At(conflict.Who), urgent ? UrgentNearest : NearestAllowed) is { } shorter && Conflict(role, shorter, now, urgent, seat.Ignoring) is null)
             {
                 var there = Vector2.Distance(shorter[^1].At, course[^1].At) < CloseEnough;
                 Follow(role, member, seat, shorter, sprint, there);
@@ -1974,6 +2117,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
             Halt(member, seat);
             seat.HaltedFor = Moving(conflict.Who) && YieldsTo(role, conflict.Who) ? conflict.Who : null;
             seat.Halts++;
+            if (!Moving(conflict.Who)) seat.Stuck++;
             seat.RetryAt = now + Backoff(seat, Pressed(gait, urgent, from, goal, now) || !Wary(conflict.Who))
                 * (urgent ? React(role, "hesitate", 0.1f, 0.15f, 0.25f, seat.Draws++) : React(role, "hesitate", 0.2f, 0.35f, 0.6f, seat.Draws++));
             return;
@@ -2001,6 +2145,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         }
         seat.LetGo = 0;
         seat.Blocked = 0;
+        seat.Stuck = 0;
         Follow(role, member, seat, course, sprint);
     }
 
@@ -2626,6 +2771,7 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
     {
         var seat = seats[(int)role];
         seat.Dodged = null;
+        seat.Ignoring = null;
         return ++seat.Job;
     }
 
@@ -2737,10 +2883,15 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
         public PartyRole? DodgingFrom;
         public PartyRole? HaltedFor;
         public int Halts;
+        public int Stuck;
         public float SteeredAt = float.NegativeInfinity;
         public PartyRole? DangerFrom;
         public float DangerSince;
         public float DangerReact;
+        public readonly Encounter?[] Met = new Encounter?[8];
+        public int Meetings;
+        public PartyRole? Ignoring;
+        public int TakenSpots;
 
         public bool Walking(float now) => Course.Count > 0 && now < Course[^1].Eta;
 
@@ -2771,8 +2922,22 @@ public sealed class TeaP2BjCcAi(bool lightningThreeToOffTank) : IScenarioAi<TeaP
             DodgingFrom = null;
             HaltedFor = null;
             Halts = 0;
+            Stuck = 0;
             DangerFrom = null;
             SteeredAt = float.NegativeInfinity;
+            Array.Clear(Met);
+            Meetings = 0;
+            Ignoring = null;
+            TakenSpots = 0;
         }
+    }
+
+    private sealed class Encounter
+    {
+        public int Draw;
+        public bool Expected;
+        public bool Judged;
+        public bool Noticed;
+        public float NoticedAt;
     }
 }
